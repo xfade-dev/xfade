@@ -50,6 +50,24 @@
       "name": "impl-task-3",
       "role": "Implement Task 3: sqlite store",
       "sessionId": "dacbed2def5f4f78b51022ce6b2a3afb"
+    },
+    {
+      "memberId": "spec-review-task-3@agent-switch-mvp",
+      "name": "spec-review-task-3",
+      "role": "Spec review Task 3",
+      "sessionId": "2df14d461c29421a8bd0eaea8e89f935"
+    },
+    {
+      "memberId": "quality-review-task-3@agent-switch-mvp",
+      "name": "quality-review-task-3",
+      "role": "Quality review Task 3",
+      "sessionId": "12661c23675c4fe4877451aa4f9ff1e0"
+    },
+    {
+      "memberId": "impl-task-4@agent-switch-mvp",
+      "name": "impl-task-4",
+      "role": "Implement Task 4: secret stores",
+      "sessionId": "6df9501ca39f432a8d6a673a671ad7a5"
     }
   ]
 }

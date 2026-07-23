@@ -106,5 +106,59 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784826485592\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-2\",\"timestamp\":\"2026-07-23T17:08:06.343Z\"}",
     "timestamp": "2026-07-23T17:08:06.343Z",
     "read": true
+  },
+  {
+    "id": "msg-1784826789249-1u3erw",
+    "from": "impl-task-3",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n## What I implemented\n\nTask 3: SQLite 存储层 (SQLite storage layer) for `agent-switch-core`.\n\n- Created `crates/core/src/store/mod.rs` with `pub mod db; pub mod secrets;`\n- Created `crates/core/src/store/db.rs` with full `Database` implementation:\n  - `open(path)` / `open_memory()` constructors with auto-migration\n  - `migrate()` creating `providers` table with `(tool, id)` composite PRIMARY KEY\n  - `upsert()` — INSERT ... ON CONFLICT DO UPDATE, preserves `is_active` on conflict\n  - `get()` / `list()` / `set_active()` / `delete()` CRUD operations\n  - `set_active()` uses transaction for per-tool exclusivity (clears others, then sets target)\n  - `row_to_provider()` helper for SQLite row → Provider mapping\n- Created empty placeholder `crates/core/src/store/secrets.rs` (for Task 4)\n- Modified `crates/core/src/lib.rs` to add `pub mod store;`\n\n## Test results\n\nFollowed TDD: RED (compile fail, `Database` undefined) → GREEN (all pass).\n\n```\nrunning 8 tests\ntest models::tests::tool_kind_roundtrip ... ok\ntest models::tests::provider_key_ref_scoped_by_tool_and_id ... ok\ntest models::tests::provider_serde_roundtrip ... ok\ntest store::db::tests::delete_works ... ok\ntest store::db::tests::crud_roundtrip ... ok\ntest store::db::tests::upsert_preserves_is_active ... ok\ntest store::db::tests::same_id_allowed_across_tools ... ok\ntest store::db::tests::set_active_exclusive_per_tool ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n```\n\nAll 8 tests pass (3 from Task 2 + 5 new). No linter errors.\n\n## Files changed\n\n- `crates/core/src/store/mod.rs` (new)\n- `crates/core/src/store/db.rs` (new)\n- `crates/core/src/store/secrets.rs` (new, empty placeholder)\n- `crates/core/src/lib.rs` (modified: added `pub mod store;`)\n\n## Commit\n\n- SHA: `2b17cfdcf0a8822d3fb6fe55a75fe544abe9f175`\n- Message: `feat(core): sqlite storage layer`\n\n## Self-review findings / concerns\n\nNone. Implementation matches spec exactly. `secrets.rs` is intentionally empty as specified.",
+    "timestamp": "2026-07-23T17:13:09.249Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784826925819-3wnyyc",
+    "from": "spec-review-task-3",
+    "to": "team-lead",
+    "type": "message",
+    "content": "✅ Spec compliant — Task 3 (sqlite storage layer) passes review.\n\nVerified independently:\n\n1. **store/mod.rs** — exactly `pub mod db; pub mod secrets;` (2 lines, no extras)\n2. **store/db.rs** — all required APIs present:\n   - `Database { conn: Connection }` struct\n   - `open(path)` creates parent dirs + migrates\n   - `open_memory()` in-memory + migrate\n   - `migrate()` CREATE TABLE IF NOT EXISTS providers with exact schema (tool, id, base_url NULL, key_ref NOT NULL, extra DEFAULT 'null', is_active DEFAULT 0, PK(tool,id))\n   - `upsert(p)` — SQL confirmed: `ON CONFLICT (tool, id) DO UPDATE SET base_url = excluded.base_url, key_ref = excluded.key_ref, extra = excluded.extra` — **does NOT touch is_active** ✅\n   - `get(tool,id)` → `Option<Provider>`\n   - `list(Option<ToolKind>)` → `Vec<Provider>` with `ORDER BY id` (filtered) / `ORDER BY tool, id` (all)\n   - `set_active(tool,id)` — uses `unchecked_transaction()`, clears all for tool, sets target; `n == 0` → `ProviderNotFound` ✅\n   - `delete(tool,id)`\n   - `row_to_provider` helper\n   - Test module has **exactly 5 tests**: crud_roundtrip, same_id_allowed_across_tools, set_active_exclusive_per_tool, upsert_preserves_is_active, delete_works\n3. **store/secrets.rs** — empty placeholder (0 bytes)\n4. **lib.rs** — adds `pub mod store;` alongside existing `pub mod error; pub mod models;`\n5. **git show 2b17cfd --stat** — only expected files touched: lib.rs, store/db.rs, store/mod.rs, store/secrets.rs (plus team config files which are outside scope)\n6. **No changes** to models.rs, error.rs, Cargo.toml (confirmed via git diff 34c0d4e..2b17cfd — empty)\n7. **cargo test -p agent-switch-core** — **8 passed** (3 old models tests + 5 new store tests) ✅\n\nNo missing requirements, no extra/unrequested code found.",
+    "timestamp": "2026-07-23T17:15:25.819Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784827045658-lq9bgc",
+    "from": "quality-review-task-3",
+    "to": "team-lead",
+    "type": "message",
+    "content": "## Code Quality Review: SQLite Store Layer (Task 3)\n\n**Verdict: Approved**\n\n---\n\n### Strengths\n\n1. **SQL Safety**: All queries use parameterized statements (`?1`, `?2` placeholders) via `rusqlite::params!`. No string interpolation or SQL injection risk.\n\n2. **Transaction Correctness**: `set_active` properly uses `unchecked_transaction` to atomically clear then set `is_active`. The transaction is committed only after both updates succeed, and the `ProviderNotFound` error path correctly returns before commit (implicit rollback on drop).\n\n3. **Schema Design**: Composite primary key `(tool, id)` correctly enforces the business rule that the same provider id can exist across different tools. `is_active` defaults to 0, avoiding NULL handling.\n\n4. **Error Mapping**: Clean `From` impls in `CoreError` for `rusqlite::Error`, `serde_json::Error`, and `std::io::Error`. The `row_to_provider` conversion manually maps `ToolKind` parse errors into `rusqlite::Error::FromSqlConversionFailure`, which is a reasonable pragmatic choice.\n\n5. **Test Quality**: 5 tests cover real behavior, not trivial assertions:\n   - `crud_roundtrip`: insert + get + cross-tool isolation\n   - `same_id_allowed_across_tools`: composite PK behavior\n   - `set_active_exclusive_per_tool`: transaction exclusivity\n   - `upsert_preserves_is_active`: ON CONFLICT clause correctness\n   - `delete_works`: deletion\n   All 5 tests pass (verified via pre-built test binary).\n\n6. **Single Responsibility**: `db.rs` is 203 lines, focused purely on SQLite persistence. No business logic leakage. `secrets.rs` is an empty placeholder module, which is fine for MVP scaffolding.\n\n---\n\n### Issues\n\n**Critical**: None\n\n**Important**: None\n\n**Minor**:\n\n1. **`upsert` inserts `is_active` on new rows but ignores it on conflict** — This is intentional per the comment \"插入或更新（不触碰 is_active）\", but the SQL is slightly misleading: the `VALUES` clause includes `?6` for `is_active`, yet the `ON CONFLICT` clause omits it. This works correctly (new rows get the passed value, existing rows keep theirs), but a reader might briefly wonder if it's a bug. A one-line SQL comment or restructuring could make this clearer.\n\n2. **`row_to_provider` silently swallows JSON parse errors on `extra`** — `serde_json::from_str(&extra_str).unwrap_or(serde_json::Value::Null)` means corrupted JSON in the DB becomes `Null` rather than an error. For MVP this is acceptable, but in production you might want to log or propagate this.\n\n3. **`list` allocates a `String` for the tool parameter when filtering** — `Some(t.as_str().to_string())` is a minor allocation that could be avoided with `rusqlite::params![t.as_str()]` directly in the query call, but this is negligible.\n\n4. **No `DROP TABLE` guard in `migrate`** — `CREATE TABLE IF NOT EXISTS` is idempotent and safe, but there's no version tracking for future schema migrations. Fine for MVP, worth noting for later.\n\n---\n\n### Assessment\n\n**Approved**. The implementation is correct, safe, and well-tested. All minor observations are stylistic or forward-looking; none block merge.",
+    "timestamp": "2026-07-23T17:17:25.658Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784827055874-noe2w3",
+    "from": "impl-task-3",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784827054736\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-3\",\"timestamp\":\"2026-07-23T17:17:35.874Z\"}",
+    "timestamp": "2026-07-23T17:17:35.874Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784827058098-4q6cvs",
+    "from": "spec-review-task-3",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784827056238\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-3\",\"timestamp\":\"2026-07-23T17:17:38.098Z\"}",
+    "timestamp": "2026-07-23T17:17:38.098Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784827059747-f7u6me",
+    "from": "quality-review-task-3",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784827057971\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-3\",\"timestamp\":\"2026-07-23T17:17:39.747Z\"}",
+    "timestamp": "2026-07-23T17:17:39.747Z",
+    "read": true
   }
 ]
