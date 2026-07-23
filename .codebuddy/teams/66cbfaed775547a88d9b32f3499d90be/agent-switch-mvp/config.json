@@ -164,6 +164,12 @@
       "name": "quality-review-task-9",
       "role": "Quality review Task 9",
       "sessionId": "39257a81ea5f4c6189ad699bae8284ea"
+    },
+    {
+      "memberId": "impl-task-10@agent-switch-mvp",
+      "name": "impl-task-10",
+      "role": "Implement Task 10: presets",
+      "sessionId": "cfafa95b6e344219b1fcb2b0d36ecaa6"
     }
   ]
 }
