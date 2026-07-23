@@ -1,0 +1,19 @@
+{
+  "name": "agent-switch-mvp",
+  "mainConversationId": "66cbfaed775547a88d9b32f3499d90be",
+  "workspacePath": "/Users/leo/CodeBuddy/20260723234336",
+  "createdAt": "2026-07-23T16:45:51.729Z",
+  "options": {
+    "workspacePath": "/Users/leo/CodeBuddy/20260723234336",
+    "isAutoTeam": false
+  },
+  "isAutoTeam": false,
+  "members": [
+    {
+      "memberId": "impl-task-1@agent-switch-mvp",
+      "name": "impl-task-1",
+      "role": "Implement Task 1: workspace scaffold",
+      "sessionId": "cec502bdb4eb4a45b547222c7bcc6ff0"
+    }
+  ]
+}
