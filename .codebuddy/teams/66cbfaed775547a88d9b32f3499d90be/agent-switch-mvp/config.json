@@ -146,6 +146,12 @@
       "name": "quality-review-task-8",
       "role": "Quality review Task 8",
       "sessionId": "dc9b8e0232be481aac2b95454908545f"
+    },
+    {
+      "memberId": "impl-task-9@agent-switch-mvp",
+      "name": "impl-task-9",
+      "role": "Implement Task 9: opencode adapter",
+      "sessionId": "526211e61e64406487b1ec7bb5414b78"
     }
   ]
 }

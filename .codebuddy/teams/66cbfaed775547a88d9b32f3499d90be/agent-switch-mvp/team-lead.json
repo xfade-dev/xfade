@@ -430,5 +430,41 @@
     "content": "## Code Quality Review — Task 8: Codex Adapter\n\n**Diff reviewed:** `f355e8c..ca4d8ea` — `crates/core/src/adapters/codex.rs` only (skeleton → full implementation + 6 tests)\n\n---\n\n### Strengths\n\n1. **Clean dual-file handling**: `load_toml()` / `load_auth()` are well-factored, each with proper `NotFound` fallback and `ConfigParse` error context including path.\n2. **TOML manipulation is safe**: Uses `toml::Value` API correctly — checks `is_table()` before `as_table_mut().unwrap()`, guards against non-table `model_providers` section by replacing it. No raw string manipulation.\n3. **Preserves user config**: `apply_preserves_other_toml_sections` test explicitly validates that unrelated TOML keys (`model`, `approval_policy`) and auth.json keys (`tokens`) survive a switch.\n4. **Official switch is minimally invasive**: Only removes `model_provider` top-level key; leaves `[model_providers]` intact for re-switching, and leaves `auth.json` untouched — matches spec exactly.\n5. **Consistent with `claude_code.rs` patterns**: Same structure (path helpers → load → apply → read_current), same error mapping style, same test setup helper pattern.\n6. **Good test coverage**: 6 tests covering third-party write, preservation, official removal, `wire_api` from extra, read_current none, and read_current import round-trip.\n\n---\n\n### Issues\n\n**Critical:** None\n\n**Important:** None\n\n**Minor:**\n\n1. **Unused variable `dir` in test** — `codex.rs:248` in `read_current_imports`: `let (dir, ad) = setup();` but `dir` is never used. Should be `let (_dir, ad) = setup();` to silence the warning. One-word fix.\n\n2. **Dual-file write atomicity window** — `apply()` writes `auth.json` first (line 105-108), then `config.toml` (line 111-116). If the process crashes between the two, `auth.json` has the new key but `config.toml` still points to the old provider (or no provider). For MVP this is acceptable — the window is small and both writes are individually atomic via `atomic_write`. A future improvement could write config first, then auth, or use a two-phase approach, but this is not a blocker.\n\n3. **`unwrap()` on `provider.base_url`** — `codex.rs:71`: `provider.base_url.as_deref().unwrap()`. This is guarded by the `is_official()` check on line 67 (`base_url.is_none()` → official), so it is logically safe. However, a `debug_assert!` or a comment noting the invariant would make the safety explicit for future readers. Same pattern exists in `claude_code.rs:77`, so this is consistent.\n\n---\n\n### Assessment\n\n**Approved**\n\nThe implementation is focused, safe, and consistent with the established adapter patterns. The only actionable item is the one-word `_dir` fix. The dual-file write ordering is a known MVP trade-off, not a defect.",
     "timestamp": "2026-07-23T18:02:02.766Z",
     "read": true
+  },
+  {
+    "id": "msg-1784829778675-5a7ae8",
+    "from": "impl-task-8",
+    "to": "team-lead",
+    "type": "message",
+    "content": "Fix applied and verified.\n\n- Changed `let (dir, ad) = setup();` to `let (_dir, ad) = setup();` in `read_current_imports` test at codex.rs:248\n- `cargo test -p agent-switch-core`: 25 passed, 0 failed (unchanged)\n- Commit SHA: `7102360d9c892f400e9d9d56eca3b08128546ddb`",
+    "timestamp": "2026-07-23T18:02:58.675Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829789868-c4jn54",
+    "from": "impl-task-8",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829788918\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-8\",\"timestamp\":\"2026-07-23T18:03:09.868Z\"}",
+    "timestamp": "2026-07-23T18:03:09.868Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829792427-mzy5mn",
+    "from": "spec-review-task-8",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829790489\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-8\",\"timestamp\":\"2026-07-23T18:03:12.427Z\"}",
+    "timestamp": "2026-07-23T18:03:12.427Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829793448-01fa6c",
+    "from": "quality-review-task-8",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829791866\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-8\",\"timestamp\":\"2026-07-23T18:03:13.448Z\"}",
+    "timestamp": "2026-07-23T18:03:13.448Z",
+    "read": true
   }
 ]
