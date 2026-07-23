@@ -68,6 +68,18 @@
       "name": "impl-task-4",
       "role": "Implement Task 4: secret stores",
       "sessionId": "6df9501ca39f432a8d6a673a671ad7a5"
+    },
+    {
+      "memberId": "spec-review-task-4@agent-switch-mvp",
+      "name": "spec-review-task-4",
+      "role": "Spec review Task 4",
+      "sessionId": "5c5ab96f3f3b4b6bbc083493e34943d0"
+    },
+    {
+      "memberId": "impl-task-5@agent-switch-mvp",
+      "name": "impl-task-5",
+      "role": "Implement Task 5: backup module",
+      "sessionId": "d8a996b641e14fbe9e56fb172ab431ce"
     }
   ]
 }
