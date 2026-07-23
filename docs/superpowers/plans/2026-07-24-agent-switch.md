@@ -2323,38 +2323,60 @@ fn main() {
     }
 }
 
+/// 环境契约（与 tests/cli.rs 的 asw() 辅助函数严格一致）：
+/// - `HOME`：工具配置根。测试注入 tempdir；真实环境即用户主目录。
+/// - `ASW_DATA_DIR`：自身数据目录（db/backups），缺省 `$HOME/.config/agent-switch`。
+/// - `ASW_MOCK_SECRETS=1`：用内存 MockStore 替代系统钥匙串（仅测试/冒烟）。
 fn build_core() -> Result<Core, CoreError> {
-    // 测试注入路径（见 cli 集成测试）
-    if let (Some(home), Some(data)) = (
-        std::env::var_os("ASW_TEST_HOME"),
-        std::env::var_os("ASW_DATA_DIR"),
-    ) {
-        let secrets: Box<dyn agent_switch_core::store::secrets::SecretStore> =
-            Box::new(MockStore::default());
-        return Core::with_paths(
-            PathBuf::from(home).as_path(),
-            PathBuf::from(data).as_path(),
-            secrets,
-        );
+    let use_mock = std::env::var("ASW_MOCK_SECRETS").ok().as_deref() == Some("1");
+    if let Ok(home) = std::env::var("HOME") {
+        let data = std::env::var_os("ASW_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join(".config").join("agent-switch"));
+        let secrets: Box<dyn agent_switch_core::store::secrets::SecretStore> = if use_mock {
+            Box::new(MockStore::default())
+        } else {
+            Box::new(KeyringStore::new())
+        };
+        return Core::with_paths(std::path::Path::new(&home), &data, secrets);
     }
-    let home = dirs_home().ok_or_else(|| CoreError::Keyring("no home dir".into()))?;
-    let data = std::env::var_os("ASW_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config").join("agent-switch"));
-    Core::with_paths(&home, &data, Box::new(KeyringStore::new()))
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from) // 测试可用 HOME 隔离
-        .or_else(dirs::home_dir)
+    Core::for_current_user() // 无 HOME 的极端环境（如部分 Windows 服务）兜底
 }
 ```
 
-注意：上面的 `build_core` 读取 `HOME` 环境变量优先，让集成测试可以用 `HOME=<tempdir>` 隔离；真实环境下 HOME 即用户主目录。`ASW_MOCK_SECRETS=1` 时使用 MockStore。CLI crate 需要增加 `dirs` 依赖。
+注意：CLI 不依赖 `dirs` crate——`HOME` 环境变量覆盖目标平台（macOS/Linux），无 HOME 时兜底走 `Core::for_current_user()`（core 内部用 `dirs`）。CLI 的 Cargo.toml 无需改动。
 
-剩余分发逻辑：
+剩余分发逻辑（含 Task 12 版 cmd_add——仅非交互路径，`name` 缺失时报错提示，交互路径 Task 13 补全）：
 
 ```rust
+/// Task 12 版：仅支持参数齐全的非交互调用；交互模式在 Task 13 实现
+fn cmd_add(
+    tool: Option<ToolKind>,
+    name: Option<String>,
+    base_url: Option<String>,
+    key: Option<String>,
+    sets: Vec<(String, String)>,
+) -> Result<(), CoreError> {
+    let (Some(tool), Some(name)) = (tool, name) else {
+        return Err(CoreError::ConfigParse {
+            path: String::new(),
+            msg: "interactive mode not yet implemented; pass --tool and --name".into(),
+        });
+    };
+    let mut map = serde_json::Map::new();
+    for (k, v) in sets {
+        map.insert(k, serde_json::Value::String(v));
+    }
+    let mut p = Provider::new(&name, tool, base_url);
+    if !map.is_empty() {
+        p.extra = serde_json::Value::Object(map);
+    }
+    let core = build_core()?;
+    core.add_provider(p, key.as_deref())?;
+    println!("added {tool}/{name}");
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<(), CoreError> {
     match cli.cmd {
         Cmd::Add { tool, name, base_url, key, sets } => cmd_add(tool, name, base_url, key, sets),
@@ -2381,13 +2403,31 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
-        // Edit / Rm / Presets / Import / Backup / Completion 同理薄封装
+        Cmd::Rm { name, tool } => {
+            let core = build_core()?;
+            let tool = resolve_tool(&core, &name, tool)?;
+            core.remove(tool, &name)?; // active 时 CoreError::ActiveProviderRemoval，消息含 "active"
+            println!("removed {tool}/{name}");
+            Ok(())
+        }
+        Cmd::Presets => {
+            for t in ToolKind::ALL {
+                println!("[{t}]");
+                for p in presets_for(t) {
+                    println!("  {:<12} {:<20} {}", p.id, p.label, p.base_url.unwrap_or("(官方)"));
+                }
+            }
+            Ok(())
+        }
+        // Edit / Import / Backup / Completion 在 Task 13 实现
         _ => todo!("Task 13"),
     }
 }
 
 /// use/rm/edit 缺省 --tool 时：全库查同名 provider；
 /// 唯一 → 用之；多个 → 报错提示加 --tool；零 → ProviderNotFound
+/// 注：spec 第 6 节原表述为"多个时交互选择"，此处有意偏离为报错——
+/// CLI 脚本化场景下确定性优于便捷性，交互选择留给未来 GUI。
 fn resolve_tool(core: &Core, name: &str, tool: Option<ToolKind>) -> Result<ToolKind, CoreError> {
     if let Some(t) = tool {
         return Ok(t);
@@ -2455,10 +2495,12 @@ fn cmd_add(
         }
     };
 
-    // name 缺省：先选预设
-    let (name, base_url, mut extra) = match (&name, &base_url) {
-        (Some(n), Some(_)) => (n.clone(), base_url, serde_json::Value::Null),
-        _ => {
+    // 非交互判定：只要 --name 已提供就不再进交互。
+    // --name 有 + --base-url 无 => 官方 provider（base_url=None），无需 key；
+    // --name 缺失 => 交互：选预设或自定义。
+    let (name, base_url, mut extra) = match name {
+        Some(n) => (n, base_url, serde_json::Value::Null),
+        None => {
             let presets = presets_for(tool);
             let labels: Vec<String> = presets.iter().map(|p| p.label.to_string()).chain(["自定义".into()]).collect();
             let idx = dialoguer::Select::new()
@@ -2467,16 +2509,14 @@ fn cmd_add(
                 .interact()
                 .map_err(|e| CoreError::Keyring(e.to_string()))?;
             if idx == presets.len() {
-                let n = name.unwrap_or_else(|| {
-                    dialoguer::Input::new()
-                        .with_prompt("名称")
-                        .interact_text()
-                        .expect("input")
-                });
+                let n = dialoguer::Input::<String>::new()
+                    .with_prompt("名称")
+                    .interact_text()
+                    .map_err(|e| CoreError::Keyring(e.to_string()))?;
                 let u = dialoguer::Input::<String>::new()
                     .with_prompt("Base URL")
                     .interact_text()
-                    .expect("input");
+                    .map_err(|e| CoreError::Keyring(e.to_string()))?;
                 (n, Some(u), serde_json::Value::Null)
             } else {
                 let p = &presets[idx];
