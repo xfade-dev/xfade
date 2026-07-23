@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn read_current_imports() {
-        let (dir, ad) = setup();
+        let (_dir, ad) = setup();
         let p = Provider::new("kimi", ToolKind::Codex, Some("https://x".into()));
         ad.apply(&p, Some("sk-9")).unwrap();
         let (got, key) = ad.read_current().unwrap().unwrap();

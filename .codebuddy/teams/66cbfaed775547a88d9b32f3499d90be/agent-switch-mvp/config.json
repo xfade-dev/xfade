@@ -134,6 +134,18 @@
       "name": "impl-task-8",
       "role": "Implement Task 8: codex adapter",
       "sessionId": "dcaef534c8394a1e8ecf068ba67ed972"
+    },
+    {
+      "memberId": "spec-review-task-8@agent-switch-mvp",
+      "name": "spec-review-task-8",
+      "role": "Spec review Task 8",
+      "sessionId": "d72b8cca6fcc4316ae859c23afecf64e"
+    },
+    {
+      "memberId": "quality-review-task-8@agent-switch-mvp",
+      "name": "quality-review-task-8",
+      "role": "Quality review Task 8",
+      "sessionId": "dc9b8e0232be481aac2b95454908545f"
     }
   ]
 }
