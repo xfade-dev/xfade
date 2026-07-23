@@ -98,6 +98,42 @@
       "name": "impl-task-6",
       "role": "Implement Task 6: adapter trait",
       "sessionId": "ac79885cc6e94c78aac9b29d79aa1ef6"
+    },
+    {
+      "memberId": "spec-review-task-6@agent-switch-mvp",
+      "name": "spec-review-task-6",
+      "role": "Spec review Task 6",
+      "sessionId": "049ab8d0d72447af8aedfa41d52f9f90"
+    },
+    {
+      "memberId": "quality-review-task-6@agent-switch-mvp",
+      "name": "quality-review-task-6",
+      "role": "Quality review Task 6",
+      "sessionId": "4ea6d2995fb842e4ba71f6a62bd632ea"
+    },
+    {
+      "memberId": "impl-task-7@agent-switch-mvp",
+      "name": "impl-task-7",
+      "role": "Implement Task 7: claude adapter",
+      "sessionId": "6e06014617654191a85f1375130067e7"
+    },
+    {
+      "memberId": "spec-review-task-7@agent-switch-mvp",
+      "name": "spec-review-task-7",
+      "role": "Spec review Task 7",
+      "sessionId": "1a973c960b834c48991d2399408bce03"
+    },
+    {
+      "memberId": "quality-review-task-7@agent-switch-mvp",
+      "name": "quality-review-task-7",
+      "role": "Quality review Task 7",
+      "sessionId": "d61f318de9334cbe9260a52f47fd37f6"
+    },
+    {
+      "memberId": "impl-task-8@agent-switch-mvp",
+      "name": "impl-task-8",
+      "role": "Implement Task 8: codex adapter",
+      "sessionId": "dcaef534c8394a1e8ecf068ba67ed972"
     }
   ]
 }

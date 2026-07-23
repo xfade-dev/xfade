@@ -295,5 +295,113 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828292012\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-5\",\"timestamp\":\"2026-07-23T17:38:13.480Z\"}",
     "timestamp": "2026-07-23T17:38:13.480Z",
     "read": true
+  },
+  {
+    "id": "msg-1784828529569-t6mhq7",
+    "from": "impl-task-6",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n## 实现内容\n- `ToolAdapter` trait（Send + Sync），含 `tool()` / `config_paths()` / `apply()` / `read_current()` 四个方法，doc 注释完整\n- `adapter_for(tool, home)` 工厂函数，按 ToolKind 分发到 3 个具体适配器，返回 `Box<dyn ToolAdapter>`\n- `atomic_write(path, contents)`：自动创建父目录 → 写入 `*.tmp-asw` → `rename` 原子替换\n- 3 个适配器骨架：`ClaudeCodeAdapter` / `CodexAdapter` / `OpenCodeAdapter`，各自 `tool()` 返回对应 ToolKind，其余方法为最小实现（Tasks 7-9 填充）\n\n## TDD 流程\n1. 先写 2 个失败测试（atomic_write_creates_parent_dirs / atomic_write_overwrites_and_leaves_no_tmp）\n2. `cargo test -p agent-switch-core adapters` 确认 FAIL（E0425 atomic_write undefined）\n3. 实现 trait + factory + atomic_write + 3 个骨架\n4. `cargo test -p agent-switch-core` → **14 passed; 0 failed**（12 旧 + 2 新）\n\n## 文件变更\n- 新增 `crates/core/src/adapters/mod.rs`（trait + factory + atomic_write + tests）\n- 新增 `crates/core/src/adapters/claude_code.rs`\n- 新增 `crates/core/src/adapters/codex.rs`\n- 新增 `crates/core/src/adapters/opencode.rs`\n- 修改 `crates/core/src/lib.rs`（首行插入 `pub mod adapters;`，保持字母序）\n\n## Commit\n`248d7cd9f28d31d6ea196f3d2620feb8a69c5c7d` — feat(core): adapter trait, atomic write, skeleton adapters\n\n## Self-review / 注意事项\n1. **环境**：cargo 不在 PATH，需 `RUSTC=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc ~/.rustup/.../cargo` 才能跑（rustdoc 同理，doc-test 因 rustdoc 找不到而失败，与本次改动无关，单元测试全过）\n2. **预期警告**：3 个 `field home is never read` 警告——骨架阶段正常，Tasks 7-9 填充 config_paths/apply/read_current 后会用到 home，警告自然消除\n3. **tmp 文件命名**：用 `with_extension(\"tmp-asw\")` 会替换原扩展名（如 `c.json` → `c.tmp-asw`），与测试断言一致；对无扩展名文件也能工作\n4. **rename 语义**：同目录 rename 在同文件系统内是原子的；tmp 与 target 始终同目录，无跨设备风险\n5. **后续任务钩子**：Tasks 7-9 可直接在对应骨架文件填充，无需改 trait 签名",
+    "timestamp": "2026-07-23T17:42:09.569Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784828597368-ssbh8r",
+    "from": "spec-review-task-6",
+    "to": "team-lead",
+    "type": "message",
+    "content": "✅ Spec compliant — Task 6 (commit 248d7cd)\n\nVerified independently against spec:\n\n1. `crates/core/src/adapters/mod.rs`\n   - `pub mod claude_code; pub mod codex; pub mod opencode;` ✓\n   - `ToolAdapter` trait: `Send + Sync` ✓, 4 methods with EXACT signatures:\n     - `fn tool(&self) -> ToolKind` ✓\n     - `fn config_paths(&self) -> Vec<PathBuf>` ✓\n     - `fn apply(&self, provider: &Provider, api_key: Option<&str>) -> Result<()>` ✓\n     - `fn read_current(&self) -> Result<Option<(Provider, Option<String>)>>` ✓ (exact return type match)\n   - `adapter_for(tool: ToolKind, home: &Path) -> Box<dyn ToolAdapter>` factory with all 3 ToolKind arms ✓\n   - `atomic_write(path: &Path, contents: &[u8]) -> Result<()>`: creates parent dirs via `create_dir_all`, writes `path.with_extension(\"tmp-asw\")`, then `rename` ✓\n   - Test module with EXACTLY 2 tests: `atomic_write_creates_parent_dirs`, `atomic_write_overwrites_and_leaves_no_tmp` ✓ (second test also asserts no `.tmp-asw` leftover)\n\n2. Three skeleton files (claude_code.rs / codex.rs / opencode.rs) — all identical in shape:\n   - struct with `home: PathBuf` ✓, `new(home: &Path)` ✓\n   - `config_paths` returns `vec![]` ✓, `apply` no-op `Ok(())` ✓, `read_current` returns `Ok(None)` ✓\n   - Correct ToolKind per file: ClaudeCode / Codex / OpenCode ✓\n\n3. `lib.rs` — adds exactly `pub mod adapters;` (1 line) ✓\n\n4. `git show 248d7cd --stat`: source changes limited to the 5 expected files (4 new + lib.rs 1-line). No Cargo.toml/Cargo.lock changes, no other source changes. (Commit also includes .codebuddy team config + target/ artifacts — non-source, outside review scope.)\n\n5. `cargo test -p agent-switch-core`: **14 passed; 0 failed** ✓ (2 new adapter tests + 12 pre-existing). 3 \"field home is never read\" warnings present as implementer noted — expected at skeleton stage.\n\nNote: doctest step fails with \"rustdoc ... (never executed): No such file or directory\" — this is a toolchain PATH issue in my shell (rustdoc not found alongside the pinned rustc), not a code defect. Unit tests themselves all pass.\n\nNo missing pieces, no extra/unrequested code.",
+    "timestamp": "2026-07-23T17:43:17.368Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784828764988-v8nvkf",
+    "from": "quality-review-task-6",
+    "to": "team-lead",
+    "type": "message",
+    "content": "## Task 6 代码质量审查报告\n\n**审查范围**: `git diff 62df841..248d7cd` — adapters 模块（ToolAdapter trait、adapter_for 工厂、atomic_write、3 个骨架适配器、2 个单测）\n\n---\n\n### Strengths（优点）\n\n1. **Trait 设计清晰且对象安全** — `ToolAdapter: Send + Sync` 满足多线程场景，4 个方法职责分明：`tool()` 标识、`config_paths()` 供 service 层备份、`apply()` 写入、`read_current()` 导入。`Box<dyn ToolAdapter>` 工厂模式正确。\n\n2. **atomic_write 实现简洁可靠** — tmp + rename 模式保证原子性；自动创建父目录减少调用方负担；`with_extension(\"tmp-asw\")` 使用独特后缀避免冲突。\n\n3. **文档注释到位** — `apply()` 的 `base_url=None` 语义、`read_current()` 的返回值结构都有明确中文说明，对后续 Tasks 7-9 的实现者友好。\n\n4. **测试覆盖核心场景** — 父目录创建、覆盖写入、临时文件清理均有验证。\n\n5. **骨架适配器结构一致** — 3 个文件模式统一，Tasks 7-9 可直接替换 `impl ToolAdapter` 块而不动结构。\n\n---\n\n### Issues（问题）\n\n**Critical**: None\n\n**Important**: None\n\n**Minor**:\n\n1. **`with_extension` 替换原扩展名的行为** — `path.with_extension(\"tmp-asw\")` 会把 `config.toml` 变为 `config.tmp-asw`（而非 `config.toml.tmp-asw`）。这符合当前设计意图（同目录临时文件），但建议在 doc comment 中显式说明，避免未来维护者误以为是追加后缀。\n\n2. **atomic_write 错误时临时文件残留** — 若 `std::fs::write(&tmp, contents)` 成功但 `rename` 失败（如跨设备链接），临时文件会残留。当前场景（同目录 rename）几乎不会触发，属可接受边缘情况。\n\n3. **3× \"field home is never read\" warnings** — 已知骨架阶段问题，Tasks 7-9 会解决。\n\n---\n\n### Assessment（评估）\n\n**Approved** — 代码质量符合要求，可继续推进 Tasks 7-9。\n\n---\n\n### 验证结果\n\n- `cargo test -p agent-switch-core adapters`: **2 passed** ✓\n- `cargo build -p agent-switch-core`: 编译成功，仅 3 个已知 dead_code 警告 ✓\n- `cargo fmt` / `cargo clippy`: 当前环境未安装对应组件，无法运行",
+    "timestamp": "2026-07-23T17:46:04.988Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828787035-v0v1sb",
+    "from": "impl-task-6",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828786853\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-6\",\"timestamp\":\"2026-07-23T17:46:27.035Z\"}",
+    "timestamp": "2026-07-23T17:46:27.035Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828790192-hm1z50",
+    "from": "quality-review-task-6",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828790014\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-6\",\"timestamp\":\"2026-07-23T17:46:30.192Z\"}",
+    "timestamp": "2026-07-23T17:46:30.192Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828790345-oqdwqe",
+    "from": "spec-review-task-6",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828788407\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-6\",\"timestamp\":\"2026-07-23T17:46:30.345Z\"}",
+    "timestamp": "2026-07-23T17:46:30.345Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784828953228-7c60zz",
+    "from": "impl-task-7",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n**What I implemented:**\nReplaced the ClaudeCodeAdapter skeleton in `crates/core/src/adapters/claude_code.rs` with the real implementation:\n- `settings_path()` → `<home>/.claude/settings.json` (never touches `~/.claude.json`)\n- `load()` — missing file → `{}`; non-object top-level → `CoreError::ConfigParse`\n- `save()` — pretty JSON + trailing newline via `atomic_write` from `super`\n- `apply()` — third-party: sets `env.ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`, sets/removes `ANTHROPIC_MODEL` based on `extra.model`; official (`is_official()`): removes all three keys, preserves everything else. Non-object `env` is reset to `{}`.\n- `read_current()` — returns `Ok(None)` when neither BASE_URL nor TOKEN present; otherwise builds `id=\"imported\"` Provider with base_url + `extra.model` and the token.\n- `config_paths()` → `vec![settings_path()]`\n\n**Tests:** Added the 5 specified tests. `cargo test -p agent-switch-core` → **19 passed, 0 failed** (14 old + 5 new). No clippy/warnings introduced by this file (the 2 pre-existing dead_code warnings in codex.rs/opencode.rs skeletons remain, not mine to fix).\n\n**Files changed:** `crates/core/src/adapters/claude_code.rs` (+179/-6)\n\n**Commit:** `f355e8ca23d5a1d24ef3f211a7fd01d245b996d7` — \"feat(core): claude code adapter\"\n\n**Self-review / concerns:**\n- `apply` for third-party uses `provider.base_url.as_deref().unwrap()` — safe because `is_official()` is checked first, but if a caller passes a non-official provider with `base_url: None` it would panic. Trait contract says base_url=None means official, so this is consistent.\n- `api_key.unwrap_or_default()` writes empty string token if api_key is None for a third-party apply; matches spec as written.\n- No deviations from the task spec.",
+    "timestamp": "2026-07-23T17:49:13.228Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784829029874-hcyup0",
+    "from": "spec-review-task-7",
+    "to": "team-lead",
+    "type": "message",
+    "content": "Spec compliance review for commit f355e8c (claude code adapter):\n\n✅ Spec compliant\n\nVerified independently:\n- File: crates/core/src/adapters/claude_code.rs\n- Commit: f355e8c, +179/-6, only claude_code.rs changed\n- cargo test -p agent-switch-core: 19 passed (14 old + 5 new)\n\nAll spec requirements met:\n- Constants ENV_BASE/ENV_TOKEN/ENV_MODEL correct\n- settings_path() → <home>/.claude/settings.json\n- load(): missing file → {}, invalid JSON or non-object → ConfigParse\n- save(): pretty JSON + trailing newline via atomic_write\n- apply(): official removes 3 keys, third-party sets BASE/TOKEN, model present→set else remove, non-object env reset to {}\n- read_current(): no BASE and no TOKEN → None, else imported Provider + token\n- config_paths() → vec![settings_path()]\n- Exactly 5 tests with correct names\n\nNo missing pieces, no extra/unrequested code.",
+    "timestamp": "2026-07-23T17:50:29.874Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784829242432-snguk9",
+    "from": "quality-review-task-7",
+    "to": "team-lead",
+    "type": "message",
+    "content": "## Code Quality Review — Task 7: Claude Code Adapter\n\n**Scope:** `crates/core/src/adapters/claude_code.rs` (248d7cd..f355e8c)\n**Tests:** 5/5 passed; full core suite 19/19 passed.\n\n---\n\n### Strengths\n\n1. **JSON manipulation is safe and defensive.**\n   - `load()` validates top-level is an object and returns `ConfigParse` on malformed JSON or non-object root (lines 26–44).\n   - Missing file → `Ok(json!({}))` is correct for first-run scenario.\n   - `apply()` re-checks `env.is_object()` and replaces non-object with `{}` before unwrapping (lines 66–70). This prevents panic if user manually set `\"env\": \"string\"`.\n\n2. **Error paths are well-structured.**\n   - All I/O and serde errors map to `CoreError` variants with context (path + message).\n   - No silent swallowing; `NotFound` is the only specially handled I/O error, which is semantically correct.\n\n3. **Unwrap/expect usage is contract-sanctioned and sound.**\n   - `doc.as_object_mut().expect(\"load guarantees object\")` (line 65): sound because `load()` guarantees object root.\n   - `env.as_object_mut().unwrap()` (line 70): sound because of the `is_object()` guard immediately above.\n   - `provider.base_url.as_deref().unwrap()` (line 77): sound because `is_official()` check on line 72 guarantees `base_url.is_some()` in the else branch.\n   - `api_key.unwrap_or_default()` (line 78): correct per trait contract — official switch ignores key, third-party without key writes empty string.\n\n4. **Test realism is good.**\n   - `apply_third_party_sets_env_keys` asserts preservation of unrelated top-level key (`model`) and unrelated env key (`OTHER`).\n   - `apply_official_removes_env_keys` asserts `OTHER` is preserved while target keys are removed.\n   - `read_current_imports_existing` verifies round-trip of base_url and token.\n   - `apply_creates_settings_when_missing` covers first-run file creation.\n\n5. **Plan compliance.**\n   - File is focused (only `claude_code.rs` modified).\n   - Matches adapter contract for Task 11 service layer: `config_paths()` returns the file that will be backed up; `apply()` handles both official and third-party; `read_current()` returns `imported` provider with optional key.\n\n---\n\n### Issues\n\n**Critical:** None\n\n**Important:** None\n\n**Minor:**\n1. **Missing edge-case test:** `env` key exists but is not an object (e.g. `\"env\": \"string\"`). The defensive code on lines 67–69 handles it, but no test covers this branch.\n2. **Missing edge-case test:** `read_current` when only `ANTHROPIC_MODEL` is present (no BASE_URL, no TOKEN). Current logic returns `None`, which is correct per plan, but untested.\n3. **Formatting:** `cargo fmt`/`clippy` binaries are not installed in this environment, so automated lint/format verification could not be run. Visual inspection shows no obvious deviations.\n\n---\n\n### Assessment\n\n**Approved.**\n\nThe implementation is correct, defensive, and well-tested. The unwrap/expect usages are all guarded by preceding checks or contract invariants. The adapter satisfies the Task 11 service-layer contract. The two missing edge-case tests are nice-to-have but do not block approval.",
+    "timestamp": "2026-07-23T17:54:02.432Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829253463-nk7abw",
+    "from": "impl-task-7",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829251956\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-7\",\"timestamp\":\"2026-07-23T17:54:13.463Z\"}",
+    "timestamp": "2026-07-23T17:54:13.463Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829255140-3hxaq2",
+    "from": "spec-review-task-7",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829253647\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-7\",\"timestamp\":\"2026-07-23T17:54:15.140Z\"}",
+    "timestamp": "2026-07-23T17:54:15.140Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784829257112-tur3b5",
+    "from": "quality-review-task-7",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784829255294\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-7\",\"timestamp\":\"2026-07-23T17:54:17.112Z\"}",
+    "timestamp": "2026-07-23T17:54:17.112Z",
+    "read": true
   }
 ]
