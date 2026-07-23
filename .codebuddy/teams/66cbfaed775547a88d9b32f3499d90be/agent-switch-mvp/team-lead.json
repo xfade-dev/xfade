@@ -538,5 +538,41 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784830365525\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-9\",\"timestamp\":\"2026-07-23T18:12:47.472Z\"}",
     "timestamp": "2026-07-23T18:12:47.472Z",
     "read": true
+  },
+  {
+    "id": "msg-1784830494966-1plm9j",
+    "from": "impl-task-10",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\nImplemented Task 10: 内置预设 (built-in provider presets).\n\n**What was done:**\n- Created `crates/core/src/presets.rs` with `Preset` struct and `presets_for()` function\n- Added `pub mod presets;` to `crates/core/src/lib.rs` in alphabetical order\n- Included 2 unit tests: `every_tool_has_official_preset` and `preset_ids_unique_per_tool`\n- Presets cover all 3 tools (ClaudeCode, Codex, OpenCode) with official + third-party endpoints\n\n**Test results:**\n- `cargo test -p agent-switch-core presets`: 2 passed\n- `cargo test -p agent-switch-core`: 32 passed (30 old + 2 new), 0 failed\n\n**Files changed:**\n- `crates/core/src/presets.rs` (new)\n- `crates/core/src/lib.rs` (modified)\n\n**Commit:** `329da6c` — `feat(core): built-in provider presets`\n\n**Self-review:** No concerns. Implementation matches spec exactly.",
+    "timestamp": "2026-07-23T18:14:54.966Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784830580129-iyuoq0",
+    "from": "review-task-10",
+    "to": "team-lead",
+    "type": "message",
+    "content": "Review for commit 329da6c (\"feat(core): built-in provider presets\") — Task 10\n\nSpec: ✅\n- `crates/core/src/presets.rs` exists with `Preset { id, label, base_url: Option<&'static str>, extra: serde_json::Value }` deriving Debug + Clone; `is_official()` returns `base_url.is_none()`.\n- `presets_for(tool: ToolKind) -> Vec<Preset>` returns official first for every tool.\n- ClaudeCode gets kimi/glm/deepseek with anthropic-compat URLs; Codex gets openrouter/kimi with `{\"wire_api\": \"chat\"}` in extra; OpenCode gets openrouter/kimi with null extra.\n- Test module has EXACTLY 2 tests: `every_tool_has_official_preset` and `preset_ids_unique_per_tool`.\n- `lib.rs` appends `pub mod presets;` alphabetically (line 5, between models and store).\n- `cargo test -p agent-switch-core` → 32 passed, 0 failed.\n- `git show 329da6c --stat` shows only presets.rs + lib.rs changed (plus team-lead config files, which are outside the crate and expected).\n\nQuality: Approved\nStrengths:\n- Data design is clean and consistent with `Provider` model (`is_official()` semantics match).\n- `Preset` uses `&'static str` for static data, avoiding unnecessary allocation.\n- `extra` field uses `serde_json::Value` consistently with `Provider`.\n- Tests are concise and cover the two key invariants (official presence, ID uniqueness).\n- No unrequested code or scope creep.\n\nIssues: None (Critical/Important/Minor).",
+    "timestamp": "2026-07-23T18:16:20.129Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784830591444-j3lxy5",
+    "from": "impl-task-10",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784830590238\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-10\",\"timestamp\":\"2026-07-23T18:16:31.444Z\"}",
+    "timestamp": "2026-07-23T18:16:31.444Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784830592733-z2n5ne",
+    "from": "review-task-10",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784830591678\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"review-task-10\",\"timestamp\":\"2026-07-23T18:16:32.733Z\"}",
+    "timestamp": "2026-07-23T18:16:32.733Z",
+    "read": true
   }
 ]

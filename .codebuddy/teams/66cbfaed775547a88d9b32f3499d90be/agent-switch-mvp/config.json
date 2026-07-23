@@ -170,6 +170,18 @@
       "name": "impl-task-10",
       "role": "Implement Task 10: presets",
       "sessionId": "cfafa95b6e344219b1fcb2b0d36ecaa6"
+    },
+    {
+      "memberId": "review-task-10@agent-switch-mvp",
+      "name": "review-task-10",
+      "role": "Spec+quality review Task 10",
+      "sessionId": "251f4f98c4bc40e9847099073abf4ef9"
+    },
+    {
+      "memberId": "impl-task-11@agent-switch-mvp",
+      "name": "impl-task-11",
+      "role": "Implement Task 11: service layer",
+      "sessionId": "6da6b6648710436a9bb646f612df8035"
     }
   ]
 }
