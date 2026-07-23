@@ -52,5 +52,59 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784825987023\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-1\",\"timestamp\":\"2026-07-23T16:59:47.178Z\"}",
     "timestamp": "2026-07-23T16:59:47.178Z",
     "read": true
+  },
+  {
+    "id": "msg-1784826208499-7vqi1k",
+    "from": "impl-task-2",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n**What I implemented (Task 2: 错误类型 + 数据模型):**\n- `crates/core/src/error.rs` — `CoreError` enum (thiserror) with variants ConfigParse, Keyring, ProviderNotFound, ActiveProviderRemoval, SecretNotFound, Io(#[from]), Db(#[from]), Json(#[from]), Toml; plus `pub type Result<T>`.\n- `crates/core/src/models.rs` — `ToolKind` enum (ClaudeCode/Codex/OpenCode, kebab-case serde, `ALL` const, `as_str`, Display, FromStr accepting claude|claude-code|codex|opencode) and `Provider` struct (id, tool, base_url, key_ref, extra, is_active) with `new()` generating `key_ref = agent-switch/{tool}/{id}` and `is_official()` helper. Test module appended at end of file.\n- `crates/core/src/lib.rs` — `pub mod error; pub mod models;`\n\n**TDD flow followed:**\n1. Wrote tests first; initial `cargo test` showed 0 tests because models wasn't declared — temporarily added `pub mod models;` to lib.rs to get a genuine RED: compile failed with E0433/E0425 (ToolKind/Provider undeclared), 8 errors.\n2. Implemented all three files exactly per spec.\n3. GREEN: `cargo test -p agent-switch-core` → **3 passed, 0 failed** (tool_kind_roundtrip, provider_key_ref_scoped_by_tool_and_id, provider_serde_roundtrip). Doc-tests: 0.\n\n**Files changed:**\n- crates/core/src/error.rs (new)\n- crates/core/src/models.rs (new)\n- crates/core/src/lib.rs (modified)\n- .gitignore (included via git add -A as instructed; note it also swept in the untracked .codebuddy/teams/*.json team state files)\n\n**Commit SHA:** 34c0d4eafb782500eb6bd00a09cf37b4cc9537c1 — \"feat(core): error types and data models\"\n\n**Self-review findings / concerns:**\n- Minor: `cargo` wasn't on PATH initially (`rustc -vV` not found); used `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin` via PATH export. No config change needed.\n- The commit includes `.codebuddy/teams/...` JSON files because the task said to use `git add -A` to include .gitignore. If team state files shouldn't be tracked, a future commit could add `.codebuddy/` to .gitignore — flagging for your decision.\n- No deviations from the spec; Cargo.toml untouched. Ready for downstream tasks (storage/adapters/service).",
+    "timestamp": "2026-07-23T17:03:28.499Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784826350028-2e0b1c",
+    "from": "spec-review-task-2",
+    "to": "team-lead",
+    "type": "message",
+    "content": "Spec compliance review for commit 34c0d4e (\"feat(core): error types and data models\"):\n\n✅ Spec compliant\n\nDetailed verification:\n\n1. `crates/core/src/error.rs` — All 9 required variants present with correct signatures:\n   - ConfigParse { path: String, msg: String } ✅\n   - Keyring(String) ✅\n   - ProviderNotFound(String) ✅\n   - ActiveProviderRemoval(String) ✅\n   - SecretNotFound(String) ✅\n   - Io(#[from] std::io::Error) ✅\n   - Db(#[from] rusqlite::Error) ✅\n   - Json(#[from] serde_json::Error) ✅\n   - Toml(String) ✅\n   - `pub type Result<T> = std::result::Result<T, CoreError>;` ✅\n\n2. `crates/core/src/models.rs` —\n   - ToolKind enum: 3 variants (ClaudeCode, Codex, OpenCode), correct derives (Debug,Clone,Copy,PartialEq,Eq,Hash,Serialize,Deserialize), serde rename_all=\"kebab-case\" ✅\n   - `ALL` const with 3 items ✅\n   - `as_str()` returning \"claude\"/\"codex\"/\"opencode\" ✅\n   - Display impl ✅\n   - FromStr accepting \"claude\"|\"claude-code\"|\"codex\"|\"opencode\", Err=String ✅\n   - Provider struct: all 6 fields with correct types and serde defaults on extra/is_active ✅\n   - `new()` generates key_ref=\"agent-switch/{tool}/{id}\", extra=Null, is_active=false ✅\n   - `is_official()` returns base_url.is_none() ✅\n   - Exactly 3 tests: tool_kind_roundtrip, provider_key_ref_scoped_by_tool_and_id, provider_serde_roundtrip ✅\n\n3. `crates/core/src/lib.rs` — exactly `pub mod error; pub mod models;` ✅\n\n4. Commit stat: no Cargo.toml changes included ✅\n   (Note: commit does include .gitignore and .codebuddy/teams/*.json files as the implementer disclosed, but these are outside the 3 requested source files and do not affect spec compliance.)\n\n5. Tests: `cargo test -p agent-switch-core` → 3 passed, 0 failed ✅\n\nNo missing pieces, no extra/unrequested code in the 3 target files.",
+    "timestamp": "2026-07-23T17:05:50.028Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784826470239-i4tw2q",
+    "from": "quality-review-task-2",
+    "to": "team-lead",
+    "type": "message",
+    "content": "质量审查报告 — Task 2（error.rs + models.rs，a4010f5..34c0d4e）\n\n验证：cargo test -p agent-switch-core → 3 passed。clippy/rustfmt 组件在本机 toolchain 未安装，无法运行，已目视检查格式与常见 lint 问题（无发现）。\n\n== Strengths ==\n- 错误设计合理：9 个变体语义清晰、消息含上下文（path/id），Io/Db/Json 三个 #[from] 正好覆盖本 crate 的直接依赖（std::io、rusqlite、serde_json），没有过度 #[from]（keyring/toml 用 String 包装是刻意的，因为这两者的错误需要在调用点补充语义，且 keyring::Error 生命周期/类型在 v3 下直接 #[from] 会泄漏依赖细节）。\n- 命名一致、符合 Rust 惯例；CoreError/Result 别名标准模式。\n- models.rs 单一职责明确：ToolKind 的 as_str/Display/FromStr 三件套一致（roundtrip 测试直接锁住这个一致性），FromStr 接受 \"claude\"|\"claude-code\" 双别名对 CLI 用户友好，错误消息列出合法值。\n- Provider::new 把 key_ref 的构造规则（agent-switch/{tool}/{id}）收敛在唯一一处，避免调用方拼错；is_official() 语义有注释说明。\n- serde 细节到位：ToolKind kebab-case、extra/is_active 带 #[serde(default)]，对旧数据/手写 JSON 兼容。\n- 测试质量真实：roundtrip 测试遍历 ALL 常量（新增变体时自动覆盖），key_ref 测试锁定格式契约，serde roundtrip 验证了 default 字段不丢。不是摆设测试。\n- 文件结构与 plan 完全匹配（error.rs / models.rs / lib.rs 仅两行导出）。\n\n== Issues ==\nCritical: None\nImportant: None\nMinor:\n1. FromStr 的 Err 类型是 String，与 CoreError 体系不互通（解析失败时调用方需手动包一层）。可接受——plan 后续 CLI 直接用 FromStr 给 clap 用，String Err 正是 clap 需要的；不建议改。\n2. FromStr 错误消息 \"expected claude|codex|opencode\" 未提及也接受 \"claude-code\" 别名，提示信息略不完整。影响极小。\n3. ToolKind::ALL 数组长度硬编码 3，新增变体时编译器不会报错（但 roundtrip 测试会在运行期抓住遗漏，因为 ALL 是手工维护的——实际上若忘记加进 ALL，测试也测不到新变体）。这是惯用写法，风险低。\n\n== Assessment ==\nApproved。代码与 plan 中 Task 2 Step 3 的参考实现逐字一致，测试真实验证行为，错误设计覆盖面恰当，无阻塞问题。Minor 项均不建议在本任务内修改。",
+    "timestamp": "2026-07-23T17:07:50.239Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784826483529-o6qlta",
+    "from": "impl-task-2",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784826482509\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-2\",\"timestamp\":\"2026-07-23T17:08:03.529Z\"}",
+    "timestamp": "2026-07-23T17:08:03.529Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784826484152-sr73hj",
+    "from": "spec-review-task-2",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784826484033\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-2\",\"timestamp\":\"2026-07-23T17:08:04.152Z\"}",
+    "timestamp": "2026-07-23T17:08:04.152Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784826486343-or0jp8",
+    "from": "quality-review-task-2",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784826485592\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-2\",\"timestamp\":\"2026-07-23T17:08:06.343Z\"}",
+    "timestamp": "2026-07-23T17:08:06.343Z",
+    "read": true
   }
 ]

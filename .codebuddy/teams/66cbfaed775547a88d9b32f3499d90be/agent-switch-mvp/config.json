@@ -32,6 +32,24 @@
       "name": "impl-task-2",
       "role": "Implement Task 2: errors+models",
       "sessionId": "7e65c48b45eb40979932d46b1cbd65ca"
+    },
+    {
+      "memberId": "spec-review-task-2@agent-switch-mvp",
+      "name": "spec-review-task-2",
+      "role": "Spec review Task 2",
+      "sessionId": "52cdd9817dfb43a583d7b42c1ca078d8"
+    },
+    {
+      "memberId": "quality-review-task-2@agent-switch-mvp",
+      "name": "quality-review-task-2",
+      "role": "Quality review Task 2",
+      "sessionId": "960b6142821a4257afd60da8223fd2a9"
+    },
+    {
+      "memberId": "impl-task-3@agent-switch-mvp",
+      "name": "impl-task-3",
+      "role": "Implement Task 3: sqlite store",
+      "sessionId": "dacbed2def5f4f78b51022ce6b2a3afb"
     }
   ]
 }
