@@ -2133,6 +2133,7 @@ pub mod store;
 pub use error::{CoreError, Result};
 pub use models::{Provider, ToolKind};
 pub use service::Core;
+pub use store::secrets::{KeyringStore, MockStore, SecretStore};
 ```
 
 - [ ] **Step 4: 运行确认通过**
@@ -2449,7 +2450,22 @@ fn resolve_tool(core: &Core, name: &str, tool: Option<ToolKind>) -> Result<ToolK
 }
 ```
 
-`print_table`：简单格式化输出（`{tool}  {id}  {base_url or "official"}  {active 标记 *}`），无需外部表格库。
+`print_table` 实现（active 行带 `*` 前缀，无需外部表格库）：
+
+```rust
+fn print_table(list: &[Provider]) {
+    for p in list {
+        let mark = if p.is_active { "*" } else { " " };
+        println!(
+            "{} {:<10} {:<16} {}",
+            mark,
+            p.tool.as_str(),
+            p.id,
+            p.base_url.as_deref().unwrap_or("(official)")
+        );
+    }
+}
+```
 
 - [ ] **Step 4: 运行确认通过**
 
@@ -2559,7 +2575,48 @@ fn cmd_add(
 }
 ```
 
-Edit 实现：取出旧 provider → 应用 `base_url`/`sets` 覆盖 → `core.update_provider(&p, key.as_deref())`。
+Edit 实现：
+
+```rust
+Cmd::Edit { name, tool, base_url, key, sets } => {
+    let core = build_core()?;
+    let tool = resolve_tool(&core, &name, tool)?;
+    let mut p = core
+        .list(Some(tool))?
+        .into_iter()
+        .find(|p| p.id == name)
+        .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{name}")))?;
+    if let Some(url) = base_url {
+        p.base_url = Some(url);
+    }
+    let mut map = p.extra.as_object().cloned().unwrap_or_default();
+    for (k, v) in sets {
+        map.insert(k, serde_json::Value::String(v));
+    }
+    if !map.is_empty() {
+        p.extra = serde_json::Value::Object(map);
+    }
+    core.update_provider(&p, key.as_deref())?; // key=Some 时更换钥匙串密钥
+    println!("updated {tool}/{name}");
+    Ok(())
+}
+```
+
+Import 分发（`--tool` 缺省时遍历全部工具）：
+
+```rust
+Cmd::Import { tool } => {
+    let core = build_core()?;
+    let tools: Vec<ToolKind> = tool.map_or_else(|| ToolKind::ALL.to_vec(), |t| vec![t]);
+    for t in tools {
+        match core.import(t)? {
+            Some(p) => println!("imported {t} snapshot: {}", p.base_url.as_deref().unwrap_or("(no key in config)")),
+            None => println!("{t}: nothing to import"),
+        }
+    }
+    Ok(())
+}
+```
 
 Backup 子命令：
 
