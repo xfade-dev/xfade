@@ -80,6 +80,18 @@
       "name": "impl-task-5",
       "role": "Implement Task 5: backup module",
       "sessionId": "d8a996b641e14fbe9e56fb172ab431ce"
+    },
+    {
+      "memberId": "spec-review-task-5@agent-switch-mvp",
+      "name": "spec-review-task-5",
+      "role": "Spec review Task 5",
+      "sessionId": "09c5724ea73447ea9241c4a5860983b8"
+    },
+    {
+      "memberId": "quality-review-task-5@agent-switch-mvp",
+      "name": "quality-review-task-5",
+      "role": "Quality review Task 5",
+      "sessionId": "32720746f84e45159afc56c3d0515af2"
     }
   ]
 }

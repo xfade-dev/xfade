@@ -1,21 +1,34 @@
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const KEEP: usize = 10;
 
-/// 备份 path 到 backup_dir/<filename>.<millis>；源不存在返回 Ok(None)
+fn is_backup_file(p: &Path) -> bool {
+    p.is_file()
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.rsplit_once('.'))
+            .is_some_and(|(_, suffix)| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 备份 path 到 backup_dir/<filename>.<nanos>；源不存在返回 Ok(None)
 pub fn backup_file(path: &Path, backup_dir: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
     fs::create_dir_all(backup_dir)?;
-    let millis = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis();
-    let name = format!("{}.{}", path.file_name().unwrap().to_string_lossy(), millis);
-    let dest = backup_dir.join(name);
+        .as_nanos();
+    let name = path.file_name().ok_or_else(|| CoreError::ConfigParse {
+        path: path.display().to_string(),
+        msg: "path has no file name".into(),
+    })?;
+    let mut dest_name = name.to_os_string();
+    dest_name.push(format!(".{}", nanos));
+    let dest = backup_dir.join(dest_name);
     fs::copy(path, &dest)?;
     rotate(backup_dir, KEEP)?;
     Ok(Some(dest))
@@ -26,7 +39,7 @@ pub fn rotate(dir: &Path, keep: usize) -> Result<()> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_file())
+        .filter(|p| is_backup_file(p))
         .collect();
     entries.sort();
     while entries.len() > keep {
@@ -48,7 +61,7 @@ pub fn list_backups(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_file())
+        .filter(|p| is_backup_file(p))
         .collect();
     entries.sort();
     entries.reverse();
