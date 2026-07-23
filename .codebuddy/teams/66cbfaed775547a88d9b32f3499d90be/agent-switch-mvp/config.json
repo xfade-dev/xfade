@@ -184,10 +184,10 @@
       "sessionId": "6da6b6648710436a9bb646f612df8035"
     },
     {
-      "memberId": "spec-review-task-11@agent-switch-mvp",
-      "name": "spec-review-task-11",
-      "role": "Spec review Task 11",
-      "sessionId": "bd48239af46b47fb87127a70cfaa559d"
+      "memberId": "impl-task-12@agent-switch-mvp",
+      "name": "impl-task-12",
+      "role": "Implement Task 12: CLI commands",
+      "sessionId": "887c9d350a154dd5a2581e407be988bb"
     }
   ]
 }

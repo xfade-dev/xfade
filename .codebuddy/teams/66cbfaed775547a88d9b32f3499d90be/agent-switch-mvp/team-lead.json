@@ -610,5 +610,68 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-quality-review-task-11\",\"approve\":true,\"from\":\"quality-review-task-11\",\"timestamp\":\"2026-07-23T18:25:52.219Z\"}",
     "timestamp": "2026-07-23T18:25:52.219Z",
     "read": true
+  },
+  {
+    "id": "msg-1784831245164-7o33dx",
+    "from": "impl-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\nFix applied: moved keyring read (`secrets.get`) before the backup loop in `use_provider`, so a keyring failure now happens before any backup side effects.\n\n- `cargo test -p agent-switch-core` → **39 passed**\n- Commit: `e721c4335d183daba1966c7dc3bdc1cb1a567bcb` — `refactor(core): read keyring before backups in use_provider`",
+    "timestamp": "2026-07-23T18:27:25.164Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784831347623-u63592",
+    "from": "re-review-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Task 11 re-review result (range 329da6c..e721c43)**\n\n**Fix verified: YES**\n\nEvidence — `git diff e721c43~1..e721c43` on `crates/core/src/service.rs` is a pure reorder:\n- The key computation block (`let key = if p.is_official() { None } else { Some(self.secrets.get(&p.key_ref)?) };`) was moved ABOVE the adapter/backup loop.\n- No logic change: same statements, same order within each block, only the relative position of the two blocks swapped. (The diff also contains unrelated `.codebuddy/teams/...` JSON churn, not part of the code fix.)\n\nFinal `use_provider` order confirmed in service.rs:76-98:\n1. `ensure_imported(tool)` (line 77)\n2. `db.get(tool, id)` → ProviderNotFound (lines 78-81)\n3. `secrets.get(&p.key_ref)` if not official (lines 83-87) ← now before any side effects\n4. backup loop `backup_file(...)` (lines 89-93)\n5. `patch_official_removal` (line 95)\n6. `adapter.apply(&p, key.as_deref())` (line 96)\n7. `db.set_active(tool, id)` (line 97)\n\nA keyring failure now aborts before any backup/apply side effects — the quality issue is resolved.\n\n**Tests: PASS** — `cargo test -p agent-switch-core` → `test result: ok. 39 passed; 0 failed` (finished in 0.07s). Doc-tests: 0 run, ok.\n\n**Final assessment for Task 11 (329da6c..e721c43): Approved**",
+    "timestamp": "2026-07-23T18:29:07.623Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784831360514-f4st9t",
+    "from": "impl-task-11",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784831359040\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-11\",\"timestamp\":\"2026-07-23T18:29:20.514Z\"}",
+    "timestamp": "2026-07-23T18:29:20.514Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784831362514-gae9sn",
+    "from": "spec-review-task-11",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784831360627\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-11\",\"timestamp\":\"2026-07-23T18:29:22.514Z\"}",
+    "timestamp": "2026-07-23T18:29:22.514Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784831362515-b3rt01",
+    "from": "re-review-task-11",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784831362301\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"re-review-task-11\",\"timestamp\":\"2026-07-23T18:29:22.515Z\"}",
+    "timestamp": "2026-07-23T18:29:22.515Z",
+    "read": true
+  },
+  {
+    "id": "timeout-1784832272076-fqrqha",
+    "from": "spec-review-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"spec-review-task-11\" did not acknowledge the shutdown_request (request_id=shutdown-1784831360627) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-07-23T18:44:32.076Z",
+    "read": true
+  },
+  {
+    "id": "timeout-1784832272077-m3zml7",
+    "from": "re-review-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "[System] Shutdown timeout: \"re-review-task-11\" did not acknowledge the shutdown_request (request_id=shutdown-1784831362301) within 60s and has been force-terminated.Any unreported deliverables from this teammate may have been lost.You can proceed with team_delete or continue with the remaining teammates.",
+    "timestamp": "2026-07-23T18:44:32.077Z",
+    "read": true
   }
 ]
