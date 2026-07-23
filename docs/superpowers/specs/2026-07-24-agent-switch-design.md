@@ -61,6 +61,8 @@ struct Provider {
 }
 ```
 
+唯一性约束：`(tool, id)` 复合唯一——同一工具内不允许同名，不同工具允许同名（如 claude 和 codex 下都可以有 "kimi"）。
+
 密钥流程：添加时 key 写入系统钥匙串，SQLite 只存 `key_ref`；切换时从 keyring 取出明文写入工具配置文件。主库永不落明文。
 
 存储位置：
@@ -78,7 +80,7 @@ struct Provider {
 4. 备份原文件到 backups 目录
 5. rename 原子替换
 
-首次运行自动把各工具当前配置导入为名为 `imported` 的 provider，保证可随时切回。
+首次运行（该工具下尚无任何 provider 时）自动把当前配置导入为名为 `imported` 的 provider，保证可随时切回。手动执行 `asw import` 时若 `imported` 已存在，则覆盖更新快照（导入语义就是"把当前实况存为快照"）。
 
 ## 5. 适配层细节
 
@@ -90,7 +92,7 @@ struct Provider {
 { "env": { "ANTHROPIC_BASE_URL": "...", "ANTHROPIC_AUTH_TOKEN": "..." } }
 ```
 
-- 切回官方 = 删除这两个 env 键，保留 settings.json 其他内容
+- 切回官方 = 恢复到 `imported` 快照的状态；对无快照场景等价于删除这两个 env 键，保留 settings.json 其他内容
 - `~/.claude.json`（登录态、用户数据）绝不触碰
 - 可选写入 `ANTHROPIC_MODEL`（存于 extra）
 
@@ -107,7 +109,7 @@ wire_api = "chat"          # 多数第三方为 chat 协议；官方为 response
 env_key = "KIMI_API_KEY"
 ```
 
-key 写入 `~/.codex/auth.json`（`{"OPENAI_API_KEY": "..."}`）。切官方时恢复导入时的原始状态。
+key 写入 `~/.codex/auth.json`（`{"OPENAI_API_KEY": "..."}`）。说明：`env_key` 是 Codex 读取第三方 key 的另一种机制（从环境变量读），但 CLI 工具无法可靠地持久化用户环境变量（需改 shell rc，侵入性大），故 MVP 统一走 auth.json 路径（cc-switch 验证过）；`env_key` 字段保留在配置中是为了语义完整，实现时需对照真实 Codex 行为核对 auth.json 键名优先级。切回官方 = 恢复 `imported` 快照的 config.toml 与 auth.json。
 
 ### 5.3 OpenCode
 
@@ -139,7 +141,7 @@ asw add --tool codex --name kimi \
 asw ls [--tool <tool>]           # 列表，active 高亮
 asw use <name> [--tool <tool>]   # 切换
 asw current                      # 各工具当前生效 provider
-asw edit <name> [--set key=val]  # 修改
+asw edit <name> [--set key=val]  # 修改 base_url / extra；--key 可更换密钥（重新写入 keyring）
 asw rm <name>                    # 删除（active 不可删）
 asw presets                      # 内置预设列表
 asw backup ls                    # 备份列表
