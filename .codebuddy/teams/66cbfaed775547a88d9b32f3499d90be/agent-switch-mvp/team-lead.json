@@ -250,5 +250,50 @@
     "content": "## Task 5 备份模块代码质量审查报告\n\n### 审查范围\n- 文件：`crates/core/src/backup.rs`（94 行，含测试）\n- 变更：`git diff 5c4b064..95569ee`\n- 测试：3 个单元测试全部通过（`cargo test -p agent-switch-core backup`）\n\n---\n\n### Strengths（优点）\n\n1. **职责单一**：模块仅负责备份/轮转/恢复/列表，无越界逻辑\n2. **API 设计清晰**：`backup_file` 返回 `Option<PathBuf>` 优雅处理源缺失；`rotate` 独立暴露便于测试\n3. **测试覆盖核心路径**：备份+恢复、缺失源、轮转保留数量，3 个测试均通过\n4. **文件大小合理**：94 行，符合单一职责原则\n5. **无 unsafe，无外部依赖**：仅用 std + crate::error\n\n---\n\n### Issues（问题）\n\n#### Critical（严重）\n- **None**\n\n#### Important（重要）\n1. **同毫秒文件名冲突风险**（`backup.rs:17`）\n   - 使用 `SystemTime::now().as_millis()` 作为后缀，同一毫秒内对同一文件连续备份会覆盖前一次\n   - 测试中用 `thread::sleep(2ms)` 规避，但生产环境高频调用时可能丢失备份\n   - 建议：追加纳秒或随机后缀，或冲突时自增计数\n\n2. **`file_name().unwrap()`  panic 风险**（`backup.rs:17`）\n   - 若 `path` 以 `..` 结尾（如 `/foo/..`），`file_name()` 返回 `None`，`unwrap()` 会 panic\n   - 虽然调用方通常传正常文件路径，但公共 API 应防御\n   - 建议：使用 `ok_or_else` 返回 `CoreError::ConfigParse` 或类似错误\n\n3. **非 UTF-8 文件名处理不一致**（`backup.rs:17`）\n   - `to_string_lossy()` 会静默替换非法 UTF-8 字符为 `U+FFFD`，可能导致：\n     - 备份名与原名不匹配，恢复时 `restore_backup` 找不到目标（见 Task 11 `rsplit_once('.')` 逻辑）\n     - 两个不同文件名的 lossy 结果相同，互相覆盖\n   - 建议：至少记录日志，或拒绝非 UTF-8 文件名\n\n#### Minor（轻微）\n1. **`rotate` 的排序假设脆弱**（`backup.rs:31`）\n   - 按文件名字典序排序等价于时间序，前提是文件名格式为 `<name>.<millis>`\n   - 若备份目录混入非备份文件（如 `.DS_Store`、临时文件），它们也会被计入 `keep` 数量并可能被误删\n   - 建议：过滤只匹配备份命名模式的文件，或按修改时间排序\n\n2. **`list_backups` 与 `rotate` 重复代码**（`backup.rs:26-30` vs `48-52`）\n   - 两处读取目录+过滤+排序逻辑完全相同，可提取辅助函数\n\n3. **`restore` 无防御**（`backup.rs:38-41`）\n   - 直接 `fs::copy`，若 `target` 父目录不存在会失败；若 `backup` 不存在也会失败\n   - 虽然调用方（service 层）可能已确保，但公共 API 可更健壮\n\n4. **常量 `KEEP` 硬编码**（`backup.rs:5`）\n   - 保留 10 份写死在模块内，未来若需配置化需改 API\n   - 当前可接受，但值得注意\n\n---\n\n### Assessment（评估）\n\n**Changes needed**\n\n主要阻塞点是 **同毫秒冲突** 和 **`file_name().unwrap()` panic 风险**。两者都可能在生产环境导致数据丢失或崩溃。建议修复后重新提交。\n\n其余为代码健壮性和可维护性改进，不阻塞合并但建议跟进。\n\n---\n\n### 验证结果\n- `cargo test -p agent-switch-core backup`：3 passed\n- `cargo test -p agent-switch-core`：12 passed（含其他模块）\n- `cargo clippy` / `cargo fmt`：环境未安装组件，无法验证",
     "timestamp": "2026-07-23T17:34:30.371Z",
     "read": true
+  },
+  {
+    "id": "msg-1784828214050-ala460",
+    "from": "impl-task-5",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n**What was fixed:**\n1. **Same-millisecond collision**: Changed timestamp from `as_millis()` to `as_nanos()`\n2. **`file_name().unwrap()` panic risk**: Replaced with `ok_or_else(|| CoreError::ConfigParse { ... })`\n3. **Non-UTF-8 filename corruption**: Replaced `to_string_lossy()` with `OsString` building via `to_os_string()` + `push()`\n4. **Stray files in rotate/list_backups**: Added `is_backup_file()` helper that filters for files ending with `.` + all-digit suffix\n\n**Test results:**\n- `cargo test -p agent-switch-core`: 12 passed, 0 failed\n- Linter: 0 errors\n\n**Files changed:**\n- `crates/core/src/backup.rs`\n\n**Commit SHA:** `62df841c9a24b19db0187c1f201f0f2990111f4e`\n\n**Self-review findings / concerns:**\n- None. All 4 issues addressed as specified. The `is_backup_file` helper uses `rsplit_once('.')` to correctly handle original filenames containing dots (e.g. `settings.json.<nanos>`). Sorting remains correct because nanos timestamps are fixed-width.",
+    "timestamp": "2026-07-23T17:36:54.050Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784828278968-qsjmj2",
+    "from": "quality-review-task-5",
+    "to": "team-lead",
+    "type": "message",
+    "content": "## Task 5 备份模块修复后复审报告\n\n### 复审范围\n- 文件：`crates/core/src/backup.rs`（107 行）\n- 变更：`git diff 5c4b064..62df841`\n- 测试：`cargo test -p agent-switch-core` — **12 passed, 0 failed**\n\n---\n\n### 修复验证\n\n| 原问题 | 修复方式 | 验证结果 |\n|--------|---------|---------|\n| 同毫秒冲突 | `as_millis()` → `as_nanos()` | ✅ 纳秒级时间戳，冲突概率极低 |\n| `file_name().unwrap()` panic | `ok_or_else` → `CoreError::ConfigParse` | ✅ 优雅降级，返回错误而非崩溃 |\n| 非 UTF-8 文件名 `to_string_lossy()` | `to_os_string()` + `push(format!(\".{}\", nanos))` | ✅ 保留原始字节，非 UTF-8 文件名安全 |\n| 杂散文件被误删/计入 keep | 新增 `is_backup_file()` 过滤 | ✅ 仅匹配 `.<digits>` 后缀，`.DS_Store` 等被排除 |\n\n---\n\n### 修复后代码质量评估\n\n**优点保持：**\n- 职责单一，API 清晰\n- 测试全部通过\n- 文件大小合理（107 行）\n\n**新增优点：**\n- `is_backup_file()` 使用 `rsplit_once('.')`，正确处理 `settings.json.<nanos>` 等多点文件名\n- 过滤逻辑同时保护 `rotate` 和 `list_backups`\n\n**残留 Minor（不阻塞）：**\n1. `rotate` / `list_backups` 仍有重复代码（读取目录+过滤+排序），可提取辅助函数\n2. `restore` 仍无防御（目标父目录不存在时失败）\n3. `KEEP` 常量硬编码\n\n以上均为可维护性改进，不影响正确性。\n\n---\n\n### Assessment\n\n**Approved**\n\n所有 Important 问题已修复，代码质量达到合并标准。测试验证通过（12/12）。建议后续迭代中处理残留的 Minor 项。",
+    "timestamp": "2026-07-23T17:37:58.968Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828289333-hsf2bn",
+    "from": "impl-task-5",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828288590\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"impl-task-5\",\"timestamp\":\"2026-07-23T17:38:09.333Z\"}",
+    "timestamp": "2026-07-23T17:38:09.333Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828290690-mb2cuk",
+    "from": "spec-review-task-5",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828290149\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"spec-review-task-5\",\"timestamp\":\"2026-07-23T17:38:10.690Z\"}",
+    "timestamp": "2026-07-23T17:38:10.690Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784828293480-sobcd7",
+    "from": "quality-review-task-5",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784828292012\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"quality-review-task-5\",\"timestamp\":\"2026-07-23T17:38:13.480Z\"}",
+    "timestamp": "2026-07-23T17:38:13.480Z",
+    "read": true
   }
 ]

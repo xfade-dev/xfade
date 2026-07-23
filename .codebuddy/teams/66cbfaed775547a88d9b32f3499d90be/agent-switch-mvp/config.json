@@ -92,6 +92,12 @@
       "name": "quality-review-task-5",
       "role": "Quality review Task 5",
       "sessionId": "32720746f84e45159afc56c3d0515af2"
+    },
+    {
+      "memberId": "impl-task-6@agent-switch-mvp",
+      "name": "impl-task-6",
+      "role": "Implement Task 6: adapter trait",
+      "sessionId": "ac79885cc6e94c78aac9b29d79aa1ef6"
     }
   ]
 }
