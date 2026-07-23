@@ -574,5 +574,41 @@
     "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-1784830591678\",\"approve\":true,\"reason\":\"Auto-acknowledged by team-member runtime\",\"from\":\"review-task-10\",\"timestamp\":\"2026-07-23T18:16:32.733Z\"}",
     "timestamp": "2026-07-23T18:16:32.733Z",
     "read": true
+  },
+  {
+    "id": "msg-1784830871960-4vfe1l",
+    "from": "impl-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "**Status:** DONE\n\n## What I implemented\n\nCreated `crates/core/src/service.rs` with the `Core` struct — the single entry point for CLI/GUI. Key methods:\n- `with_paths(home, data_dir, secrets)` / `for_current_user()` — injected paths for testability\n- `add_provider` / `update_provider` / `list` / `current` / `remove` — CRUD with keyring integration\n- `use_provider` — full switch flow: ensure_imported → backup → get key → patch_official_removal → adapter.apply → db.set_active\n- `ensure_imported` / `import` — first-time auto snapshot and manual re-import\n- `backups` / `restore_backup` — backup listing and restoration\n- `patch_official_removal` — OpenCode-specific: when switching to official, records current custom provider id in `extra.remove_provider` so adapter can clean it up\n\nUpdated `crates/core/src/lib.rs` with `pub mod service;` and re-exports (`Core`, `CoreError`, `Result`, `Provider`, `ToolKind`, `KeyringStore`, `MockStore`, `SecretStore`).\n\n## Test results\n\n- `cargo test -p agent-switch-core service` → 7 passed\n- `cargo test -p agent-switch-core` → **39 passed** (32 old + 7 new), 0 failed\n\n## Files changed\n\n- `crates/core/src/service.rs` (new, 321 lines)\n- `crates/core/src/lib.rs` (modified)\n\n## Commit\n\n`97b1979ffe3415b72e4be1daf17cc17fc389edc0` — `feat(core): service layer with use/import/remove`\n\n## Self-review findings / concerns\n\nNone. Implementation matches spec exactly. All tests pass on first run.",
+    "timestamp": "2026-07-23T18:21:11.960Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784830967419-xiyuoe",
+    "from": "spec-review-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "✅ Spec compliant\n\n## Verification Summary\n\n**Commit**: 97b1979 (\"feat(core): service layer with use/import/remove\")\n**Files changed**: service.rs (267 lines), lib.rs (+6 lines), config/team files\n**Test result**: `cargo test -p agent-switch-core` → **39 passed** (32 old + 7 new) ✓\n\n## Spec Compliance Check\n\n### 1. `Core` struct & constructors\n- `Core { db, secrets: Box<dyn SecretStore>, home, data_dir }` ✓\n- `with_paths(home, data_dir, secrets)` — create_dir_all(data_dir), Database::open(data_dir/agent-switch.db) ✓\n- `for_current_user()` — dirs::home_dir, ~/.config/agent-switch, KeyringStore ✓\n\n### 2. Provider CRUD\n- `add_provider(p, key)` — key→keyring, is_active=false, upsert ✓\n- `update_provider(p, key)` — ProviderNotFound if missing; key→keyring if Some ✓\n- `list(Option<ToolKind>)` ✓\n- `current(tool)` → active provider ✓\n- `remove(tool,id)` — ActiveProviderRemoval if active; delete keyring + db row ✓\n\n### 3. `use_provider` flow (order verified)\n1. `ensure_imported(tool)` ✓ (before get)\n2. `get(tool, id)` → ProviderNotFound if missing ✓\n3. Backup all config_paths to `data_dir/backups/<tool>` ✓ (before apply)\n4. Key from keyring (None if official) ✓\n5. `patch_official_removal` ✓\n6. `adapter.apply(&p, key)` ✓\n7. `db.set_active(tool, id)` ✓\n\n### 4. `patch_official_removal`\n- OpenCode + official + current is third-party → `extra.remove_provider = current id` ✓\n- Sets `p.extra = json!({ \"remove_provider\": cur.id })` ✓\n\n### 5. `ensure_imported` / `import`\n- Skip if imported exists ✓\n- Else `read_current` → key→keyring, upsert ✓\n- `import(tool)` — read_current → overwrite snapshot → Option<Provider> ✓\n\n### 6. `backups` / `restore_backup`\n- `backups(tool)` → list_backups ✓\n- `restore_backup(tool, backup)` — parse original filename by `rsplit_once('.')`, match against config_paths by `file_name`, restore ✓\n\n### 7. Test module — exactly 7 tests\n1. `add_and_use_claude_provider` ✓\n2. `first_use_auto_imports_current_config` ✓\n3. `use_official_clears_claude_env` ✓\n4. `remove_active_rejected` ✓\n5. `use_creates_backup` ✓\n6. `use_unknown_provider_errors` ✓\n7. `use_opencode_official_removes_previous_custom` ✓\n\n### 8. `lib.rs` exports\n- `pub mod service;` ✓\n- Re-exports: CoreError, Result, Provider, ToolKind, Core, KeyringStore, MockStore, SecretStore ✓\n\n## Issues Found\nNone. No missing pieces, no extra/unrequested code.",
+    "timestamp": "2026-07-23T18:22:47.419Z",
+    "read": true
+  },
+  {
+    "id": "msg-1784831136869-utzd2r",
+    "from": "quality-review-task-11",
+    "to": "team-lead",
+    "type": "message",
+    "content": "Task 11 (Core 服务层) 质量审查报告\n\n## Strengths\n- API 设计清晰：Core 提供 with_paths/for_current_user 双构造入口，CLI 和测试都能方便注入依赖\n- 职责单一：Core 是唯一知道如何改配置/存密钥的入口，适配器只负责文件格式转换\n- 测试覆盖全面：7 个集成测试覆盖正常切换、自动导入、官方切换、备份创建、错误路径等关键场景\n- 测试真正端到端：使用 tempfile 创建隔离环境，读写真实文件并断言内容\n- 错误处理一致：统一使用 CoreError，错误信息包含上下文（如 provider 标识）\n- 事务安全：set_active 使用 SQLite 事务保证同工具内排他性\n\n## Issues\n\n### Critical\nNone\n\n### Important\n1. **keyring 失败发生在备份后 apply 前，状态不安全**\n   - 位置：service.rs:89-97\n   - 问题：use_provider 流程是 备份→取 key→补丁→apply→set_active。如果 secrets.get() 失败，备份已创建但配置未修改，用户重试时会再次备份，产生冗余备份。更严重的是，如果 apply 失败（如磁盘写入错误），备份已创建但配置处于不一致状态（部分文件已修改）。\n   - 建议：将 secrets.get() 移到备份之前，或在 apply 失败时自动恢复备份。\n\n2. **patch_official_removal 的特例处理不够最小侵入**\n   - 位置：service.rs:101-110\n   - 问题：OpenCode 官方切换需要知道清理哪个自定义 provider，当前通过修改 provider.extra 传递 remove_provider，这污染了 Provider 的语义。extra 应该存储工具特有配置（如 model、wire_api），而不是控制流指令。\n   - 建议：让 ToolAdapter.apply 接收一个 Option<&Provider> 参数表示当前 active provider，由适配器自行决定如何清理。\n\n### Minor\n1. **restore_backup 的备份文件名解析过于简单**\n   - 位置：service.rs:144-157\n   - 问题：假设备份文件名格式为 <原文件名>.<时间戳>，使用 rsplit_once('.') 分割。如果原文件名本身包含多个点（如 config.toml.bak），会解析错误。\n   - 建议：使用更可靠的命名方案，如 <原文件名>.<纳秒时间戳>，并在恢复时验证目标文件是否存在于 config_paths 中。\n\n2. **ensure_imported 在 use_provider 中隐式调用，行为不够透明**\n   - 位置：service.rs:76-77\n   - 问题：用户调用 use_provider 时，如果该工具没有 imported 快照，会自动导入当前配置。这个副作用对用户不透明，可能导致意外覆盖现有配置。\n   - 建议：将 ensure_imported 改为显式步骤，或在文档中明确说明。\n\n3. **backup_file 的纳秒时间戳在文件系统上可能不唯一**\n   - 位置：backup.rs:21-24\n   - 问题：使用 SystemTime::now().as_nanos() 作为后缀，在快速连续备份时可能产生相同时间戳（虽然概率极低）。\n   - 建议：添加随机后缀或使用 UUID。\n\n## Assessment\n**Changes needed**\n\n核心功能实现正确，测试覆盖良好，但存在两个重要问题需要修复：\n1. 错误路径下的状态安全性需要加强（keyring/apply 失败时的备份处理）\n2. patch_official_removal 的设计需要重构以避免污染 Provider 语义\n\n建议修复 Important 级别问题后再合并。",
+    "timestamp": "2026-07-23T18:25:36.869Z",
+    "read": true
+  },
+  {
+    "id": "resp-1784831152219-tc2mqg",
+    "from": "quality-review-task-11",
+    "to": "team-lead",
+    "type": "shutdown_response",
+    "content": "{\"type\":\"shutdown_response\",\"request_id\":\"shutdown-quality-review-task-11\",\"approve\":true,\"from\":\"quality-review-task-11\",\"timestamp\":\"2026-07-23T18:25:52.219Z\"}",
+    "timestamp": "2026-07-23T18:25:52.219Z",
+    "read": true
   }
 ]

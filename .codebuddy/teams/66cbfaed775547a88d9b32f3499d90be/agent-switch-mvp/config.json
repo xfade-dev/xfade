@@ -182,6 +182,12 @@
       "name": "impl-task-11",
       "role": "Implement Task 11: service layer",
       "sessionId": "6da6b6648710436a9bb646f612df8035"
+    },
+    {
+      "memberId": "spec-review-task-11@agent-switch-mvp",
+      "name": "spec-review-task-11",
+      "role": "Spec review Task 11",
+      "sessionId": "bd48239af46b47fb87127a70cfaa559d"
     }
   ]
 }

@@ -80,17 +80,17 @@ impl Core {
             .get(tool, id)?
             .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{id}")))?;
 
-        let adapter = self.adapter(tool);
-        let backup_dir = self.data_dir.join("backups").join(tool.as_str());
-        for path in adapter.config_paths() {
-            backup_file(&path, &backup_dir)?;
-        }
-
         let key = if p.is_official() {
             None
         } else {
             Some(self.secrets.get(&p.key_ref)?)
         };
+
+        let adapter = self.adapter(tool);
+        let backup_dir = self.data_dir.join("backups").join(tool.as_str());
+        for path in adapter.config_paths() {
+            backup_file(&path, &backup_dir)?;
+        }
 
         let p = self.patch_official_removal(tool, p)?;
         adapter.apply(&p, key.as_deref())?;
