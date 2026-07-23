@@ -14,6 +14,24 @@
       "name": "impl-task-1",
       "role": "Implement Task 1: workspace scaffold",
       "sessionId": "cec502bdb4eb4a45b547222c7bcc6ff0"
+    },
+    {
+      "memberId": "spec-review-task-1@agent-switch-mvp",
+      "name": "spec-review-task-1",
+      "role": "Spec review Task 1 scaffold",
+      "sessionId": "d0a57e3b397c4e6896f6ffbb2fe08f12"
+    },
+    {
+      "memberId": "quality-review-task-1@agent-switch-mvp",
+      "name": "quality-review-task-1",
+      "role": "Quality review Task 1",
+      "sessionId": "97b0ba4fe43242e2a8bb32ba447f60a6"
+    },
+    {
+      "memberId": "impl-task-2@agent-switch-mvp",
+      "name": "impl-task-2",
+      "role": "Implement Task 2: errors+models",
+      "sessionId": "7e65c48b45eb40979932d46b1cbd65ca"
     }
   ]
 }

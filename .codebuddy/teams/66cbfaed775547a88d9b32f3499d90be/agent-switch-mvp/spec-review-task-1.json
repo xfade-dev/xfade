@@ -1,0 +1,11 @@
+[
+  {
+    "id": "shutdown-1784825984486",
+    "from": "team-lead",
+    "to": "spec-review-task-1",
+    "type": "shutdown_request",
+    "content": "{\"type\":\"shutdown_request\",\"request_id\":\"shutdown-1784825984486\",\"reason\":\"Review complete, task approved. Shutting down.\",\"from\":\"team-lead\",\"timestamp\":\"2026-07-23T16:59:44.486Z\"}",
+    "timestamp": "2026-07-23T16:59:44.486Z",
+    "read": true
+  }
+]
