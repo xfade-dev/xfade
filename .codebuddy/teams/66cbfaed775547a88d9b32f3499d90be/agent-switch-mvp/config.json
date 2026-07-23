@@ -152,6 +152,18 @@
       "name": "impl-task-9",
       "role": "Implement Task 9: opencode adapter",
       "sessionId": "526211e61e64406487b1ec7bb5414b78"
+    },
+    {
+      "memberId": "spec-review-task-9@agent-switch-mvp",
+      "name": "spec-review-task-9",
+      "role": "Spec review Task 9",
+      "sessionId": "2e50a0ce31cf4ee4b0cdb3b36825dd3e"
+    },
+    {
+      "memberId": "quality-review-task-9@agent-switch-mvp",
+      "name": "quality-review-task-9",
+      "role": "Quality review Task 9",
+      "sessionId": "39257a81ea5f4c6189ad699bae8284ea"
     }
   ]
 }

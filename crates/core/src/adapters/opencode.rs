@@ -115,8 +115,8 @@ impl ToolAdapter for OpenCodeAdapter {
             );
         }
 
-        self.save_json(&self.config_path(), &doc)?;
-        self.save_json(&self.auth_path(), &auth)
+        self.save_json(&self.auth_path(), &auth)?;
+        self.save_json(&self.config_path(), &doc)
     }
 
     fn read_current(&self) -> Result<Option<(Provider, Option<String>)>> {
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn read_current_imports_first_custom() {
-        let (dir, ad) = setup();
+        let (_dir, ad) = setup();
         let p = Provider::new("kimi", ToolKind::OpenCode, Some("https://x".into()));
         ad.apply(&p, Some("sk-9")).unwrap();
         let (got, key) = ad.read_current().unwrap().unwrap();
