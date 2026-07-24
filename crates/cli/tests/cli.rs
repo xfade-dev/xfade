@@ -64,3 +64,91 @@ fn presets_lists_all_tools() {
         .success()
         .stdout(predicate::str::contains("official").and(predicate::str::contains("kimi")));
 }
+
+#[test]
+fn switch_back_to_imported_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(
+        home.path().join(".claude/settings.json"),
+        r#"{"env":{"ANTHROPIC_BASE_URL":"https://relay","ANTHROPIC_AUTH_TOKEN":"sk-old"}}"#,
+    ).unwrap();
+
+    asw(home.path())
+        .args(["add", "--tool", "claude", "--name", "kimi", "--base-url", "https://x", "--key", "sk-new"])
+        .assert().success();
+    asw(home.path()).args(["use", "kimi", "--tool", "claude"]).assert().success();
+    asw(home.path()).args(["use", "imported", "--tool", "claude"]).assert().success();
+
+    let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+    assert!(s.contains("https://relay"));
+    assert!(s.contains("sk-old"));
+}
+
+#[test]
+fn codex_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["add", "--tool", "codex", "--name", "kimi", "--base-url", "https://api.moonshot.cn/v1", "--key", "sk-1"])
+        .assert().success();
+    asw(home.path()).args(["use", "kimi", "--tool", "codex"]).assert().success();
+
+    let cfg = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(cfg.contains("model_provider = \"kimi\""));
+    let auth = fs::read_to_string(home.path().join(".codex/auth.json")).unwrap();
+    assert!(auth.contains("sk-1"));
+
+    asw(home.path())
+        .args(["add", "--tool", "codex", "--name", "official"])
+        .assert().success(); // 无 --base-url => 官方
+    asw(home.path()).args(["use", "official", "--tool", "codex"]).assert().success();
+    let cfg = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(!cfg.contains("model_provider ="));
+}
+
+#[test]
+fn edit_updates_base_url_and_extra() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["add", "--tool", "claude", "--name", "kimi", "--base-url", "https://old", "--key", "sk-1"])
+        .assert().success();
+    asw(home.path())
+        .args(["edit", "kimi", "--tool", "claude", "--base-url", "https://new", "--set", "model=k2"])
+        .assert().success();
+    asw(home.path()).args(["use", "kimi", "--tool", "claude"]).assert().success();
+    let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+    assert!(s.contains("https://new"));
+    assert!(s.contains("k2")); // ANTHROPIC_MODEL from extra.model
+}
+
+#[test]
+fn import_and_backup_commands() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["import", "--tool", "claude"])
+        .assert().success()
+        .stdout(predicate::str::contains("nothing"));
+    asw(home.path())
+        .args(["backup", "ls", "--tool", "claude"])
+        .assert().success();
+    fs::create_dir_all(home.path().join(".claude")).unwrap();
+    fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+    asw(home.path())
+        .args(["add", "--tool", "claude", "--name", "k", "--base-url", "https://x", "--key", "1"])
+        .assert().success();
+    asw(home.path()).args(["use", "k", "--tool", "claude"]).assert().success();
+    asw(home.path())
+        .args(["backup", "ls", "--tool", "claude"])
+        .assert().success()
+        .stdout(predicate::str::contains("settings.json"));
+}
+
+#[test]
+fn completion_generates() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["completion", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#compdef asw"));
+}

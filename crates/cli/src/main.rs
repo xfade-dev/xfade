@@ -104,7 +104,7 @@ fn main() {
 /// 环境契约（与 tests/cli.rs 的 asw() 辅助函数严格一致）：
 /// - `HOME`：工具配置根。测试注入 tempdir；真实环境即用户主目录。
 /// - `ASW_DATA_DIR`：自身数据目录（db/backups），缺省 `$HOME/.config/agent-switch`。
-/// - `ASW_MOCK_SECRETS=1`：用内存 MockStore 替代系统钥匙串（仅测试/冒烟）。
+/// - `ASW_MOCK_SECRETS=1`：用文件 MockStore（ASW_DATA_DIR/mock-secrets.json）替代系统钥匙串（仅测试/冒烟）。
 fn build_core() -> Result<Core, CoreError> {
     let use_mock = std::env::var("ASW_MOCK_SECRETS").ok().as_deref() == Some("1");
     if let Ok(home) = std::env::var("HOME") {
@@ -163,12 +163,69 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
-        // Edit / Import / Backup / Completion 在 Task 13 实现
-        _ => todo!("Task 13"),
+        Cmd::Edit { name, tool, base_url, key, sets } => {
+            let core = build_core()?;
+            let tool = resolve_tool(&core, &name, tool)?;
+            let mut p = core
+                .list(Some(tool))?
+                .into_iter()
+                .find(|p| p.id == name)
+                .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{name}")))?;
+            if let Some(url) = base_url {
+                p.base_url = Some(url);
+            }
+            let mut map = p.extra.as_object().cloned().unwrap_or_default();
+            for (k, v) in sets {
+                map.insert(k, serde_json::Value::String(v));
+            }
+            if !map.is_empty() {
+                p.extra = serde_json::Value::Object(map);
+            }
+            core.update_provider(&p, key.as_deref())?;
+            println!("updated {tool}/{name}");
+            Ok(())
+        }
+        Cmd::Import { tool } => {
+            let core = build_core()?;
+            let tools: Vec<ToolKind> = tool.map_or_else(|| ToolKind::ALL.to_vec(), |t| vec![t]);
+            for t in tools {
+                match core.import(t)? {
+                    Some(p) => println!(
+                        "imported {t} snapshot: {}",
+                        p.base_url.as_deref().unwrap_or("(no base url in config)")
+                    ),
+                    None => println!("{t}: nothing to import"),
+                }
+            }
+            Ok(())
+        }
+        Cmd::Backup { cmd } => match cmd {
+            BackupCmd::Ls { tool } => {
+                let core = build_core()?;
+                for b in core.backups(tool)? {
+                    println!("{}", b.display());
+                }
+                Ok(())
+            }
+            BackupCmd::Restore { tool, file } => {
+                let core = build_core()?;
+                core.restore_backup(tool, &file)?;
+                println!("restored {}", file.display());
+                Ok(())
+            }
+        },
+        Cmd::Completion { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
-/// Task 12 版：仅支持参数齐全的非交互调用；交互模式在 Task 13 实现
+/// 交互判定：只要 --name 已提供就不再进交互。
+/// --name 有 + --base-url 无 => 官方 provider（base_url=None），无需 key；
+/// --name 缺失 => 交互：选预设或自定义。
 fn cmd_add(
     tool: Option<ToolKind>,
     name: Option<String>,
@@ -176,23 +233,80 @@ fn cmd_add(
     key: Option<String>,
     sets: Vec<(String, String)>,
 ) -> Result<(), CoreError> {
-    let (Some(tool), Some(name)) = (tool, name) else {
-        return Err(CoreError::ConfigParse {
-            path: String::new(),
-            msg: "interactive mode not yet implemented; pass --tool and --name".into(),
-        });
+    let core = build_core()?;
+
+    let tool = match tool {
+        Some(t) => t,
+        None => {
+            let items: Vec<String> = ToolKind::ALL.iter().map(|t| t.to_string()).collect();
+            let idx = dialoguer::Select::new()
+                .with_prompt("选择工具")
+                .items(&items)
+                .interact()
+                .map_err(|e| CoreError::Keyring(e.to_string()))?;
+            ToolKind::ALL[idx]
+        }
     };
-    let mut map = serde_json::Map::new();
+
+    let (name, base_url, mut extra) = match name {
+        Some(n) => (n, base_url, serde_json::Value::Null),
+        None => {
+            let presets = presets_for(tool);
+            let labels: Vec<String> = presets
+                .iter()
+                .map(|p| p.label.to_string())
+                .chain(["自定义".into()])
+                .collect();
+            let idx = dialoguer::Select::new()
+                .with_prompt("选择供应商")
+                .items(&labels)
+                .interact()
+                .map_err(|e| CoreError::Keyring(e.to_string()))?;
+            if idx == presets.len() {
+                let n = dialoguer::Input::<String>::new()
+                    .with_prompt("名称")
+                    .interact_text()
+                    .map_err(|e| CoreError::Keyring(e.to_string()))?;
+                let u = dialoguer::Input::<String>::new()
+                    .with_prompt("Base URL")
+                    .interact_text()
+                    .map_err(|e| CoreError::Keyring(e.to_string()))?;
+                (n, Some(u), serde_json::Value::Null)
+            } else {
+                let p = &presets[idx];
+                (p.id.to_string(), p.base_url.map(String::from), p.extra.clone())
+            }
+        }
+    };
+
+    let key = if base_url.is_none() {
+        None
+    } else {
+        Some(match key {
+            Some(k) => k,
+            None => dialoguer::Password::new()
+                .with_prompt("API Key")
+                .interact()
+                .map_err(|e| CoreError::Keyring(e.to_string()))?,
+        })
+    };
+
+    let mut map = extra.as_object().cloned().unwrap_or_default();
     for (k, v) in sets {
         map.insert(k, serde_json::Value::String(v));
     }
-    let mut p = Provider::new(&name, tool, base_url);
     if !map.is_empty() {
-        p.extra = serde_json::Value::Object(map);
+        extra = serde_json::Value::Object(map);
     }
-    let core = build_core()?;
+
+    let mut p = Provider::new(&name, tool, base_url);
+    p.extra = extra;
+    let official = p.is_official();
     core.add_provider(p, key.as_deref())?;
     println!("added {tool}/{name}");
+    if !official {
+        println!("run `asw use {name} --tool {tool}` to switch");
+    }
     Ok(())
 }
 
