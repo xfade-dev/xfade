@@ -129,6 +129,8 @@ impl ToolAdapter for CodexAdapter {
             .map(String::from);
         let mut p = Provider::new("imported", ToolKind::Codex, base_url);
         if let Some(w) = prov.and_then(|p| p.get("wire_api")).and_then(|v| v.as_str()) {
+            // 上游已废弃 chat：导入时规范化，避免快照复活不可加载的配置
+            let w = if w == "chat" { "responses" } else { w };
             p.extra = json!({ "wire_api": w });
         }
         let auth = self.load_auth()?;
@@ -253,5 +255,17 @@ mod tests {
         assert_eq!(got.id, "imported");
         assert_eq!(got.base_url.as_deref(), Some("https://x"));
         assert_eq!(key.as_deref(), Some("sk-9"));
+    }
+
+    #[test]
+    fn read_current_normalizes_deprecated_chat_wire_api() {
+        let (dir, ad) = setup();
+        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/config.toml"),
+            "model_provider = \"old\"\n\n[model_providers.old]\nname = \"old\"\nbase_url = \"https://x\"\nwire_api = \"chat\"\n",
+        ).unwrap();
+        let (got, _key) = ad.read_current().unwrap().unwrap();
+        assert_eq!(got.extra["wire_api"], "responses");
     }
 }
