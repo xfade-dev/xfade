@@ -109,7 +109,7 @@ wire_api = "chat"          # 多数第三方为 chat 协议；官方为 response
 env_key = "KIMI_API_KEY"
 ```
 
-key 写入 `~/.codex/auth.json`（`{"OPENAI_API_KEY": "..."}`）。说明：`env_key` 是 Codex 读取第三方 key 的另一种机制（从环境变量读），但 CLI 工具无法可靠地持久化用户环境变量（需改 shell rc，侵入性大），故 MVP 统一走 auth.json 路径（cc-switch 验证过）；`env_key` 字段保留在配置中是为了语义完整，实现时需对照真实 Codex 行为核对 auth.json 键名优先级。切回官方 = 恢复 `imported` 快照的 config.toml 与 auth.json。
+key 写入 `~/.codex/auth.json`（`{"OPENAI_API_KEY": "..."}`）。说明（已经真实环境验证）：Codex 对配置了 `env_key` 的 provider **强制**从该环境变量读 key 并完全忽略 auth.json；**省略 `env_key`** 时才会回退到 auth.json 的 `OPENAI_API_KEY`。因此适配器不写 `env_key`，统一走 auth.json 路径（与 cc-switch 一致）。另：新版 Codex 已废弃 `wire_api = "chat"`，默认写 `"responses"`。切回官方 = 移除顶层 `model_provider`，恢复 `imported` 快照的 config.toml 与 auth.json。
 
 ### 5.3 OpenCode
 

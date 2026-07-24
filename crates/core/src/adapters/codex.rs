@@ -74,13 +74,14 @@ impl ToolAdapter for CodexAdapter {
                 .get("wire_api")
                 .and_then(|v| v.as_str())
                 .unwrap_or("responses"); // 新版 Codex 已废弃 wire_api = "chat"
-            let env_key = format!("{}_API_KEY", id.to_uppercase().replace('-', "_"));
 
+            // 注意：不写 env_key。Codex 对配了 env_key 的 provider 强制从该环境变量
+            // 读 key（完全忽略 auth.json）；省略 env_key 才会回退到 auth.json 的
+            // OPENAI_API_KEY——与本工具的 keyring → auth.json 流程一致。
             let mut prov = toml::map::Map::new();
             prov.insert("name".into(), toml::Value::String(id.clone()));
             prov.insert("base_url".into(), toml::Value::String(url.to_string()));
             prov.insert("wire_api".into(), toml::Value::String(wire_api.to_string()));
-            prov.insert("env_key".into(), toml::Value::String(env_key));
 
             let providers = root
                 .entry("model_providers")
@@ -173,7 +174,7 @@ mod tests {
             "https://api.moonshot.cn/v1"
         );
         assert_eq!(prov["wire_api"].as_str().unwrap(), "responses");
-        assert_eq!(prov["env_key"].as_str().unwrap(), "KIMI_API_KEY");
+        assert!(prov.get("env_key").is_none()); // 不写 env_key，走 auth.json
 
         let auth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),
