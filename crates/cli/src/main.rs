@@ -93,6 +93,11 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected key=value, got {s}"))
 }
 
+/// --set 值：能解析为 JSON 就用 JSON（支持对象/数组/数字/布尔），否则按字符串
+fn parse_set_value(s: &str) -> serde_json::Value {
+    serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -176,7 +181,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             let mut map = p.extra.as_object().cloned().unwrap_or_default();
             for (k, v) in sets {
-                map.insert(k, serde_json::Value::String(v));
+                map.insert(k, parse_set_value(&v));
             }
             if !map.is_empty() {
                 p.extra = serde_json::Value::Object(map);
@@ -293,7 +298,7 @@ fn cmd_add(
 
     let mut map = extra.as_object().cloned().unwrap_or_default();
     for (k, v) in sets {
-        map.insert(k, serde_json::Value::String(v));
+        map.insert(k, parse_set_value(&v));
     }
     if !map.is_empty() {
         extra = serde_json::Value::Object(map);
