@@ -28,8 +28,8 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
         }
         ToolKind::Codex => {
             v.extend([
-                Preset { id: "openrouter", label: "OpenRouter", base_url: Some("https://openrouter.ai/api/v1"), extra: serde_json::json!({"wire_api": "chat"}) },
-                Preset { id: "kimi", label: "Kimi (Moonshot)", base_url: Some("https://api.moonshot.cn/v1"), extra: serde_json::json!({"wire_api": "chat"}) },
+                Preset { id: "openrouter", label: "OpenRouter", base_url: Some("https://openrouter.ai/api/v1"), extra: serde_json::json!({"wire_api": "responses"}) },
+                Preset { id: "kimi", label: "Kimi (Moonshot)", base_url: Some("https://api.moonshot.cn/v1"), extra: serde_json::json!({"wire_api": "responses"}) },
             ]);
         }
         ToolKind::OpenCode => {

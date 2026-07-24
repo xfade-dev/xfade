@@ -73,7 +73,7 @@ impl ToolAdapter for CodexAdapter {
                 .extra
                 .get("wire_api")
                 .and_then(|v| v.as_str())
-                .unwrap_or("chat");
+                .unwrap_or("responses"); // 新版 Codex 已废弃 wire_api = "chat"
             let env_key = format!("{}_API_KEY", id.to_uppercase().replace('-', "_"));
 
             let mut prov = toml::map::Map::new();
@@ -172,7 +172,7 @@ mod tests {
             prov["base_url"].as_str().unwrap(),
             "https://api.moonshot.cn/v1"
         );
-        assert_eq!(prov["wire_api"].as_str().unwrap(), "chat");
+        assert_eq!(prov["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(prov["env_key"].as_str().unwrap(), "KIMI_API_KEY");
 
         let auth: serde_json::Value = serde_json::from_str(
@@ -228,12 +228,12 @@ mod tests {
     fn wire_api_from_extra() {
         let (dir, ad) = setup();
         let mut p = Provider::new("oa", ToolKind::Codex, Some("https://x".into()));
-        p.extra = json!({"wire_api": "responses"});
+        p.extra = json!({"wire_api": "chat"}); // 验证 extra 能覆盖默认值
         ad.apply(&p, Some("k")).unwrap();
         let cfg = read_config(&dir);
         assert_eq!(
             cfg["model_providers"]["oa"]["wire_api"].as_str().unwrap(),
-            "responses"
+            "chat"
         );
     }
 
