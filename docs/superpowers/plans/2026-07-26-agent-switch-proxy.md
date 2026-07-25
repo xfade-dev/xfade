@@ -32,6 +32,8 @@ crates/cli/tests/cli.rs    # 修改：+proxy 命令组集成测试
 
 service.rs 补访问器：`pub fn db(&self) -> &Database`（proxy 与测试需要）。
 
+**关键架构约束（P2 前置）**：`rusqlite::Connection` 是 `Send` 但非 `Sync`，而 `ProxyService` 要包进 `Arc` 作为 axum 共享状态（多线程 handler 并发访问，要求 Send+Sync）。解法：**Database 的 `conn` 改为 `Mutex<Connection>`**（内部可变性，所有 `&self` 方法内 `.lock().unwrap()`；对现有同步调用方完全透明，单 CLI 进程无竞争）。此改动放在 P1 完成（属于 db.rs 变更的一部分），P1 测试需同步全绿以验证无破坏。
+
 ---
 
 ### Task P1: 依赖 + 数据库迁移与统计查询
@@ -341,6 +343,7 @@ fn proxy_use_status_clear() {
         .assert().failure();
     asw(home.path()).args(["proxy", "clear"]).assert().success();
 }
+```
 
 ```rust
 #[test]
@@ -384,10 +387,13 @@ fn serve_help_lists_options() {
 cargo build --release
 ./target/release/asw proxy use yy
 ./target/release/asw serve --port 24860 &
+SERVE_PID=$!
+sleep 1
 curl -X POST http://127.0.0.1:24860/v1/chat/completions \
   -H "Authorization: Bearer any" -H "Content-Type: application/json" \
   -d '{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ./target/release/asw stats
+kill $SERVE_PID   # 冒烟结束必须清理后台进程
 ```
 
 - [ ] **Step 3: README**（项目根新建，四节各不超过 15 行：简介/安装/命令速查/代理模式上手）
