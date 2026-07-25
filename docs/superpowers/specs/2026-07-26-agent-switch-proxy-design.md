@@ -61,7 +61,7 @@ asw serve（前台进程，axum）
 ### proxy_state 与熔断
 
 - `proxy_state.routes`：JSON 数组 `["yy","backup1"]`，首项为主，其余按序 failover
-- 熔断：内存状态（进程级）。主 provider 连续失败 3 次 → 冷却 60s，期间直接走 fallback；冷却结束回切主。`proxy status` 可见熔断状态
+- 熔断：内存状态（进程级，**有意为之**——`asw serve` 重启即清零，不持久化）。主 provider 连续失败 3 次 → 冷却 60s，期间直接走 fallback；冷却结束回切主。`proxy status` 可见熔断状态
 - 失败定义：连接错误 / 上游 429 / 上游 5xx。4xx（非 429）视为客户端错误，原样回传不触发 failover
 
 ## 4. 数据模型
@@ -87,14 +87,14 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 ```
 
-迁移并入现有 `Database::migrate`（CREATE TABLE IF NOT EXISTS，向后兼容）。
+迁移并入现有 `Database::migrate`（CREATE TABLE IF NOT EXISTS，向后兼容）。`request_logs.ts` 加索引支撑 `stats --since` 查询；表无保留策略（v0.2 接受无限增长，清理命令 `asw stats --prune` 留作后续）。
 
 ## 5. 用量统计的 usage 提取
 
 | 场景 | 提取方式 |
 |------|---------|
 | 非流式（三种端点） | 响应 JSON 的 `usage`（OpenAI: prompt_tokens/completion_tokens；Anthropic: input_tokens/output_tokens，统一映射） |
-| chat/completions 流式 | 转发请求前注入 `"stream_options": {"include_usage": true}`（若客户端未带），从末尾 chunk 提取 |
+| chat/completions 流式 | 转发请求前注入 `"stream_options": {"include_usage": true}`（**唯一例外于"body 原样透传"原则**：仅当客户端未带 `stream_options` 时注入，且只作用于该字段，其余字节不动），从末尾 chunk 提取 |
 | responses 流式 | `response.completed` 事件的 usage |
 | messages 流式 | `message_delta` 事件的 usage |
 
@@ -107,7 +107,7 @@ asw serve [--port 24860] [--host 127.0.0.1] [--auth-token <t>]
 # 前台运行；每请求一行日志：ts endpoint model provider status tokens ms
 # --auth-token 设置后校验入站 Authorization: Bearer <t>，转发时替换为真实 key
 
-asw proxy use <name> [fallback1] [fallback2]   # 设置路由（热生效）
+asw proxy use <name> [fallback1] [fallback2]   # 设置路由（热生效；serve 未运行也可执行，写 db 待下次 serve 生效）
 asw proxy status                               # 当前路由 + 各 provider 熔断状态
 asw proxy clear                                # 清除路由（serve 时 503）
 
