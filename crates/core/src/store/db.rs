@@ -46,13 +46,17 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Self { conn: std::sync::Arc::new(Mutex::new(Connection::open(path)?)) };
+        let db = Self {
+            conn: std::sync::Arc::new(Mutex::new(Connection::open(path)?)),
+        };
         db.migrate()?;
         Ok(db)
     }
 
     pub fn open_memory() -> Result<Self> {
-        let db = Self { conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)) };
+        let db = Self {
+            conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -150,7 +154,10 @@ impl Database {
     pub fn set_active(&self, tool: ToolKind, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        tx.execute("UPDATE providers SET is_active = 0 WHERE tool = ?1", params![tool.as_str()])?;
+        tx.execute(
+            "UPDATE providers SET is_active = 0 WHERE tool = ?1",
+            params![tool.as_str()],
+        )?;
         let n = tx.execute(
             "UPDATE providers SET is_active = 1 WHERE tool = ?1 AND id = ?2",
             params![tool.as_str(), id],
@@ -172,9 +179,13 @@ impl Database {
 
     /// 设置代理路由（主→备 顺序）
     pub fn set_routes(&self, routes: &[String]) -> Result<()> {
-        let now = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .map_err(|e| CoreError::ConfigParse { path: "time".into(), msg: e.to_string() })?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO proxy_state (id, routes, updated_at) VALUES (1, ?1, ?2)
              ON CONFLICT (id) DO UPDATE SET routes = excluded.routes, updated_at = excluded.updated_at",
@@ -198,7 +209,10 @@ impl Database {
     }
 
     pub fn clear_routes(&self) -> Result<()> {
-        self.conn.lock().unwrap().execute("DELETE FROM proxy_state WHERE id = 1", [])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM proxy_state WHERE id = 1", [])?;
         Ok(())
     }
 
@@ -283,11 +297,14 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
     let tool_str: String = row.get(0)?;
     let extra_str: String = row.get(4)?;
     Ok(Provider {
-        tool: tool_str.parse().map_err(|e| {
+        tool: tool_str.parse().map_err(|e: String| {
             rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}"))),
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
             )
         })?,
         id: row.get(1)?,
@@ -338,7 +355,12 @@ mod tests {
         let list = db.list(Some(ToolKind::Codex)).unwrap();
         assert!(!list.iter().find(|p| p.id == "a").unwrap().is_active);
         assert!(list.iter().find(|p| p.id == "b").unwrap().is_active);
-        assert!(!db.get(ToolKind::ClaudeCode, "a").unwrap().unwrap().is_active);
+        assert!(
+            !db.get(ToolKind::ClaudeCode, "a")
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
     }
 
     #[test]
@@ -365,7 +387,10 @@ mod tests {
         let db = Database::open_memory().unwrap();
         assert!(db.get_routes().unwrap().is_none());
         db.set_routes(&["yy".into(), "bak".into()]).unwrap();
-        assert_eq!(db.get_routes().unwrap().unwrap(), vec!["yy".to_string(), "bak".to_string()]);
+        assert_eq!(
+            db.get_routes().unwrap().unwrap(),
+            vec!["yy".to_string(), "bak".to_string()]
+        );
         db.clear_routes().unwrap();
         assert!(db.get_routes().unwrap().is_none());
     }
@@ -374,22 +399,39 @@ mod tests {
     fn request_log_and_stats() {
         let db = Database::open_memory().unwrap();
         db.insert_request_log(&RequestLog {
-            ts: "2026-07-26T10:00:00Z".into(), endpoint: "chat".into(),
-            model: Some("gpt-5.6-luna".into()), provider_id: "yy".into(),
-            status: 200, prompt_tokens: 100, completion_tokens: 50, duration_ms: 800, error: None,
-        }).unwrap();
+            ts: "2026-07-26T10:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("gpt-5.6-luna".into()),
+            provider_id: "yy".into(),
+            status: 200,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            duration_ms: 800,
+            error: None,
+        })
+        .unwrap();
         db.insert_request_log(&RequestLog {
-            ts: "2026-07-26T11:00:00Z".into(), endpoint: "messages".into(),
-            model: Some("claude-sonnet-4-6".into()), provider_id: "yy".into(),
-            status: 429, prompt_tokens: 0, completion_tokens: 0, duration_ms: 120,
+            ts: "2026-07-26T11:00:00Z".into(),
+            endpoint: "messages".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            provider_id: "yy".into(),
+            status: 429,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            duration_ms: 120,
             error: Some("rate limited".into()),
-        }).unwrap();
-        let rows = db.stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider).unwrap();
+        })
+        .unwrap();
+        let rows = db
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider)
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].requests, 2);
         assert_eq!(rows[0].prompt_tokens, 100);
         assert_eq!(rows[0].errors, 1);
-        let by_model = db.stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model).unwrap();
+        let by_model = db
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model)
+            .unwrap();
         assert_eq!(by_model.len(), 2);
     }
 }

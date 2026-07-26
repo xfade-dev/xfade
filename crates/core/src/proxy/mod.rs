@@ -1,7 +1,7 @@
 pub mod forward;
-pub mod usage;
 #[cfg(test)]
 pub mod testsupport;
+pub mod usage;
 
 use crate::error::Result;
 use crate::service::Core;
@@ -118,7 +118,10 @@ mod tests {
         let core = test_core(&dir, &[("yy", &up.url(), "sk-real")]);
         core.db().set_routes(&["yy".into()]).unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
-        up.respond_with(200, r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#);
+        up.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let (status, body) = http_post_json(
             &url,
             "/v1/chat/completions",
@@ -147,10 +150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
-        let core = test_core(
-            &dir,
-            &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")],
-        );
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
         core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(403, r#"{"error":"denied"}"#);
@@ -182,7 +182,10 @@ mod tests {
         core.db().set_routes(&["yy".into()]).unwrap();
         let db = core.db().clone();
         let url = spawn_service(ProxyService::new(core)).await;
-        up.respond_with(200, r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#);
+        up.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        );
         let _ = http_post_json(
             &url,
             "/v1/chat/completions",
@@ -191,7 +194,10 @@ mod tests {
         )
         .await;
         let stats = db
-            .stats_since("2020-01-01T00:00:00Z", crate::store::db::StatsGroupBy::Provider)
+            .stats_since(
+                "2020-01-01T00:00:00Z",
+                crate::store::db::StatsGroupBy::Provider,
+            )
             .unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].prompt_tokens, 10);
@@ -241,7 +247,10 @@ mod tests {
         assert!(body.contains("\"content\":\"o\""));
         assert!(body.contains("[DONE]"));
         let stats = db
-            .stats_since("2020-01-01T00:00:00Z", crate::store::db::StatsGroupBy::Provider)
+            .stats_since(
+                "2020-01-01T00:00:00Z",
+                crate::store::db::StatsGroupBy::Provider,
+            )
             .unwrap();
         assert_eq!(stats[0].prompt_tokens, 7);
         assert_eq!(stats[0].completion_tokens, 1);
@@ -258,7 +267,10 @@ mod tests {
         core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(429, "rate limited");
-        up2.respond_with(200, r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
+        up2.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
         let (status, _) = http_post_json(
             &url,
             "/v1/chat/completions",
@@ -270,13 +282,13 @@ mod tests {
         assert_eq!(up.call_count().await, 1);
         assert_eq!(up2.call_count().await, 1);
         let stats = db
-            .stats_since("2020-01-01T00:00:00Z", crate::store::db::StatsGroupBy::Provider)
+            .stats_since(
+                "2020-01-01T00:00:00Z",
+                crate::store::db::StatsGroupBy::Provider,
+            )
             .unwrap();
         assert_eq!(stats.iter().find(|s| s.group == "yy").unwrap().errors, 1);
-        assert_eq!(
-            stats.iter().find(|s| s.group == "bak").unwrap().requests,
-            1
-        );
+        assert_eq!(stats.iter().find(|s| s.group == "bak").unwrap().requests, 1);
     }
 
     #[tokio::test]

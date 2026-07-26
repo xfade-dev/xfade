@@ -9,7 +9,9 @@ fn is_backup_file(p: &Path) -> bool {
         && p.file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.rsplit_once('.'))
-            .is_some_and(|(_, suffix)| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+            .is_some_and(|(_, suffix)| {
+                !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+            })
 }
 
 /// 备份 path 到 backup_dir/<filename>.<nanos>；源不存在返回 Ok(None)

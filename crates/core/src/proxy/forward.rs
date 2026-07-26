@@ -53,7 +53,11 @@ fn now_rfc3339() -> String {
 fn extract_model(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("model")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// If this is a chat completion request that asked for streaming but did not
@@ -140,6 +144,7 @@ fn is_stream_response(resp: &reqwest::Response) -> bool {
 
 /// Log a request to the database. Best-effort: errors are swallowed (proxy
 /// must not fail a successful forward because logging failed).
+#[allow(clippy::too_many_arguments)]
 fn log_request(
     svc: &ProxyService,
     endpoint: &str,
@@ -416,7 +421,7 @@ where
                     *errored.lock().unwrap() = true;
                 }
             }
-            chunk_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            chunk_result.map_err(|e| std::io::Error::other(e.to_string()))
         }
     });
 
@@ -540,10 +545,7 @@ pub async fn handle(
     forward_with_failover(&svc, "POST", endpoint, &headers, &body, model).await
 }
 
-pub async fn handle_get(
-    State(svc): State<Arc<ProxyService>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
     let endpoint = "models";
     if let Some(token) = &svc.auth_token {
         let auth = headers

@@ -16,9 +16,19 @@ fn add_ls_use_current_flow() {
     let home = tempfile::tempdir().unwrap();
 
     asw(home.path())
-        .args(["add", "--tool", "claude", "--name", "kimi",
-               "--base-url", "https://api.moonshot.cn/anthropic", "--key", "sk-1",
-               "--set", "model=kimi-k2.5"])
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "--name",
+            "kimi",
+            "--base-url",
+            "https://api.moonshot.cn/anthropic",
+            "--key",
+            "sk-1",
+            "--set",
+            "model=kimi-k2.5",
+        ])
         .assert()
         .success();
 
@@ -28,7 +38,10 @@ fn add_ls_use_current_flow() {
         .success()
         .stdout(predicate::str::contains("kimi"));
 
-    asw(home.path()).args(["use", "kimi", "--tool", "claude"]).assert().success();
+    asw(home.path())
+        .args(["use", "kimi", "--tool", "claude"])
+        .assert()
+        .success();
 
     let settings = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
     assert!(settings.contains("api.moonshot.cn"));
@@ -44,10 +57,23 @@ fn add_ls_use_current_flow() {
 fn rm_active_fails() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
-        .args(["add", "--tool", "codex", "--name", "k", "--base-url", "https://x", "--key", "1"])
+        .args([
+            "add",
+            "--tool",
+            "codex",
+            "--name",
+            "k",
+            "--base-url",
+            "https://x",
+            "--key",
+            "1",
+        ])
         .assert()
         .success();
-    asw(home.path()).args(["use", "k", "--tool", "codex"]).assert().success();
+    asw(home.path())
+        .args(["use", "k", "--tool", "codex"])
+        .assert()
+        .success();
     asw(home.path())
         .args(["rm", "k", "--tool", "codex"])
         .assert()
@@ -72,13 +98,31 @@ fn switch_back_to_imported_snapshot() {
     fs::write(
         home.path().join(".claude/settings.json"),
         r#"{"env":{"ANTHROPIC_BASE_URL":"https://relay","ANTHROPIC_AUTH_TOKEN":"sk-old"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     asw(home.path())
-        .args(["add", "--tool", "claude", "--name", "kimi", "--base-url", "https://x", "--key", "sk-new"])
-        .assert().success();
-    asw(home.path()).args(["use", "kimi", "--tool", "claude"]).assert().success();
-    asw(home.path()).args(["use", "imported", "--tool", "claude"]).assert().success();
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "--name",
+            "kimi",
+            "--base-url",
+            "https://x",
+            "--key",
+            "sk-new",
+        ])
+        .assert()
+        .success();
+    asw(home.path())
+        .args(["use", "kimi", "--tool", "claude"])
+        .assert()
+        .success();
+    asw(home.path())
+        .args(["use", "imported", "--tool", "claude"])
+        .assert()
+        .success();
 
     let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
     assert!(s.contains("https://relay"));
@@ -89,9 +133,23 @@ fn switch_back_to_imported_snapshot() {
 fn codex_end_to_end() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
-        .args(["add", "--tool", "codex", "--name", "kimi", "--base-url", "https://api.moonshot.cn/v1", "--key", "sk-1"])
-        .assert().success();
-    asw(home.path()).args(["use", "kimi", "--tool", "codex"]).assert().success();
+        .args([
+            "add",
+            "--tool",
+            "codex",
+            "--name",
+            "kimi",
+            "--base-url",
+            "https://api.moonshot.cn/v1",
+            "--key",
+            "sk-1",
+        ])
+        .assert()
+        .success();
+    asw(home.path())
+        .args(["use", "kimi", "--tool", "codex"])
+        .assert()
+        .success();
 
     let cfg = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
     assert!(cfg.contains("model_provider = \"kimi\""));
@@ -100,8 +158,12 @@ fn codex_end_to_end() {
 
     asw(home.path())
         .args(["add", "--tool", "codex", "--name", "official"])
-        .assert().success(); // 无 --base-url => 官方
-    asw(home.path()).args(["use", "official", "--tool", "codex"]).assert().success();
+        .assert()
+        .success(); // 无 --base-url => 官方
+    asw(home.path())
+        .args(["use", "official", "--tool", "codex"])
+        .assert()
+        .success();
     let cfg = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
     assert!(!cfg.contains("model_provider ="));
 }
@@ -110,12 +172,36 @@ fn codex_end_to_end() {
 fn edit_updates_base_url_and_extra() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
-        .args(["add", "--tool", "claude", "--name", "kimi", "--base-url", "https://old", "--key", "sk-1"])
-        .assert().success();
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "--name",
+            "kimi",
+            "--base-url",
+            "https://old",
+            "--key",
+            "sk-1",
+        ])
+        .assert()
+        .success();
     asw(home.path())
-        .args(["edit", "kimi", "--tool", "claude", "--base-url", "https://new", "--set", "model=k2"])
-        .assert().success();
-    asw(home.path()).args(["use", "kimi", "--tool", "claude"]).assert().success();
+        .args([
+            "edit",
+            "kimi",
+            "--tool",
+            "claude",
+            "--base-url",
+            "https://new",
+            "--set",
+            "model=k2",
+        ])
+        .assert()
+        .success();
+    asw(home.path())
+        .args(["use", "kimi", "--tool", "claude"])
+        .assert()
+        .success();
     let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
     assert!(s.contains("https://new"));
     assert!(s.contains("k2")); // ANTHROPIC_MODEL from extra.model
@@ -126,20 +212,37 @@ fn import_and_backup_commands() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
         .args(["import", "--tool", "claude"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("nothing"));
     asw(home.path())
         .args(["backup", "ls", "--tool", "claude"])
-        .assert().success();
+        .assert()
+        .success();
     fs::create_dir_all(home.path().join(".claude")).unwrap();
     fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
     asw(home.path())
-        .args(["add", "--tool", "claude", "--name", "k", "--base-url", "https://x", "--key", "1"])
-        .assert().success();
-    asw(home.path()).args(["use", "k", "--tool", "claude"]).assert().success();
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "--name",
+            "k",
+            "--base-url",
+            "https://x",
+            "--key",
+            "1",
+        ])
+        .assert()
+        .success();
+    asw(home.path())
+        .args(["use", "k", "--tool", "claude"])
+        .assert()
+        .success();
     asw(home.path())
         .args(["backup", "ls", "--tool", "claude"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("settings.json"));
 }
 
@@ -157,19 +260,33 @@ fn completion_generates() {
 fn proxy_use_status_clear() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
-        .args(["add", "--tool", "codex", "--name", "yy", "--base-url", "http://x", "--key", "k"])
-        .assert().success();
+        .args([
+            "add",
+            "--tool",
+            "codex",
+            "--name",
+            "yy",
+            "--base-url",
+            "http://x",
+            "--key",
+            "k",
+        ])
+        .assert()
+        .success();
     asw(home.path())
         .args(["proxy", "use", "yy"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("yy"));
     asw(home.path())
         .args(["proxy", "status"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("yy"));
     asw(home.path())
         .args(["proxy", "use", "nope"])
-        .assert().failure();
+        .assert()
+        .failure();
     asw(home.path()).args(["proxy", "clear"]).assert().success();
 }
 
@@ -184,7 +301,8 @@ fn presets_include_local_proxy() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
         .args(["presets"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("local-proxy"));
 }
 
@@ -193,6 +311,7 @@ fn serve_help_lists_options() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path())
         .args(["serve", "--help"])
-        .assert().success()
+        .assert()
+        .success()
         .stdout(predicate::str::contains("--port").and(predicate::str::contains("--auth-token")));
 }

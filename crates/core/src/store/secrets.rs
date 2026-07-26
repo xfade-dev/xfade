@@ -15,7 +15,9 @@ pub struct KeyringStore {
 
 impl KeyringStore {
     pub fn new() -> Self {
-        Self { service: "agent-switch".into() }
+        Self {
+            service: "agent-switch".into(),
+        }
     }
 
     fn entry(&self, key_ref: &str) -> Result<keyring::Entry> {
@@ -37,12 +39,10 @@ impl SecretStore for KeyringStore {
     }
 
     fn get(&self, key_ref: &str) -> Result<String> {
-        self.entry(key_ref)?
-            .get_password()
-            .map_err(|e| match e {
-                keyring::Error::NoEntry => CoreError::SecretNotFound(key_ref.to_string()),
-                other => CoreError::Keyring(other.to_string()),
-            })
+        self.entry(key_ref)?.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => CoreError::SecretNotFound(key_ref.to_string()),
+            other => CoreError::Keyring(other.to_string()),
+        })
     }
 
     fn delete(&self, key_ref: &str) -> Result<()> {
@@ -84,8 +84,7 @@ impl FileMockStore {
         }
         let s = serde_json::to_string(map)
             .map_err(|e| CoreError::Keyring(format!("serialize secrets: {e}")))?;
-        std::fs::write(&self.path, s)
-            .map_err(|e| CoreError::Keyring(format!("write secrets: {e}")))
+        std::fs::write(&self.path, s).map_err(|e| CoreError::Keyring(format!("write secrets: {e}")))
     }
 }
 
@@ -112,7 +111,10 @@ impl SecretStore for FileMockStore {
 
 impl SecretStore for MockStore {
     fn set(&self, key_ref: &str, secret: &str) -> Result<()> {
-        self.map.lock().unwrap().insert(key_ref.to_string(), secret.to_string());
+        self.map
+            .lock()
+            .unwrap()
+            .insert(key_ref.to_string(), secret.to_string());
         Ok(())
     }
 

@@ -1,12 +1,7 @@
 use super::ProxyService;
 use crate::service::Core;
 use axum::{
-    body::Body,
-    extract::Request,
-    http::StatusCode,
-    response::Response,
-    routing::any,
-    Router,
+    body::Body, extract::Request, http::StatusCode, response::Response, routing::any, Router,
 };
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -25,11 +20,17 @@ enum MockResponse {
     /// Non-streaming: status + body bytes.
     Plain { status: StatusCode, body: String },
     /// Streaming: status + content-type text/event-stream + lines (each terminated with `\n\n`).
-    Sse { status: StatusCode, lines: Vec<String> },
+    Sse {
+        status: StatusCode,
+        lines: Vec<String>,
+    },
     /// Streaming that emits `lines` then errors mid-stream (to simulate an
     /// interrupted upstream connection). Used by the interrupted-stream
     /// regression test.
-    SseError { status: StatusCode, lines: Vec<String> },
+    SseError {
+        status: StatusCode,
+        lines: Vec<String>,
+    },
 }
 
 pub struct MockUpstream {
@@ -110,9 +111,9 @@ impl MockUpstream {
                                     let mut payload = lines[idx].as_bytes().to_vec();
                                     payload.extend_from_slice(b"\n\n");
                                     Some((
-                                        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(
-                                            payload,
-                                        )),
+                                        Ok::<axum::body::Bytes, std::io::Error>(
+                                            axum::body::Bytes::from(payload),
+                                        ),
                                         (lines, idx + 1, false),
                                     ))
                                 } else if !yielded_err {
@@ -159,13 +160,10 @@ impl MockUpstream {
     }
 
     pub fn respond_with(&self, status: u16, body: &str) {
-        self.responses
-            .lock()
-            .unwrap()
-            .push(MockResponse::Plain {
-                status: StatusCode::from_u16(status).unwrap(),
-                body: body.to_string(),
-            });
+        self.responses.lock().unwrap().push(MockResponse::Plain {
+            status: StatusCode::from_u16(status).unwrap(),
+            body: body.to_string(),
+        });
     }
 
     pub fn respond_sequence(&self, seq: Vec<(u16, &str)>) {
@@ -182,25 +180,19 @@ impl MockUpstream {
     /// `line\n\n` and the connection is closed after the last line so that
     /// `reqwest`'s response body consumption terminates cleanly.
     pub fn respond_sse(&self, lines: Vec<&str>) {
-        self.responses
-            .lock()
-            .unwrap()
-            .push(MockResponse::Sse {
-                status: StatusCode::OK,
-                lines: lines.into_iter().map(String::from).collect(),
-            });
+        self.responses.lock().unwrap().push(MockResponse::Sse {
+            status: StatusCode::OK,
+            lines: lines.into_iter().map(String::from).collect(),
+        });
     }
 
     /// Queue a streaming text/event-stream response that emits `lines` then
     /// errors mid-stream, simulating an interrupted upstream connection.
     pub fn respond_sse_error(&self, lines: Vec<&str>) {
-        self.responses
-            .lock()
-            .unwrap()
-            .push(MockResponse::SseError {
-                status: StatusCode::OK,
-                lines: lines.into_iter().map(String::from).collect(),
-            });
+        self.responses.lock().unwrap().push(MockResponse::SseError {
+            status: StatusCode::OK,
+            lines: lines.into_iter().map(String::from).collect(),
+        });
     }
 
     pub async fn last_request(&self) -> RecordedRequest {
@@ -268,8 +260,12 @@ pub async fn http_post_json_lossy(url: &str, path: &str, body: &str, auth: &str)
 pub fn test_core(dir: &tempfile::TempDir, providers: &[(&str, &str, &str)]) -> Core {
     let home = dir.path().join("home");
     let data = dir.path().join("data");
-    let core = Core::with_paths(&home, &data, Box::new(crate::store::secrets::MockStore::default()))
-        .unwrap();
+    let core = Core::with_paths(
+        &home,
+        &data,
+        Box::new(crate::store::secrets::MockStore::default()),
+    )
+    .unwrap();
     for (id, base_url, key) in providers {
         let p = crate::models::Provider::new(
             *id,

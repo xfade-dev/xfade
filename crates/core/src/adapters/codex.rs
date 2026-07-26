@@ -38,10 +38,12 @@ impl CodexAdapter {
 
     fn load_auth(&self) -> Result<Value> {
         match std::fs::read_to_string(self.auth_path()) {
-            Ok(s) => Ok(serde_json::from_str(&s).map_err(|e| CoreError::ConfigParse {
-                path: self.auth_path().display().to_string(),
-                msg: e.to_string(),
-            })?),
+            Ok(s) => Ok(
+                serde_json::from_str(&s).map_err(|e| CoreError::ConfigParse {
+                    path: self.auth_path().display().to_string(),
+                    msg: e.to_string(),
+                })?,
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
             Err(e) => Err(e.into()),
         }
@@ -99,10 +101,9 @@ impl ToolAdapter for CodexAdapter {
             if !auth.is_object() {
                 auth = json!({});
             }
-            auth.as_object_mut().unwrap().insert(
-                "OPENAI_API_KEY".into(),
-                json!(api_key.unwrap_or_default()),
-            );
+            auth.as_object_mut()
+                .unwrap()
+                .insert("OPENAI_API_KEY".into(), json!(api_key.unwrap_or_default()));
             atomic_write(
                 &self.auth_path(),
                 format!("{}\n", serde_json::to_string_pretty(&auth)?).as_bytes(),
@@ -128,7 +129,10 @@ impl ToolAdapter for CodexAdapter {
             .and_then(|v| v.as_str())
             .map(String::from);
         let mut p = Provider::new("imported", ToolKind::Codex, base_url);
-        if let Some(w) = prov.and_then(|p| p.get("wire_api")).and_then(|v| v.as_str()) {
+        if let Some(w) = prov
+            .and_then(|p| p.get("wire_api"))
+            .and_then(|v| v.as_str())
+        {
             // 上游已废弃 chat：导入时规范化，避免快照复活不可加载的配置
             let w = if w == "chat" { "responses" } else { w };
             p.extra = json!({ "wire_api": w });

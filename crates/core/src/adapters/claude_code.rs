@@ -74,7 +74,10 @@ impl ToolAdapter for ClaudeCodeAdapter {
             env.remove(ENV_TOKEN);
             env.remove(ENV_MODEL);
         } else {
-            env.insert(ENV_BASE.into(), json!(provider.base_url.as_deref().unwrap()));
+            env.insert(
+                ENV_BASE.into(),
+                json!(provider.base_url.as_deref().unwrap()),
+            );
             env.insert(ENV_TOKEN.into(), json!(api_key.unwrap_or_default()));
             match provider.extra.get("model").and_then(|m| m.as_str()) {
                 Some(model) => {

@@ -27,7 +27,8 @@ impl Core {
 
     /// 真实环境：home = 用户主目录，data_dir = ~/.config/agent-switch，系统钥匙串
     pub fn for_current_user() -> Result<Self> {
-        let home = dirs::home_dir().ok_or_else(|| CoreError::Keyring("cannot locate home dir".into()))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| CoreError::Keyring("cannot locate home dir".into()))?;
         let data = home.join(".config").join("agent-switch");
         Self::with_paths(&home, &data, Box::new(KeyringStore::new()))
     }
@@ -47,7 +48,10 @@ impl Core {
     /// 编辑 provider（key 传 Some 时同时更换钥匙串中的密钥）
     pub fn update_provider(&self, provider: &Provider, api_key: Option<&str>) -> Result<()> {
         if self.db.get(provider.tool, &provider.id)?.is_none() {
-            return Err(CoreError::ProviderNotFound(format!("{}/{}", provider.tool, provider.id)));
+            return Err(CoreError::ProviderNotFound(format!(
+                "{}/{}",
+                provider.tool, provider.id
+            )));
         }
         if let Some(key) = api_key {
             self.secrets.set(&provider.key_ref, key)?;
@@ -64,7 +68,10 @@ impl Core {
     }
 
     pub fn remove(&self, tool: ToolKind, id: &str) -> Result<()> {
-        let p = self.db.get(tool, id)?.ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{id}")))?;
+        let p = self
+            .db
+            .get(tool, id)?
+            .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{id}")))?;
         if p.is_active {
             return Err(CoreError::ActiveProviderRemoval(format!("{tool}/{id}")));
         }
@@ -150,17 +157,27 @@ impl Core {
     }
 
     pub fn restore_backup(&self, tool: ToolKind, backup: &Path) -> Result<()> {
-        let file_name = backup
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| CoreError::ConfigParse { path: backup.display().to_string(), msg: "bad backup name".into() })?;
-        let original = file_name.rsplit_once('.').map(|(n, _)| n).unwrap_or(file_name);
+        let file_name =
+            backup
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: backup.display().to_string(),
+                    msg: "bad backup name".into(),
+                })?;
+        let original = file_name
+            .rsplit_once('.')
+            .map(|(n, _)| n)
+            .unwrap_or(file_name);
         let adapter = self.adapter(tool);
         let target = adapter
             .config_paths()
             .into_iter()
             .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(original))
-            .ok_or_else(|| CoreError::ConfigParse { path: backup.display().to_string(), msg: format!("no config file named {original}") })?;
+            .ok_or_else(|| CoreError::ConfigParse {
+                path: backup.display().to_string(),
+                msg: format!("no config file named {original}"),
+            })?;
         restore(backup, &target)
     }
 }
@@ -183,13 +200,15 @@ mod tests {
     #[test]
     fn add_and_use_claude_provider() {
         let (dir, core) = setup();
-        let p = Provider::new("kimi", ToolKind::ClaudeCode, Some("https://api.moonshot.cn/anthropic".into()));
+        let p = Provider::new(
+            "kimi",
+            ToolKind::ClaudeCode,
+            Some("https://api.moonshot.cn/anthropic".into()),
+        );
         core.add_provider(p, Some("sk-test")).unwrap();
         core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
 
-        let s = std::fs::read_to_string(
-            dir.path().join("home/.claude/settings.json"),
-        ).unwrap();
+        let s = std::fs::read_to_string(dir.path().join("home/.claude/settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(doc["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test");
 
@@ -210,8 +229,12 @@ mod tests {
         core.add_provider(p, Some("sk-new")).unwrap();
         core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
 
-        let imported = core.list(Some(ToolKind::ClaudeCode)).unwrap()
-            .into_iter().find(|p| p.id == "imported").unwrap();
+        let imported = core
+            .list(Some(ToolKind::ClaudeCode))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == "imported")
+            .unwrap();
         assert_eq!(imported.base_url.as_deref(), Some("https://relay"));
 
         core.use_provider(ToolKind::ClaudeCode, "imported").unwrap();
@@ -223,8 +246,13 @@ mod tests {
     #[test]
     fn use_official_clears_claude_env() {
         let (dir, core) = setup();
-        core.add_provider(Provider::new("kimi", ToolKind::ClaudeCode, Some("https://x".into())), Some("k")).unwrap();
-        core.add_provider(Provider::new("official", ToolKind::ClaudeCode, None), None).unwrap();
+        core.add_provider(
+            Provider::new("kimi", ToolKind::ClaudeCode, Some("https://x".into())),
+            Some("k"),
+        )
+        .unwrap();
+        core.add_provider(Provider::new("official", ToolKind::ClaudeCode, None), None)
+            .unwrap();
         core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
         core.use_provider(ToolKind::ClaudeCode, "official").unwrap();
 
@@ -236,7 +264,11 @@ mod tests {
     #[test]
     fn remove_active_rejected() {
         let (_dir, core) = setup();
-        core.add_provider(Provider::new("kimi", ToolKind::Codex, Some("https://x".into())), Some("k")).unwrap();
+        core.add_provider(
+            Provider::new("kimi", ToolKind::Codex, Some("https://x".into())),
+            Some("k"),
+        )
+        .unwrap();
         core.use_provider(ToolKind::Codex, "kimi").unwrap();
         let err = core.remove(ToolKind::Codex, "kimi").unwrap_err();
         assert!(matches!(err, CoreError::ActiveProviderRemoval(_)));
@@ -247,7 +279,11 @@ mod tests {
         let (dir, core) = setup();
         std::fs::create_dir_all(dir.path().join("home/.claude")).unwrap();
         std::fs::write(dir.path().join("home/.claude/settings.json"), "{}").unwrap();
-        core.add_provider(Provider::new("kimi", ToolKind::ClaudeCode, Some("https://x".into())), Some("k")).unwrap();
+        core.add_provider(
+            Provider::new("kimi", ToolKind::ClaudeCode, Some("https://x".into())),
+            Some("k"),
+        )
+        .unwrap();
         core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
         let backups = std::fs::read_dir(dir.path().join("data/backups/claude")).unwrap();
         assert_eq!(backups.count(), 1);
@@ -262,14 +298,21 @@ mod tests {
     #[test]
     fn use_opencode_official_removes_previous_custom() {
         let (dir, core) = setup();
-        core.add_provider(Provider::new("kimi", ToolKind::OpenCode, Some("https://x".into())), Some("k")).unwrap();
-        core.add_provider(Provider::new("official", ToolKind::OpenCode, None), None).unwrap();
+        core.add_provider(
+            Provider::new("kimi", ToolKind::OpenCode, Some("https://x".into())),
+            Some("k"),
+        )
+        .unwrap();
+        core.add_provider(Provider::new("official", ToolKind::OpenCode, None), None)
+            .unwrap();
         core.use_provider(ToolKind::OpenCode, "kimi").unwrap();
         core.use_provider(ToolKind::OpenCode, "official").unwrap();
 
         let doc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("home/.config/opencode/opencode.json")).unwrap(),
-        ).unwrap();
+            &std::fs::read_to_string(dir.path().join("home/.config/opencode/opencode.json"))
+                .unwrap(),
+        )
+        .unwrap();
         assert!(doc["provider"].get("kimi").is_none());
     }
 }

@@ -7,7 +7,11 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "asw", version, about = "Switch API providers for AI coding tools")]
+#[command(
+    name = "asw",
+    version,
+    about = "Switch API providers for AI coding tools"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -161,7 +165,13 @@ fn build_core() -> Result<Core, CoreError> {
 
 fn run(cli: Cli) -> Result<(), CoreError> {
     match cli.cmd {
-        Cmd::Add { tool, name, base_url, key, sets } => cmd_add(tool, name, base_url, key, sets),
+        Cmd::Add {
+            tool,
+            name,
+            base_url,
+            key,
+            sets,
+        } => cmd_add(tool, name, base_url, key, sets),
         Cmd::Ls { tool } => {
             let core = build_core()?;
             let list = core.list(tool)?;
@@ -179,7 +189,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             let core = build_core()?;
             for t in ToolKind::ALL {
                 match core.current(t)? {
-                    Some(p) => println!("{t}: {} ({})", p.id, p.base_url.as_deref().unwrap_or("official")),
+                    Some(p) => println!(
+                        "{t}: {} ({})",
+                        p.id,
+                        p.base_url.as_deref().unwrap_or("official")
+                    ),
                     None => println!("{t}: (none)"),
                 }
             }
@@ -196,12 +210,23 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             for t in ToolKind::ALL {
                 println!("[{t}]");
                 for p in presets_for(t) {
-                    println!("  {:<12} {:<20} {}", p.id, p.label, p.base_url.unwrap_or("(官方)"));
+                    println!(
+                        "  {:<12} {:<20} {}",
+                        p.id,
+                        p.label,
+                        p.base_url.unwrap_or("(官方)")
+                    );
                 }
             }
             Ok(())
         }
-        Cmd::Edit { name, tool, base_url, key, sets } => {
+        Cmd::Edit {
+            name,
+            tool,
+            base_url,
+            key,
+            sets,
+        } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
             let mut p = core
@@ -258,7 +283,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Serve { port, host, auth_token } => {
+        Cmd::Serve {
+            port,
+            host,
+            auth_token,
+        } => {
             let core = build_core()?;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
@@ -274,7 +303,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 if names.is_empty() {
                     return Err(CoreError::ConfigParse {
                         path: String::new(),
-                        msg: "no provider names given; usage: asw proxy use <name> [<name>...]".into(),
+                        msg: "no provider names given; usage: asw proxy use <name> [<name>...]"
+                            .into(),
                     });
                 }
                 let core = build_core()?;
@@ -303,7 +333,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     None => println!("routes: (none)"),
                     Some(routes) => {
                         let main = &routes[0];
-                        let backups: Vec<&str> = routes.iter().skip(1).map(|s| s.as_str()).collect();
+                        let backups: Vec<&str> =
+                            routes.iter().skip(1).map(|s| s.as_str()).collect();
                         if backups.is_empty() {
                             println!("routes: {main}");
                         } else {
@@ -333,7 +364,10 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 println!("no requests in the last {since}");
                 return Ok(());
             }
-            println!("{:<24} {:>10} {:>10} {:>8} {:>8}", "group", "requests", "tokens", "errors", "avg_ms");
+            println!(
+                "{:<24} {:>10} {:>10} {:>8} {:>8}",
+                "group", "requests", "tokens", "errors", "avg_ms"
+            );
             for r in &rows {
                 let tokens = r.prompt_tokens + r.completion_tokens;
                 println!(
@@ -350,14 +384,22 @@ fn run(cli: Cli) -> Result<(), CoreError> {
 fn parse_since(s: &str) -> Result<String, CoreError> {
     let s = s.trim();
     let days = if let Some(rest) = s.strip_suffix('d') {
-        rest.parse::<u64>()
-            .map_err(|_| CoreError::ConfigParse { path: String::new(), msg: format!("invalid --since {s:?}; expected <N>d, e.g. 7d") })?
+        rest.parse::<u64>().map_err(|_| CoreError::ConfigParse {
+            path: String::new(),
+            msg: format!("invalid --since {s:?}; expected <N>d, e.g. 7d"),
+        })?
     } else {
-        return Err(CoreError::ConfigParse { path: String::new(), msg: format!("--since only supports <N>d (e.g. 7d); got {s:?}") });
+        return Err(CoreError::ConfigParse {
+            path: String::new(),
+            msg: format!("--since only supports <N>d (e.g. 7d); got {s:?}"),
+        });
     };
     let now = time::OffsetDateTime::now_utc() - time::Duration::days(days as i64);
     now.format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| CoreError::ConfigParse { path: "time".into(), msg: e.to_string() })
+        .map_err(|e| CoreError::ConfigParse {
+            path: "time".into(),
+            msg: e.to_string(),
+        })
 }
 
 /// 交互判定：只要 --name 已提供就不再进交互。
@@ -411,7 +453,11 @@ fn cmd_add(
                 (n, Some(u), serde_json::Value::Null)
             } else {
                 let p = &presets[idx];
-                (p.id.to_string(), p.base_url.map(String::from), p.extra.clone())
+                (
+                    p.id.to_string(),
+                    p.base_url.map(String::from),
+                    p.extra.clone(),
+                )
             }
         }
     };

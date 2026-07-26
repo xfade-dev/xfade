@@ -16,7 +16,12 @@ impl Preset {
 
 /// 各工具的内置预设。第三方端点均为各厂商公开的兼容端点，新增前需核对。
 pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
-    let official = Preset { id: "official", label: "官方登录", base_url: None, extra: serde_json::Value::Null };
+    let official = Preset {
+        id: "official",
+        label: "官方登录",
+        base_url: None,
+        extra: serde_json::Value::Null,
+    };
     let local_proxy = Preset {
         id: "local-proxy",
         label: "本地代理 (asw serve)",
@@ -27,21 +32,56 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
     match tool {
         ToolKind::ClaudeCode => {
             v.extend([
-                Preset { id: "kimi", label: "Kimi (Moonshot)", base_url: Some("https://api.moonshot.cn/anthropic"), extra: serde_json::Value::Null },
-                Preset { id: "glm", label: "GLM (智谱)", base_url: Some("https://open.bigmodel.cn/api/anthropic"), extra: serde_json::Value::Null },
-                Preset { id: "deepseek", label: "DeepSeek", base_url: Some("https://api.deepseek.com/anthropic"), extra: serde_json::Value::Null },
+                Preset {
+                    id: "kimi",
+                    label: "Kimi (Moonshot)",
+                    base_url: Some("https://api.moonshot.cn/anthropic"),
+                    extra: serde_json::Value::Null,
+                },
+                Preset {
+                    id: "glm",
+                    label: "GLM (智谱)",
+                    base_url: Some("https://open.bigmodel.cn/api/anthropic"),
+                    extra: serde_json::Value::Null,
+                },
+                Preset {
+                    id: "deepseek",
+                    label: "DeepSeek",
+                    base_url: Some("https://api.deepseek.com/anthropic"),
+                    extra: serde_json::Value::Null,
+                },
             ]);
         }
         ToolKind::Codex => {
             v.extend([
-                Preset { id: "openrouter", label: "OpenRouter", base_url: Some("https://openrouter.ai/api/v1"), extra: serde_json::json!({"wire_api": "responses"}) },
-                Preset { id: "kimi", label: "Kimi (Moonshot)", base_url: Some("https://api.moonshot.cn/v1"), extra: serde_json::json!({"wire_api": "responses"}) },
+                Preset {
+                    id: "openrouter",
+                    label: "OpenRouter",
+                    base_url: Some("https://openrouter.ai/api/v1"),
+                    extra: serde_json::json!({"wire_api": "responses"}),
+                },
+                Preset {
+                    id: "kimi",
+                    label: "Kimi (Moonshot)",
+                    base_url: Some("https://api.moonshot.cn/v1"),
+                    extra: serde_json::json!({"wire_api": "responses"}),
+                },
             ]);
         }
         ToolKind::OpenCode => {
             v.extend([
-                Preset { id: "openrouter", label: "OpenRouter", base_url: Some("https://openrouter.ai/api/v1"), extra: serde_json::Value::Null },
-                Preset { id: "kimi", label: "Kimi (Moonshot)", base_url: Some("https://api.moonshot.cn/v1"), extra: serde_json::Value::Null },
+                Preset {
+                    id: "openrouter",
+                    label: "OpenRouter",
+                    base_url: Some("https://openrouter.ai/api/v1"),
+                    extra: serde_json::Value::Null,
+                },
+                Preset {
+                    id: "kimi",
+                    label: "Kimi (Moonshot)",
+                    base_url: Some("https://api.moonshot.cn/v1"),
+                    extra: serde_json::Value::Null,
+                },
             ]);
         }
     }

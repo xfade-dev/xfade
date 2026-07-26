@@ -35,7 +35,9 @@ impl FromStr for ToolKind {
             "claude" | "claude-code" => Ok(ToolKind::ClaudeCode),
             "codex" => Ok(ToolKind::Codex),
             "opencode" => Ok(ToolKind::OpenCode),
-            _ => Err(format!("unknown tool: {s} (expected claude|codex|opencode)")),
+            _ => Err(format!(
+                "unknown tool: {s} (expected claude|codex|opencode)"
+            )),
         }
     }
 }
