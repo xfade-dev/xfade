@@ -104,7 +104,15 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ProxyCmd {
     /// 设置代理路由（主 → 备，按参数顺序）
-    Use { names: Vec<String> },
+    Use {
+        names: Vec<String>,
+        /// 覆盖上游 model 字段（不填则透传客户端请求的 model）
+        #[arg(long)]
+        model: Option<String>,
+        /// 目标协议：chat（OpenAI 兼容）或 messages（Anthropic 原生透传）
+        #[arg(long, value_parser = ["chat", "messages"], default_value = "chat")]
+        target: String,
+    },
     /// 查看当前路由
     Status,
     /// 清空路由
@@ -189,9 +197,20 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 if let Some(preset) = presets_for(tool).into_iter().find(|p| p.id == name) {
                     let mut p = Provider::new(&name, tool, preset.base_url.map(String::from));
                     p.extra = preset.extra;
-                    let key = if p.is_official() { None } else { Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string()) };
+                    let key = if p.is_official() {
+                        None
+                    } else {
+                        Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string())
+                    };
                     core.add_provider(p, key.as_deref())?;
-                    println!("auto-created {tool}/{name} from preset{}", if name == "local-proxy" { " (key is arbitrary, proxy will replace it)" } else { "" });
+                    println!(
+                        "auto-created {tool}/{name} from preset{}",
+                        if name == "local-proxy" {
+                            " (key is arbitrary, proxy will replace it)"
+                        } else {
+                            ""
+                        }
+                    );
                 }
             }
             core.use_provider(tool, &name)?;
@@ -312,7 +331,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             })
         }
         Cmd::Proxy { cmd } => match cmd {
-            ProxyCmd::Use { names } => {
+            ProxyCmd::Use {
+                names,
+                model,
+                target,
+            } => {
                 if names.is_empty() {
                     return Err(CoreError::ConfigParse {
                         path: String::new(),
@@ -330,7 +353,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         )));
                     }
                 }
-                core.db().set_routes(&names)?;
+                core.db().set_routes(&names, model.as_deref(), &target)?;
                 let main = &names[0];
                 let backups: Vec<&str> = names.iter().skip(1).map(|s| s.as_str()).collect();
                 if backups.is_empty() {
@@ -338,13 +361,18 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 } else {
                     println!("proxy route: {main} -> {}", backups.join(" -> "));
                 }
+                match model.as_deref() {
+                    Some(m) => println!("model: {m}"),
+                    None => println!("model: (passthrough)"),
+                }
+                println!("target: {target}");
                 Ok(())
             }
             ProxyCmd::Status => {
                 let core = build_core()?;
                 match core.db().get_routes()? {
                     None => println!("routes: (none)"),
-                    Some(routes) => {
+                    Some((routes, model_override, target_protocol)) => {
                         let main = &routes[0];
                         let backups: Vec<&str> =
                             routes.iter().skip(1).map(|s| s.as_str()).collect();
@@ -353,6 +381,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         } else {
                             println!("routes: {main} -> {}", backups.join(" -> "));
                         }
+                        match model_override.as_deref() {
+                            Some(m) => println!("model: {m}"),
+                            None => println!("model: (passthrough)"),
+                        }
+                        println!("target: {target_protocol}");
                     }
                 }
                 println!("note: 熔断状态仅在 serve 进程内可见（CLI 新进程看到的是空 circuits）");

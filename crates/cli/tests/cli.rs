@@ -291,6 +291,67 @@ fn proxy_use_status_clear() {
 }
 
 #[test]
+fn proxy_use_with_model_and_target() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args([
+            "add",
+            "--tool",
+            "codex",
+            "--name",
+            "yy",
+            "--base-url",
+            "http://x",
+            "--key",
+            "k",
+        ])
+        .assert()
+        .success();
+    // proxy use with --model and --target chat
+    asw(home.path())
+        .args([
+            "proxy",
+            "use",
+            "yy",
+            "--model",
+            "gpt-5.6-luna",
+            "--target",
+            "chat",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("proxy route: yy"))
+        .stdout(predicate::str::contains("model: gpt-5.6-luna"))
+        .stdout(predicate::str::contains("target: chat"));
+    // status reflects model + target
+    asw(home.path())
+        .args(["proxy", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("routes: yy"))
+        .stdout(predicate::str::contains("model: gpt-5.6-luna"))
+        .stdout(predicate::str::contains("target: chat"));
+    // target=messages path
+    asw(home.path())
+        .args(["proxy", "use", "yy", "--target", "messages"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model: (passthrough)"))
+        .stdout(predicate::str::contains("target: messages"));
+    asw(home.path())
+        .args(["proxy", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model: (passthrough)"))
+        .stdout(predicate::str::contains("target: messages"));
+    // invalid target value rejected by value_parser
+    asw(home.path())
+        .args(["proxy", "use", "yy", "--target", "bogus"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn stats_empty_ok() {
     let home = tempfile::tempdir().unwrap();
     asw(home.path()).args(["stats"]).assert().success();

@@ -116,7 +116,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "sk-real")]);
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(
             200,
@@ -151,7 +151,9 @@ mod tests {
         let up = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
-        core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(403, r#"{"error":"denied"}"#);
         let (status, body) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
@@ -165,7 +167,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let url = spawn_service(ProxyService::new(core).with_auth_token(Some("t1".into()))).await;
         let (s1, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer wrong").await;
         assert_eq!(s1, 401);
@@ -179,7 +181,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let db = core.db().clone();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(
@@ -209,7 +211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
 
         up.respond_with(200, "{}");
@@ -229,7 +231,7 @@ mod tests {
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
         let db = core.db().clone();
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_sse(vec![
             r#"data: {"choices":[{"delta":{"content":"o"}}]}"#,
@@ -264,7 +266,9 @@ mod tests {
         let up2 = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
         let db = core.db().clone();
-        core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(429, "rate limited");
         up2.respond_with(
@@ -297,7 +301,9 @@ mod tests {
         let up = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
-        core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(500, "boom");
         up2.respond_with(200, "{}");
@@ -316,7 +322,7 @@ mod tests {
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
         let db = core.db().clone();
-        core.db().set_routes(&["yy".into()]).unwrap();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         // Emit two SSE lines then error mid-stream.
         up.respond_sse_error(vec![

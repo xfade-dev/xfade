@@ -177,8 +177,8 @@ async fn forward_with_failover(
     model: Option<String>,
 ) -> Response {
     let start = Instant::now();
-    let routes = match svc.core.db().get_routes() {
-        Ok(Some(r)) if !r.is_empty() => r,
+    let (routes, _model_override, _target_protocol) = match svc.core.db().get_routes() {
+        Ok(Some(r)) if !r.0.is_empty() => r,
         _ => {
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
