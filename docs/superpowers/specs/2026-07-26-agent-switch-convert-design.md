@@ -41,7 +41,7 @@ v0.2 代理只做透传：入站协议必须与上游协议一致。v0.3 引入 
 - `tools[]`（input_schema）→ `tools[]`（`{type:"function", function:{name, description, parameters: input_schema}}`）
 - `tool_choice`：`{type:"auto"}`→`"auto"`；`{type:"any"}`→`"required"`；`{type:"tool", name}`→`{type:"function", function:{name}}`
 - `max_tokens` 透传；`temperature`/`top_p` 透传
-- 丢弃 `anthropic-version`、`anthropic-beta` headers（STRIP_HEADERS 已含，确认覆盖）
+- 丢弃 `anthropic-version`、`anthropic-beta` headers（**当前 v0.2 STRIP_HEADERS 不含这两个，实现时必须加入**）
 - 丢弃 `thinking` content blocks（不转 reasoning）
 
 ### 响应侧（OpenAI → Anthropic）
@@ -66,8 +66,8 @@ v0.2 代理只做透传：入站协议必须与上游协议一致。v0.3 引入 
 | 首个 chunk（含 role） | `message_start`（含 message.id/model/usage.input_tokens）+ `content_block_start`（text block, index 0） |
 | delta.content 文本分片 | `content_block_delta`（{type:"text_delta", text}） |
 | delta.tool_calls 出现 | 当前 text block（如有）`content_block_stop`；`content_block_start`（tool_use block, index N） |
-| delta.tool_calls[].function.arguments 分片 | **聚合到对应 tool_call 的 arguments 缓冲**（不立即转发） |
-| 该 tool_call 完成（finish_reason 出现或下一 tool_call 开始） | 聚合的完整 JSON 字符串作为 `content_block_delta`（{type:"input_json_delta", partial_json: <完整 JSON>}）一次发出；`content_block_stop` |
+| delta.tool_calls[].function.arguments 分片 | **按 `delta.tool_calls[].index` 维护独立缓冲**，聚合该 index 的完整 JSON 字符串 |
+| 该 tool_call 完成（finish_reason 出现或下一 index 的 tool_call 开始） | 聚合的完整 JSON 字符串作为 `content_block_delta`（{type:"input_json_delta", partial_json: <完整 JSON>}）一次发出；`content_block_stop` |
 | finish_reason 出现 | 末尾 text/tool_use block 的 `content_block_stop`；`message_delta`（{stop_reason, stop_seq:null}+usage.output_tokens）；`message_stop` |
 
 聚合-再分片说明：OpenAI 的 tool_calls arguments 是分片字符串（多个 chunk 的 `delta.tool_calls[i].function.arguments` 拼接才是完整 JSON）。代理按 tool_call_id 聚合完整 JSON 后，作为单个 `input_json_delta` 发出。Anthropic SDK 的 input_json_delta 处理器容忍完整 JSON 字符串（它的设计就是为部分 JSON，但完整 JSON 是其特例）。非真增量但可靠。
@@ -75,8 +75,9 @@ v0.2 代理只做透传：入站协议必须与上游协议一致。v0.3 引入 
 ## 4. CLI 与数据模型
 
 ```bash
-asw proxy use <name> [fallback...] [--model <openai-model>]   # model_override 可选
-asw proxy status                                                # 显示 routes + model_override + target_protocol
+asw proxy use <name> [fallback...] [--model <openai-model>] [--target chat|messages]
+# --model: model_override（可选）；--target: target_protocol，默认 chat
+asw proxy status   # 显示 routes + model_override + target_protocol
 ```
 
 数据模型迁移：
@@ -99,7 +100,8 @@ ALTER TABLE proxy_state ADD COLUMN target_protocol TEXT DEFAULT 'chat';  -- chat
 3. 若 endpoint == "messages" && target_protocol == "chat"：
    - 调 `convert::request_anthropic_to_openai(body, model_override)` 得 OpenAI 请求
    - 上游 URL 用 `{base}/chat/completions`，method POST，body=转换后
-   - 上游响应：若非流式，`convert::response_openai_to_anthropic` 转回；若流式，`convert::stream_openai_to_anthropic` 转换 SSE
+   - 转换后请求体若 `stream==true`，需经 `maybe_inject_stream_options` 注入 `include_usage`（与透传路径同处理）
+   - 上游响应：若非流式，`convert::response_openai_to_anthropic` 转回；若流式，**构建新的 stream**：解析 OpenAI SSE chunk → 状态机转 Anthropic SSE 事件 → 输出 Anthropic SSE bytes 给客户端，**同时从转换后的 Anthropic SSE 提取 usage**（不复用 v0.2 的 make_tapped_streaming_body 透传 tap）
 4. 否则走 v0.2 透传路径
 
 failover 循环不变（每个 route 都按其 target_protocol 决定转换与否，但 v0.3 简化：整条路由共用一个 target_protocol，存在 proxy_state）。
@@ -119,3 +121,4 @@ failover 循环不变（每个 route 都按其 target_protocol 决定转换与�
 - thinking/reasoning 块转换（丢弃）
 - 多模态 image 的格式优化（透传 data URI）
 - 按 provider 独立 target_protocol（v0.3 整条路由共用）
+- 错误响应格式转换（上游 OpenAI 错误体原样回传客户端，不转 Anthropic 错误格式；Claude Code 容忍非 Anthropic 错误体）
