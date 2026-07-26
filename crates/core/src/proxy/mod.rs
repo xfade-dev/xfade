@@ -216,4 +216,85 @@ mod tests {
         assert_eq!(s2, 200);
         assert_eq!(up.last_request().await.path, "/messages");
     }
+
+    #[tokio::test]
+    async fn stream_chat_passthrough_and_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()]).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"o"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":1}}"#,
+            "data: [DONE]",
+        ]);
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[],"stream":true}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("\"content\":\"o\""));
+        assert!(body.contains("[DONE]"));
+        let stats = db
+            .stats_since("2020-01-01T00:00:00Z", crate::store::db::StatsGroupBy::Provider)
+            .unwrap();
+        assert_eq!(stats[0].prompt_tokens, 7);
+        assert_eq!(stats[0].completion_tokens, 1);
+        assert!(up.last_request().await.body.contains("include_usage"));
+    }
+
+    #[tokio::test]
+    async fn failover_on_429_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(429, "rate limited");
+        up2.respond_with(200, r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(up.call_count().await, 1);
+        assert_eq!(up2.call_count().await, 1);
+        let stats = db
+            .stats_since("2020-01-01T00:00:00Z", crate::store::db::StatsGroupBy::Provider)
+            .unwrap();
+        assert_eq!(stats.iter().find(|s| s.group == "yy").unwrap().errors, 1);
+        assert_eq!(
+            stats.iter().find(|s| s.group == "bak").unwrap().requests,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_opens_after_threshold_and_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        core.db().set_routes(&["yy".into(), "bak".into()]).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(500, "boom");
+        up2.respond_with(200, "{}");
+        for _ in 0..3 {
+            let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        }
+        let calls_after_3 = up.call_count().await;
+        let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(up.call_count().await, calls_after_3);
+        assert!(up2.call_count().await >= 4);
+    }
 }

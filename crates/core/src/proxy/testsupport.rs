@@ -1,6 +1,7 @@
 use super::ProxyService;
 use crate::service::Core;
 use axum::{
+    body::Body,
     extract::Request,
     http::StatusCode,
     response::Response,
@@ -18,15 +19,24 @@ pub struct RecordedRequest {
     pub body: String,
 }
 
+/// Mock upstream response descriptor.
+#[derive(Clone)]
+enum MockResponse {
+    /// Non-streaming: status + body bytes.
+    Plain { status: StatusCode, body: String },
+    /// Streaming: status + content-type text/event-stream + lines (each terminated with `\n\n`).
+    Sse { status: StatusCode, lines: Vec<String> },
+}
+
 pub struct MockUpstream {
     pub url: String,
-    responses: Arc<Mutex<Vec<(StatusCode, String)>>>,
+    responses: Arc<Mutex<Vec<MockResponse>>>,
     calls: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
 impl MockUpstream {
     pub async fn spawn() -> Self {
-        let responses = Arc::new(Mutex::new(Vec::<(StatusCode, String)>::new()));
+        let responses = Arc::new(Mutex::new(Vec::<MockResponse>::new()));
         let calls = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
 
         let r = responses.clone();
@@ -51,17 +61,38 @@ impl MockUpstream {
                 c.lock().unwrap().push(recorded);
 
                 let mut resps = r.lock().unwrap();
-                let (status, body) = if resps.is_empty() {
-                    (StatusCode::OK, "{}".to_string())
+                let resp = if resps.is_empty() {
+                    MockResponse::Plain {
+                        status: StatusCode::OK,
+                        body: "{}".to_string(),
+                    }
                 } else if resps.len() == 1 {
                     resps[0].clone()
                 } else {
                     resps.remove(0)
                 };
-                Response::builder()
-                    .status(status)
-                    .body(axum::body::Body::from(body))
-                    .unwrap()
+                drop(resps);
+
+                match resp {
+                    MockResponse::Plain { status, body } => Response::builder()
+                        .status(status)
+                        .body(Body::from(body))
+                        .unwrap(),
+                    MockResponse::Sse { status, lines } => {
+                        // Build a single body chunk where each line is terminated by `\n\n`,
+                        // then close the stream so the client doesn't hang.
+                        let mut payload = Vec::new();
+                        for line in &lines {
+                            payload.extend_from_slice(line.as_bytes());
+                            payload.extend_from_slice(b"\n\n");
+                        }
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(payload))
+                            .unwrap()
+                    }
+                }
             }
         }));
 
@@ -87,14 +118,33 @@ impl MockUpstream {
         self.responses
             .lock()
             .unwrap()
-            .push((StatusCode::from_u16(status).unwrap(), body.to_string()));
+            .push(MockResponse::Plain {
+                status: StatusCode::from_u16(status).unwrap(),
+                body: body.to_string(),
+            });
     }
 
     pub fn respond_sequence(&self, seq: Vec<(u16, &str)>) {
         let mut resps = self.responses.lock().unwrap();
         for (status, body) in seq {
-            resps.push((StatusCode::from_u16(status).unwrap(), body.to_string()));
+            resps.push(MockResponse::Plain {
+                status: StatusCode::from_u16(status).unwrap(),
+                body: body.to_string(),
+            });
         }
+    }
+
+    /// Queue a streaming text/event-stream response. Each line is written as
+    /// `line\n\n` and the connection is closed after the last line so that
+    /// `reqwest`'s response body consumption terminates cleanly.
+    pub fn respond_sse(&self, lines: Vec<&str>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push(MockResponse::Sse {
+                status: StatusCode::OK,
+                lines: lines.into_iter().map(String::from).collect(),
+            });
     }
 
     pub async fn last_request(&self) -> RecordedRequest {
