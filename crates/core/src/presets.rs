@@ -17,7 +17,13 @@ impl Preset {
 /// 各工具的内置预设。第三方端点均为各厂商公开的兼容端点，新增前需核对。
 pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
     let official = Preset { id: "official", label: "官方登录", base_url: None, extra: serde_json::Value::Null };
-    let mut v = vec![official];
+    let local_proxy = Preset {
+        id: "local-proxy",
+        label: "本地代理 (asw serve)",
+        base_url: Some(local_proxy_base_url(tool)),
+        extra: serde_json::Value::Null,
+    };
+    let mut v = vec![official, local_proxy];
     match tool {
         ToolKind::ClaudeCode => {
             v.extend([
@@ -40,6 +46,14 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
         }
     }
     v
+}
+
+/// 各工具 local-proxy 预设的 base_url：claude 直连根路径，codex/opencode 走 /v1。
+fn local_proxy_base_url(tool: ToolKind) -> &'static str {
+    match tool {
+        ToolKind::ClaudeCode => "http://127.0.0.1:24860",
+        ToolKind::Codex | ToolKind::OpenCode => "http://127.0.0.1:24860/v1",
+    }
 }
 
 #[cfg(test)]

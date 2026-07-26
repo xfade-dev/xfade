@@ -1,3 +1,5 @@
+use agent_switch_core::proxy::ProxyService;
+use agent_switch_core::store::db::StatsGroupBy;
 use agent_switch_core::store::secrets::{FileMockStore, KeyringStore, SecretStore};
 use agent_switch_core::{presets::presets_for, Core, CoreError, Provider, ToolKind};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -72,6 +74,37 @@ enum Cmd {
     },
     /// 生成 shell 补全
     Completion { shell: Shell },
+    /// 启动本地代理服务（OpenAI/Anthropic 兼容端点）
+    Serve {
+        #[arg(long, default_value = "24860")]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+    /// 代理路由管理（主/备 provider 顺序）
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCmd,
+    },
+    /// 请求统计聚合
+    Stats {
+        #[arg(long, default_value = "7d")]
+        since: String,
+        #[arg(long, value_parser = ["provider", "model"])]
+        by: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyCmd {
+    /// 设置代理路由（主 → 备，按参数顺序）
+    Use { names: Vec<String> },
+    /// 查看当前路由
+    Status,
+    /// 清空路由
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -225,7 +258,106 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
+        Cmd::Serve { port, host, auth_token } => {
+            let core = build_core()?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
+            rt.block_on(async {
+                ProxyService::new(core)
+                    .with_auth_token(auth_token)
+                    .serve(&host, port)
+                    .await
+            })
+        }
+        Cmd::Proxy { cmd } => match cmd {
+            ProxyCmd::Use { names } => {
+                if names.is_empty() {
+                    return Err(CoreError::ConfigParse {
+                        path: String::new(),
+                        msg: "no provider names given; usage: asw proxy use <name> [<name>...]".into(),
+                    });
+                }
+                let core = build_core()?;
+                let known: std::collections::HashSet<String> =
+                    core.list(None)?.into_iter().map(|p| p.id).collect();
+                for n in &names {
+                    if !known.contains(n) {
+                        return Err(CoreError::ProviderNotFound(format!(
+                            "{n} (not in any tool; run `asw ls` to list)"
+                        )));
+                    }
+                }
+                core.db().set_routes(&names)?;
+                let main = &names[0];
+                let backups: Vec<&str> = names.iter().skip(1).map(|s| s.as_str()).collect();
+                if backups.is_empty() {
+                    println!("proxy route: {main}");
+                } else {
+                    println!("proxy route: {main} -> {}", backups.join(" -> "));
+                }
+                Ok(())
+            }
+            ProxyCmd::Status => {
+                let core = build_core()?;
+                match core.db().get_routes()? {
+                    None => println!("routes: (none)"),
+                    Some(routes) => {
+                        let main = &routes[0];
+                        let backups: Vec<&str> = routes.iter().skip(1).map(|s| s.as_str()).collect();
+                        if backups.is_empty() {
+                            println!("routes: {main}");
+                        } else {
+                            println!("routes: {main} -> {}", backups.join(" -> "));
+                        }
+                    }
+                }
+                println!("note: 熔断状态仅在 serve 进程内可见（CLI 新进程看到的是空 circuits）");
+                Ok(())
+            }
+            ProxyCmd::Clear => {
+                let core = build_core()?;
+                core.db().clear_routes()?;
+                println!("routes cleared");
+                Ok(())
+            }
+        },
+        Cmd::Stats { since, by } => {
+            let since_ts = parse_since(&since)?;
+            let group_by = match by.as_deref() {
+                Some("model") => StatsGroupBy::Model,
+                _ => StatsGroupBy::Provider,
+            };
+            let core = build_core()?;
+            let rows = core.db().stats_since(&since_ts, group_by)?;
+            if rows.is_empty() {
+                println!("no requests in the last {since}");
+                return Ok(());
+            }
+            println!("{:<24} {:>10} {:>10} {:>8} {:>8}", "group", "requests", "tokens", "errors", "avg_ms");
+            for r in &rows {
+                let tokens = r.prompt_tokens + r.completion_tokens;
+                println!(
+                    "{:<24} {:>10} {:>10} {:>8} {:>8}",
+                    r.group, r.requests, tokens, r.errors, r.avg_duration_ms
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+/// 解析 `<N>d` 为 RFC3339 时间戳前缀（now - N 天）。
+fn parse_since(s: &str) -> Result<String, CoreError> {
+    let s = s.trim();
+    let days = if let Some(rest) = s.strip_suffix('d') {
+        rest.parse::<u64>()
+            .map_err(|_| CoreError::ConfigParse { path: String::new(), msg: format!("invalid --since {s:?}; expected <N>d, e.g. 7d") })?
+    } else {
+        return Err(CoreError::ConfigParse { path: String::new(), msg: format!("--since only supports <N>d (e.g. 7d); got {s:?}") });
+    };
+    let now = time::OffsetDateTime::now_utc() - time::Duration::days(days as i64);
+    now.format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| CoreError::ConfigParse { path: "time".into(), msg: e.to_string() })
 }
 
 /// 交互判定：只要 --name 已提供就不再进交互。

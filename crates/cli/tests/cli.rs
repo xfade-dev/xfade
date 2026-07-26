@@ -152,3 +152,47 @@ fn completion_generates() {
         .success()
         .stdout(predicate::str::contains("#compdef asw"));
 }
+
+#[test]
+fn proxy_use_status_clear() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["add", "--tool", "codex", "--name", "yy", "--base-url", "http://x", "--key", "k"])
+        .assert().success();
+    asw(home.path())
+        .args(["proxy", "use", "yy"])
+        .assert().success()
+        .stdout(predicate::str::contains("yy"));
+    asw(home.path())
+        .args(["proxy", "status"])
+        .assert().success()
+        .stdout(predicate::str::contains("yy"));
+    asw(home.path())
+        .args(["proxy", "use", "nope"])
+        .assert().failure();
+    asw(home.path()).args(["proxy", "clear"]).assert().success();
+}
+
+#[test]
+fn stats_empty_ok() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path()).args(["stats"]).assert().success();
+}
+
+#[test]
+fn presets_include_local_proxy() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["presets"])
+        .assert().success()
+        .stdout(predicate::str::contains("local-proxy"));
+}
+
+#[test]
+fn serve_help_lists_options() {
+    let home = tempfile::tempdir().unwrap();
+    asw(home.path())
+        .args(["serve", "--help"])
+        .assert().success()
+        .stdout(predicate::str::contains("--port").and(predicate::str::contains("--auth-token")));
+}
