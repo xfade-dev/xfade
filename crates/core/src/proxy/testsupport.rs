@@ -98,7 +98,12 @@ impl MockUpstream {
     }
 
     pub async fn last_request(&self) -> RecordedRequest {
-        self.calls.lock().unwrap().last().cloned().unwrap()
+        self.calls
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("no request recorded yet")
     }
 
     pub async fn call_count(&self) -> usize {

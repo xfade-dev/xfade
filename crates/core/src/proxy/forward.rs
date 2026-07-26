@@ -3,7 +3,7 @@ use crate::store::db::RequestLog;
 use axum::{
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::Response,
 };
 use std::sync::Arc;
@@ -30,16 +30,12 @@ fn endpoint_path(endpoint: &str) -> &'static str {
 }
 
 fn endpoint_from_path(path: &str) -> &'static str {
-    if path.contains("chat/completions") {
-        "chat"
-    } else if path.contains("responses") {
-        "responses"
-    } else if path.contains("messages") {
-        "messages"
-    } else if path.contains("models") {
-        "models"
-    } else {
-        "chat"
+    match path {
+        "/v1/chat/completions" => "chat",
+        "/v1/responses" => "responses",
+        "/v1/messages" => "messages",
+        "/v1/models" => "models",
+        _ => "chat",
     }
 }
 
@@ -114,6 +110,10 @@ async fn forward_with_failover(
         }
     };
 
+    let providers = svc.core.list(None).unwrap_or_default();
+    let provider_map: std::collections::HashMap<&String, &crate::models::Provider> =
+        providers.iter().map(|p| (&p.id, p)).collect();
+
     let mut last_err: Option<(StatusCode, String)> = None;
 
     for route_id in &routes {
@@ -121,12 +121,9 @@ async fn forward_with_failover(
             continue;
         }
 
-        let provider = match svc.core.list(None) {
-            Ok(list) => match list.into_iter().find(|p| &p.id == route_id) {
-                Some(p) => p,
-                None => continue,
-            },
-            Err(_) => continue,
+        let provider = match provider_map.get(route_id) {
+            Some(p) => *p,
+            None => continue,
         };
 
         let base_url = match &provider.base_url {
@@ -221,14 +218,11 @@ async fn forward_with_failover(
 
 pub async fn handle(
     State(svc): State<Arc<ProxyService>>,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let path = headers
-        .get("x-original-path")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/v1/chat/completions");
-    let endpoint = endpoint_from_path(path);
+    let endpoint = endpoint_from_path(uri.path());
 
     if let Some(token) = &svc.auth_token {
         let auth = headers

@@ -197,4 +197,23 @@ mod tests {
         assert_eq!(stats[0].prompt_tokens, 10);
         assert_eq!(stats[0].completion_tokens, 5);
     }
+
+    #[tokio::test]
+    async fn responses_and_messages_reach_correct_upstream_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db().set_routes(&["yy".into()]).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+
+        up.respond_with(200, "{}");
+        let (s1, _) = http_post_json(&url, "/v1/responses", "{}", "Bearer x").await;
+        assert_eq!(s1, 200);
+        assert_eq!(up.last_request().await.path, "/responses");
+
+        up.respond_with(200, "{}");
+        let (s2, _) = http_post_json(&url, "/v1/messages", "{}", "Bearer x").await;
+        assert_eq!(s2, 200);
+        assert_eq!(up.last_request().await.path, "/messages");
+    }
 }
