@@ -11,3 +11,8 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 toml = "0.8"
 dirs = "6"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
