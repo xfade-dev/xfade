@@ -395,16 +395,25 @@ where
 {
     let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
     let tail_for_stream = tail.clone();
+    let errored: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let errored_for_stream = errored.clone();
 
     let mapped = upstream.then(move |chunk_result| {
         let tail = tail_for_stream.clone();
+        let errored = errored_for_stream.clone();
         async move {
-            if let Ok(ref chunk) = chunk_result {
-                let mut t = tail.lock().unwrap();
-                t.extend_from_slice(chunk);
-                if t.len() > SSE_TAIL_CAP {
-                    let excess = t.len() - SSE_TAIL_CAP;
-                    t.drain(..excess);
+            match &chunk_result {
+                Ok(chunk) => {
+                    let mut t = tail.lock().unwrap();
+                    t.extend_from_slice(chunk);
+                    if t.len() > SSE_TAIL_CAP {
+                        let excess = t.len() - SSE_TAIL_CAP;
+                        t.drain(..excess);
+                    }
+                }
+                Err(_) => {
+                    // Mark for the TailStream's completion logger.
+                    *errored.lock().unwrap() = true;
                 }
             }
             chunk_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
@@ -414,6 +423,7 @@ where
     let finalized = TailStream {
         inner: Box::pin(mapped),
         tail,
+        errored,
         endpoint,
         model,
         provider_id,
@@ -431,6 +441,8 @@ where
 struct TailStream {
     inner: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
     tail: Arc<Mutex<Vec<u8>>>,
+    /// Set to true when the inner stream ever yields an `Err` chunk.
+    errored: Arc<Mutex<bool>>,
     endpoint: String,
     model: Option<String>,
     provider_id: String,
@@ -449,10 +461,12 @@ impl futures::Stream for TailStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
-            std::task::Poll::Ready(None) => {
-                if !this.done_logged {
+            std::task::Poll::Ready(Some(item)) => {
+                // If the inner stream yielded an error, record it now (the
+                // stream may be aborted by axum before we ever see Ready(None)).
+                if item.is_err() && !this.done_logged {
                     this.done_logged = true;
+                    *this.errored.lock().unwrap() = true;
                     let tail_bytes = this.tail.lock().unwrap().clone();
                     let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
                     let duration_ms = this.start.elapsed().as_millis() as i64;
@@ -465,7 +479,33 @@ impl futures::Stream for TailStream {
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                         duration_ms,
-                        error: None,
+                        error: Some("upstream stream interrupted".to_string()),
+                    });
+                }
+                std::task::Poll::Ready(Some(item))
+            }
+            std::task::Poll::Ready(None) => {
+                if !this.done_logged {
+                    this.done_logged = true;
+                    let tail_bytes = this.tail.lock().unwrap().clone();
+                    let errored = *this.errored.lock().unwrap();
+                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
+                    let duration_ms = this.start.elapsed().as_millis() as i64;
+                    let error = if errored {
+                        Some("upstream stream interrupted".to_string())
+                    } else {
+                        None
+                    };
+                    let _ = this.db.insert_request_log(&RequestLog {
+                        ts: now_rfc3339(),
+                        endpoint: this.endpoint.clone(),
+                        model: this.model.clone(),
+                        provider_id: this.provider_id.clone(),
+                        status: this.status.as_u16() as i64,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        duration_ms,
+                        error,
                     });
                 }
                 std::task::Poll::Ready(None)

@@ -26,6 +26,10 @@ enum MockResponse {
     Plain { status: StatusCode, body: String },
     /// Streaming: status + content-type text/event-stream + lines (each terminated with `\n\n`).
     Sse { status: StatusCode, lines: Vec<String> },
+    /// Streaming that emits `lines` then errors mid-stream (to simulate an
+    /// interrupted upstream connection). Used by the interrupted-stream
+    /// regression test.
+    SseError { status: StatusCode, lines: Vec<String> },
 }
 
 pub struct MockUpstream {
@@ -92,6 +96,46 @@ impl MockUpstream {
                             .body(Body::from(payload))
                             .unwrap()
                     }
+                    MockResponse::SseError { status, lines } => {
+                        // Emit each line as its own chunk (terminated by `\n\n`),
+                        // then yield an error to simulate a mid-stream failure.
+                        // A short sleep before the terminal error lets axum flush
+                        // the response headers + chunks so reqwest's `send()`
+                        // succeeds; only `bytes()` then surfaces the error.
+                        let owned_lines: Vec<String> = lines.clone();
+                        let s = futures::stream::unfold(
+                            (owned_lines, 0usize, false),
+                            |(lines, idx, yielded_err)| async move {
+                                if idx < lines.len() {
+                                    let mut payload = lines[idx].as_bytes().to_vec();
+                                    payload.extend_from_slice(b"\n\n");
+                                    Some((
+                                        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(
+                                            payload,
+                                        )),
+                                        (lines, idx + 1, false),
+                                    ))
+                                } else if !yielded_err {
+                                    // Give axum time to flush headers + chunks.
+                                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                    Some((
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::ConnectionAborted,
+                                            "upstream stream interrupted",
+                                        )),
+                                        (lines, idx, true),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from_stream(s))
+                            .unwrap()
+                    }
                 }
             }
         }));
@@ -147,6 +191,18 @@ impl MockUpstream {
             });
     }
 
+    /// Queue a streaming text/event-stream response that emits `lines` then
+    /// errors mid-stream, simulating an interrupted upstream connection.
+    pub fn respond_sse_error(&self, lines: Vec<&str>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push(MockResponse::SseError {
+                status: StatusCode::OK,
+                lines: lines.into_iter().map(String::from).collect(),
+            });
+    }
+
     pub async fn last_request(&self) -> RecordedRequest {
         self.calls
             .lock()
@@ -184,6 +240,28 @@ pub async fn http_post_json(url: &str, path: &str, body: &str, auth: &str) -> (u
         .unwrap();
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap();
+    (status, text)
+}
+
+/// Like `http_post_json` but tolerates mid-stream body errors (returns
+/// whatever bytes were received before the error). Used by the
+/// interrupted-stream regression test.
+pub async fn http_post_json_lossy(url: &str, path: &str, body: &str, auth: &str) -> (u16, String) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}{path}"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", auth)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    // Use bytes() which may return partial bytes on error, then fall back to text.
+    let text = match resp.bytes().await {
+        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+        Err(_) => String::new(),
+    };
     (status, text)
 }
 

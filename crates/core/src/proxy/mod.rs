@@ -297,4 +297,40 @@ mod tests {
         assert_eq!(up.call_count().await, calls_after_3);
         assert!(up2.call_count().await >= 4);
     }
+
+    #[tokio::test]
+    async fn interrupted_stream_marked_in_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()]).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        // Emit two SSE lines then error mid-stream.
+        up.respond_sse_error(vec![
+            r#"data: {"choices":[{"delta":{"content":"o"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#,
+        ]);
+        // Tolerate the mid-stream body error (lossy helper).
+        let _ = http_post_json_lossy(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[],"stream":true}"#,
+            "Bearer x",
+        )
+        .await;
+        // Give the deferred stream-completion logger a moment to flush.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let logs = db.recent_request_logs(5).unwrap();
+        assert!(!logs.is_empty(), "expected a request log row");
+        let last = &logs[0];
+        assert_eq!(last.endpoint, "chat");
+        assert_eq!(last.provider_id, "yy");
+        assert_eq!(last.status, 200);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("interrupted"),
+            "expected error field set to 'upstream stream interrupted', got {:?}",
+            last.error
+        );
+    }
 }

@@ -7,6 +7,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// 单条请求日志（数值均为 i64）
+#[derive(Debug)]
 pub struct RequestLog {
     pub ts: String,
     pub endpoint: String,
@@ -247,6 +248,31 @@ impl Database {
                 completion_tokens: row.get(3)?,
                 errors: row.get(4)?,
                 avg_duration_ms: row.get(5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 读取最近 `limit` 条请求日志（按插入顺序倒序）。用于测试断言。
+    pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, endpoint, model, provider_id, status, prompt_tokens, completion_tokens, duration_ms, error
+             FROM request_logs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(RequestLog {
+                ts: row.get(0)?,
+                endpoint: row.get(1)?,
+                model: row.get(2)?,
+                provider_id: row.get(3)?,
+                status: row.get(4)?,
+                prompt_tokens: row.get(5)?,
+                completion_tokens: row.get(6)?,
+                duration_ms: row.get(7)?,
+                error: row.get(8)?,
             });
         }
         Ok(out)
