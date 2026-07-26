@@ -28,6 +28,9 @@ pub enum CoreError {
 
     #[error("toml error: {0}")]
     Toml(String),
+
+    #[error("proxy error: {0}")]
+    Proxy(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

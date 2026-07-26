@@ -35,8 +35,9 @@ pub struct StatsRow {
     pub avg_duration_ms: i64,
 }
 
+#[derive(Clone)]
 pub struct Database {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -44,13 +45,13 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Self { conn: Mutex::new(Connection::open(path)?) };
+        let db = Self { conn: std::sync::Arc::new(Mutex::new(Connection::open(path)?)) };
         db.migrate()?;
         Ok(db)
     }
 
     pub fn open_memory() -> Result<Self> {
-        let db = Self { conn: Mutex::new(Connection::open_in_memory()?) };
+        let db = Self { conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)) };
         db.migrate()?;
         Ok(db)
     }

@@ -137,6 +137,14 @@ impl Core {
         }
     }
 
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+
+    pub fn secrets(&self) -> &dyn SecretStore {
+        &*self.secrets
+    }
+
     pub fn backups(&self, tool: ToolKind) -> Result<Vec<PathBuf>> {
         list_backups(&self.data_dir.join("backups").join(tool.as_str()))
     }
