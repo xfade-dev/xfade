@@ -181,6 +181,19 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Use { name, tool } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
+            // 特例：provider 不存在但匹配预设 → 自动从预设创建。
+            // 对 local-proxy 尤其有用（key 任意值，代理会替换）；
+            // 其他预设（kimi/glm 等）也自动创建，但 key 用占位，用户需后续 `asw edit <name> --key`。
+            let exists = core.list(Some(tool))?.iter().any(|p| p.id == name);
+            if !exists {
+                if let Some(preset) = presets_for(tool).into_iter().find(|p| p.id == name) {
+                    let mut p = Provider::new(&name, tool, preset.base_url.map(String::from));
+                    p.extra = preset.extra;
+                    let key = if p.is_official() { None } else { Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string()) };
+                    core.add_provider(p, key.as_deref())?;
+                    println!("auto-created {tool}/{name} from preset{}", if name == "local-proxy" { " (key is arbitrary, proxy will replace it)" } else { "" });
+                }
+            }
             core.use_provider(tool, &name)?;
             println!("switched {tool} -> {name}");
             Ok(())
