@@ -83,15 +83,28 @@ impl ProxyService {
         self.circuits.lock().unwrap().get(provider_id).cloned()
     }
 
-    pub async fn serve(self, host: &str, port: u16) -> Result<()> {
+    /// 启动代理；`shutdown` future 完成时优雅关停。GUI 用 oneshot receiver。
+    pub async fn serve_with_shutdown(
+        self,
+        host: &str,
+        port: u16,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
         let app = self.build_router();
         let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
             .await
             .map_err(|e| crate::error::CoreError::Proxy(format!("bind {host}:{port}: {e}")))?;
         axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| crate::error::CoreError::Proxy(format!("serve: {e}")))?;
         Ok(())
+    }
+
+    /// CLI 用：阻塞运行直到中断（永不触发优雅关停信号）。
+    pub async fn serve(self, host: &str, port: u16) -> Result<()> {
+        self.serve_with_shutdown(host, port, std::future::pending::<()>())
+            .await
     }
 
     pub fn build_router(self) -> Router {
@@ -319,6 +332,42 @@ mod tests {
         let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(up.call_count().await, calls_after_3);
         assert!(up2.call_count().await >= 4);
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_stops_and_releases_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        // 取一个空闲端口
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let core2 = core.clone();
+        let handle = tokio::spawn(async move {
+            ProxyService::new(core2)
+                .serve_with_shutdown("127.0.0.1", port, async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+        // 等监听就绪
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+
+        // 端口已释放：可重新绑定
+        let rebind = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await;
+        assert!(
+            rebind.is_ok(),
+            "port should be released after graceful shutdown"
+        );
     }
 
     // ----- C4: anthropic→openai conversion end-to-end tests -----
