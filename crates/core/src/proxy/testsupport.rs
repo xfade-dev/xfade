@@ -263,7 +263,7 @@ pub fn test_core(dir: &tempfile::TempDir, providers: &[(&str, &str, &str)]) -> C
     let core = Core::with_paths(
         &home,
         &data,
-        Box::new(crate::store::secrets::MockStore::default()),
+        Arc::new(crate::store::secrets::MockStore::default()),
     )
     .unwrap();
     for (id, base_url, key) in providers {

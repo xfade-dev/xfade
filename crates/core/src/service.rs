@@ -5,17 +5,19 @@ use crate::models::{Provider, ToolKind};
 use crate::store::db::Database;
 use crate::store::secrets::{KeyringStore, SecretStore};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Core {
     db: Database,
-    secrets: Box<dyn SecretStore>,
+    secrets: Arc<dyn SecretStore>,
     home: PathBuf,
     data_dir: PathBuf,
 }
 
 impl Core {
     /// 测试与嵌入用：显式指定 home（工具配置根）与 data_dir（自身数据根）
-    pub fn with_paths(home: &Path, data_dir: &Path, secrets: Box<dyn SecretStore>) -> Result<Self> {
+    pub fn with_paths(home: &Path, data_dir: &Path, secrets: Arc<dyn SecretStore>) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         Ok(Self {
             db: Database::open(&data_dir.join("agent-switch.db"))?,
@@ -30,7 +32,7 @@ impl Core {
         let home =
             dirs::home_dir().ok_or_else(|| CoreError::Keyring("cannot locate home dir".into()))?;
         let data = home.join(".config").join("agent-switch");
-        Self::with_paths(&home, &data, Box::new(KeyringStore::new()))
+        Self::with_paths(&home, &data, Arc::new(KeyringStore::new()))
     }
 
     fn adapter(&self, tool: ToolKind) -> Box<dyn ToolAdapter> {
@@ -193,7 +195,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let data = dir.path().join("data");
-        let core = Core::with_paths(&home, &data, Box::new(MockStore::default())).unwrap();
+        let core = Core::with_paths(&home, &data, Arc::new(MockStore::default())).unwrap();
         (dir, core)
     }
 
@@ -314,5 +316,23 @@ mod tests {
         )
         .unwrap();
         assert!(doc["provider"].get("kimi").is_none());
+    }
+
+    #[test]
+    fn core_clone_shares_db() {
+        let (_dir, core) = setup();
+        core.add_provider(
+            Provider::new("kimi", ToolKind::Codex, Some("https://x".into())),
+            Some("k"),
+        )
+        .unwrap();
+        let core2 = core.clone();
+        core2
+            .add_provider(
+                Provider::new("bak", ToolKind::Codex, Some("https://y".into())),
+                Some("k2"),
+            )
+            .unwrap();
+        assert_eq!(core.list(Some(ToolKind::Codex)).unwrap().len(), 2);
     }
 }

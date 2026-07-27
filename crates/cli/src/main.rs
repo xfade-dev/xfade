@@ -5,6 +5,7 @@ use agent_switch_core::{presets::presets_for, Core, CoreError, Provider, ToolKin
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -161,10 +162,10 @@ fn build_core() -> Result<Core, CoreError> {
         let data = std::env::var_os("ASW_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join(".config").join("agent-switch"));
-        let secrets: Box<dyn SecretStore> = if use_mock {
-            Box::new(FileMockStore::new(data.join("mock-secrets.json")))
+        let secrets: Arc<dyn SecretStore> = if use_mock {
+            Arc::new(FileMockStore::new(data.join("mock-secrets.json")))
         } else {
-            Box::new(KeyringStore::new())
+            Arc::new(KeyringStore::new())
         };
         return Core::with_paths(std::path::Path::new(&home), &data, secrets);
     }
