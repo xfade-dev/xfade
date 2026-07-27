@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/gui/src-tauri"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
