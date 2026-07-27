@@ -212,7 +212,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
-        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        // target=messages so /v1/messages is passthrough (no conversion);
+        // /v1/responses is always passthrough regardless of target.
+        core.db()
+            .set_routes(&["yy".into()], None, "messages")
+            .unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
 
         up.respond_with(200, "{}");
@@ -315,6 +319,105 @@ mod tests {
         let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(up.call_count().await, calls_after_3);
         assert!(up2.call_count().await >= 4);
+    }
+
+    // ----- C4: anthropic→openai conversion end-to-end tests -----
+
+    #[tokio::test]
+    async fn e2e_anthropic_to_openai_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], Some("gpt-5.6-luna"), "chat")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        // mock returns OpenAI-format response
+        up.respond_with(
+            200,
+            r#"{"id":"r1","model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+        );
+        // client sends Anthropic-format request
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/messages",
+            r#"{"model":"claude-sonnet-4-6","max_tokens":100,"messages":[{"role":"user","content":"say ok"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "ok");
+        assert_eq!(v["stop_reason"], "end_turn");
+        // upstream received OpenAI-format + model_override
+        let seen = up.last_request().await;
+        assert_eq!(seen.path, "/chat/completions");
+        let seen_v: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+        assert_eq!(seen_v["model"], "gpt-5.6-luna");
+        assert!(seen_v["messages"].is_array());
+    }
+
+    #[tokio::test]
+    async fn e2e_anthropic_to_openai_streaming_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], Some("gpt-5.6-luna"), "chat")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"ls","arguments":"{\"path\":\""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":4}}"#,
+            "data: [DONE]",
+        ]);
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/messages",
+            r#"{"model":"m","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"list files"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("message_start"));
+        assert!(body.contains(r#""type":"tool_use""#));
+        assert!(body.contains(r#""id":"t1""#));
+        assert!(body.contains(r#""name":"ls""#));
+        assert!(body.contains(r#""input_json_delta""#));
+        assert!(body.contains(r#""partial_json":"{\"path\":\"/\"}""#));
+        assert!(body.contains("content_block_stop"));
+        assert!(body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn target_messages_passthrough_regression() {
+        // target=messages still goes through v0.2 passthrough, no conversion
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], None, "messages")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(
+            200,
+            r#"{"type":"message","content":[{"type":"text","text":"ok"}]}"#,
+        );
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/messages",
+            r#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains(r#""type":"text","text":"ok""#));
+        // upstream received the original Anthropic request (unconverted)
+        let seen = up.last_request().await;
+        assert_eq!(seen.path, "/messages");
+        assert!(seen.body.contains(r#""role":"user""#));
     }
 
     #[tokio::test]
