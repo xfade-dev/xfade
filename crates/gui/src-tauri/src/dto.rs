@@ -1,7 +1,6 @@
-use agent_switch_core::models::{Provider, ToolKind};
+use agent_switch_core::models::ToolKind;
 use agent_switch_core::presets::Preset;
 use agent_switch_core::proxy::Circuit;
-use agent_switch_core::store::db::{RequestLog, StatsGroupBy, StatsRow};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -87,3 +86,4 @@ pub struct RoutesDto {
 }
 
 // core 已 Serialize 的类型透传：Provider / ToolKind / StatsRow / RequestLog / StatsGroupBy
+// （在 commands.rs 中直接作为 command 返回值/参数使用）
