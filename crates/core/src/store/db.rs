@@ -7,7 +7,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// 单条请求日志（数值均为 i64）
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct RequestLog {
     pub ts: String,
     pub endpoint: String,
@@ -21,12 +21,14 @@ pub struct RequestLog {
 }
 
 /// 统计聚合维度
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum StatsGroupBy {
     Provider,
     Model,
 }
 
 /// 一行聚合统计
+#[derive(Debug, serde::Serialize)]
 pub struct StatsRow {
     pub group: String,
     pub requests: i64,
@@ -557,5 +559,37 @@ mod tests {
             .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model)
             .unwrap();
         assert_eq!(by_model.len(), 2);
+    }
+
+    #[test]
+    fn request_log_serializes() {
+        let log = RequestLog {
+            ts: "2026-07-27T00:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("gpt-x".into()),
+            provider_id: "yy".into(),
+            status: 200,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            duration_ms: 10,
+            error: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&log).unwrap();
+        assert_eq!(v["endpoint"], "chat");
+        assert_eq!(v["status"], 200);
+    }
+
+    #[test]
+    fn stats_group_by_roundtrip() {
+        for b in [StatsGroupBy::Provider, StatsGroupBy::Model] {
+            let s = serde_json::to_string(&b).unwrap();
+            let back: StatsGroupBy = serde_json::from_str(&s).unwrap();
+            let _ = back;
+        }
+        // 也校验字段命名（默认 PascalCase 即变体名）
+        assert_eq!(
+            serde_json::to_string(&StatsGroupBy::Provider).unwrap(),
+            "\"Provider\""
+        );
     }
 }

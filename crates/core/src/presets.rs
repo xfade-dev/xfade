@@ -1,6 +1,6 @@
 use crate::models::ToolKind;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Preset {
     pub id: &'static str,
     pub label: &'static str,
@@ -116,5 +116,13 @@ mod tests {
             ids.dedup();
             assert_eq!(ids.len(), list.len());
         }
+    }
+
+    #[test]
+    fn preset_serializes() {
+        let p = presets_for(crate::models::ToolKind::Codex)[0].clone();
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert!(v["id"].is_string());
+        assert!(v["label"].is_string());
     }
 }
