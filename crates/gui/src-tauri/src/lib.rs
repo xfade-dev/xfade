@@ -2,11 +2,13 @@ mod commands;
 mod daemon_ctl;
 mod dto;
 mod state;
+mod tray;
 
 use agent_switch_core::store::secrets::{FileMockStore, KeyringStore, SecretStore};
 use agent_switch_core::Core;
 use state::AppState;
 use std::sync::Arc;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 /// 环境契约（与 CLI 一致）：
 /// - `HOME`：工具配置根。
@@ -35,6 +37,10 @@ pub fn run() {
     let core = build_core().expect("failed to init core");
     tauri::Builder::default()
         .manage(AppState::new(core))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::list_providers,
             commands::add_provider,
@@ -55,7 +61,14 @@ pub fn run() {
             commands::stats,
             commands::recent_logs,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
+            tray::build(app.handle())?;
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -63,6 +76,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // 开机自启（launchd login item）
+            let _ = app.autolaunch().enable();
             Ok(())
         })
         .run(tauri::generate_context!())
