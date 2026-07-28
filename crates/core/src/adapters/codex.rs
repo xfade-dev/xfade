@@ -101,9 +101,12 @@ impl ToolAdapter for CodexAdapter {
             if !auth.is_object() {
                 auth = json!({});
             }
-            auth.as_object_mut()
-                .unwrap()
-                .insert("OPENAI_API_KEY".into(), json!(api_key.unwrap_or_default()));
+            let obj = auth.as_object_mut().unwrap();
+            // F2: 移除官方 OAuth tokens（会劫持 Authorization），切回 apikey 认证
+            if obj.remove("tokens").is_some() {
+                obj.insert("preferred_auth_method".into(), json!("apikey"));
+            }
+            obj.insert("OPENAI_API_KEY".into(), json!(api_key.unwrap_or_default()));
             atomic_write(
                 &self.auth_path(),
                 format!("{}\n", serde_json::to_string_pretty(&auth)?).as_bytes(),
@@ -214,8 +217,30 @@ mod tests {
             &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),
         )
         .unwrap();
-        assert!(auth.get("tokens").is_some());
+        assert!(auth.get("tokens").is_none());
+        assert_eq!(auth["preferred_auth_method"], "apikey");
         assert_eq!(auth["OPENAI_API_KEY"], "sk-1");
+    }
+
+    #[test]
+    fn apply_removes_oauth_tokens() {
+        let (dir, ad) = setup();
+        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/auth.json"),
+            json!({"tokens": {"access_token": "oa-tok", "id_token": "id"}, "OPENAI_API_KEY": "old"})
+                .to_string(),
+        )
+        .unwrap();
+        let p = Provider::new("kimi", ToolKind::Codex, Some("https://x".into()));
+        ad.apply(&p, Some("sk-new")).unwrap();
+        let auth: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(auth.get("tokens").is_none());
+        assert_eq!(auth["preferred_auth_method"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-new");
     }
 
     #[test]
