@@ -29,6 +29,8 @@ pub struct ProxyService {
     pub client: reqwest::Client,
     pub circuits: Arc<Mutex<HashMap<String, Circuit>>>,
     pub auth_token: Option<String>,
+    pub host: String,
+    pub port: u16,
 }
 
 impl ProxyService {
@@ -38,7 +40,15 @@ impl ProxyService {
             client: reqwest::Client::new(),
             circuits: Arc::new(Mutex::new(HashMap::new())),
             auth_token: None,
+            host: "127.0.0.1".to_string(),
+            port: 0,
         }
+    }
+
+    pub fn with_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.host = host.into();
+        self.port = port;
+        self
     }
 
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {
@@ -83,17 +93,16 @@ impl ProxyService {
         self.circuits.lock().unwrap().get(provider_id).cloned()
     }
 
-    /// 启动代理；`shutdown` future 完成时优雅关停。GUI 用 oneshot receiver。
+    /// 启动代理；`shutdown` future 完成时优雅关停。host/port 取自自身字段。
     pub async fn serve_with_shutdown(
         self,
-        host: &str,
-        port: u16,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
+        let addr = format!("{}:{}", self.host, self.port);
         let app = self.build_router();
-        let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
+        let listener = tokio::net::TcpListener::bind(&addr)
             .await
-            .map_err(|e| crate::error::CoreError::Proxy(format!("bind {host}:{port}: {e}")))?;
+            .map_err(|e| crate::error::CoreError::Proxy(format!("bind {addr}: {e}")))?;
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
@@ -102,9 +111,8 @@ impl ProxyService {
     }
 
     /// CLI 用：阻塞运行直到中断（永不触发优雅关停信号）。
-    pub async fn serve(self, host: &str, port: u16) -> Result<()> {
-        self.serve_with_shutdown(host, port, std::future::pending::<()>())
-            .await
+    pub async fn serve(self) -> Result<()> {
+        self.serve_with_shutdown(std::future::pending::<()>()).await
     }
 
     pub fn build_router(self) -> Router {
@@ -347,7 +355,8 @@ mod tests {
         let core2 = core.clone();
         let handle = tokio::spawn(async move {
             ProxyService::new(core2)
-                .serve_with_shutdown("127.0.0.1", port, async move {
+                .with_host_port("127.0.0.1", port)
+                .serve_with_shutdown(async move {
                     let _ = rx.await;
                 })
                 .await
@@ -368,6 +377,33 @@ mod tests {
             rebind.is_ok(),
             "port should be released after graceful shutdown"
         );
+    }
+
+    // ----- C4: anthropic→openai conversion end-to-end tests -----
+
+    #[tokio::test]
+    async fn serve_with_shutdown_uses_configured_host_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            ProxyService::new(core)
+                .with_host_port("127.0.0.1", port)
+                .serve_with_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     // ----- C4: anthropic→openai conversion end-to-end tests -----

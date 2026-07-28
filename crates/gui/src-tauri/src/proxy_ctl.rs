@@ -68,12 +68,13 @@ impl ProxyCtl {
         if inner.shutdown.is_some() {
             return Err("proxy already running".into());
         }
-        let svc = ProxyService::new(core).with_auth_token(auth_token.clone());
+        let svc = ProxyService::new(core)
+            .with_host_port(host.clone(), port)
+            .with_auth_token(auth_token.clone());
         let circuits = svc.circuits.clone();
         let (tx, rx) = oneshot::channel::<()>();
-        let host_for_task = host.clone();
         let handle = async_runtime::spawn(async move {
-            svc.serve_with_shutdown(&host_for_task, port, async move {
+            svc.serve_with_shutdown(async move {
                 let _ = rx.await;
             })
             .await

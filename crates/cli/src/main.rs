@@ -326,8 +326,9 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
             rt.block_on(async {
                 ProxyService::new(core)
+                    .with_host_port(&host, port)
                     .with_auth_token(auth_token)
-                    .serve(&host, port)
+                    .serve()
                     .await
             })
         }
