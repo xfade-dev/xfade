@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli:
+    name: CLI ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release -p asw
+      - name: package
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          BIN=target/release/asw
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/asw.exe; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "dist/asw-${{ matrix.target }}.zip" "$BIN"
+          else
+            tar czf "dist/asw-${{ matrix.target }}.tar.gz" -C target/release asw
+          fi
+          cd dist && sha256sum asw-* > ../checksums-${{ matrix.target }}.txt && cd ..
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: |
+            dist/asw-*
+            checksums-*.txt
+
+  gui:
+    name: GUI macOS (dmg)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: crates/gui/package-lock.json
+      - name: build sidecar
+        shell: bash
+        run: |
+          cargo build --release -p asw
+          mkdir -p crates/gui/src-tauri/binaries
+          cp target/release/asw crates/gui/src-tauri/binaries/asw-aarch64-apple-darwin
+      - name: install frontend deps
+        working-directory: crates/gui
+        run: npm ci
+      - name: tauri build
+        working-directory: crates/gui
+        run: npx tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-dmg
+          path: |
+            crates/gui/src-tauri/target/release/bundle/dmg/*.dmg
+            crates/gui/src-tauri/target/release/bundle/macos/*.app
+
+  release:
+    name: Publish release
+    needs: [cli, gui]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: merge checksums
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release
+          find artifacts -name 'checksums-*.txt' -exec cat {} \; > release/SHA256SUMS
+          find artifacts -name 'asw-*' -exec cp {} release/ \;
+          find artifacts -name '*.dmg' -exec cp {} release/ \;
+          cd release && sha256sum -c SHA256SUMS || true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/asw-*
+            release/*.dmg
+            release/SHA256SUMS
