@@ -1,6 +1,6 @@
 mod commands;
+mod daemon_ctl;
 mod dto;
-mod proxy_ctl;
 mod state;
 
 use agent_switch_core::store::secrets::{FileMockStore, KeyringStore, SecretStore};

@@ -1,23 +1,9 @@
 use agent_switch_core::daemon::{self, DaemonConfig};
 use agent_switch_core::{CoreError, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub const LABEL: &str = "ai.agent-switch.serve";
-
-fn launch_agents_dir(home: &Path) -> PathBuf {
-    home.join("Library/LaunchAgents")
-}
-
-pub fn plist_path(home: &Path) -> PathBuf {
-    launch_agents_dir(home).join(format!("{LABEL}.plist"))
-}
-
-pub fn data_dir(home: &Path) -> PathBuf {
-    home.join(".config/agent-switch")
-}
-
-/// 写 launchd plist + daemon.json；`load=true` 时 launchctl load（macOS）。
-/// `load=false` 仅供测试（不实际加载 launchd）。
+/// 写 launchd plist（ProgramArguments 指向当前 asw 二进制）+ daemon.json；
+/// `load=true` 时 launchctl load（macOS）。`load=false` 仅供测试。
 pub fn install(
     home: &Path,
     host: &str,
@@ -25,7 +11,7 @@ pub fn install(
     auth_token: Option<String>,
     load: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(launch_agents_dir(home))?;
+    std::fs::create_dir_all(daemon::launch_agents_dir(home))?;
     let exe = std::env::current_exe()
         .map_err(|e| CoreError::Proxy(format!("current_exe: {e}")))?
         .display()
@@ -36,14 +22,15 @@ pub fn install(
          <key>ProgramArguments</key><array>\
          <string>{exe}</string><string>serve</string>\
          <string>--host</string><string>{host}</string>\
-         <string>--port</string><string>{port}</string>"
+         <string>--port</string><string>{port}</string>",
+        LABEL = daemon::LABEL
     );
     if let Some(t) = &auth_token {
         plist.push_str(&format!(
             "<string>--auth-token</string><string>{t}</string>"
         ));
     }
-    let dd = data_dir(home);
+    let dd = daemon::data_dir(home);
     std::fs::create_dir_all(&dd)?;
     let log = dd.join("serve.log").display().to_string();
     plist.push_str(&format!(
@@ -54,7 +41,7 @@ pub fn install(
          <key>StandardErrorPath</key><string>{log}</string>\
          </dict></plist>"
     ));
-    std::fs::write(plist_path(home), plist)?;
+    std::fs::write(daemon::plist_path(home), plist)?;
     let cfg = DaemonConfig {
         host: host.to_string(),
         port,
@@ -62,28 +49,18 @@ pub fn install(
     };
     daemon::write(&dd, &cfg)?;
     if load {
-        let p = plist_path(home);
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &p.display().to_string()])
-            .output();
-        std::process::Command::new("launchctl")
-            .args(["load", &p.display().to_string()])
-            .status()
-            .map_err(|e| CoreError::Proxy(format!("launchctl load: {e}")))?;
+        daemon::load(home)?;
     }
     Ok(())
 }
 
 /// 卸载：launchctl unload（`unload=true`）+ 删 plist + 删 daemon.json。幂等。
-pub fn uninstall(home: &Path, unload: bool) -> Result<()> {
-    let p = plist_path(home);
-    if unload && p.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &p.display().to_string()])
-            .status();
+pub fn uninstall(home: &Path, do_unload: bool) -> Result<()> {
+    if do_unload {
+        daemon::unload(home)?;
     }
-    let _ = std::fs::remove_file(&p);
-    let _ = std::fs::remove_file(daemon::daemon_json_path(&data_dir(home)));
+    let _ = std::fs::remove_file(daemon::plist_path(home));
+    let _ = std::fs::remove_file(daemon::daemon_json_path(&daemon::data_dir(home)));
     Ok(())
 }
 
@@ -99,8 +76,8 @@ mod tests {
     fn install_writes_plist_and_daemon_json() {
         let dir = setup_home();
         let home = dir.path();
-        let plist = plist_path(home);
-        let cfg = daemon::daemon_json_path(&data_dir(home));
+        let plist = daemon::plist_path(home);
+        let cfg = daemon::daemon_json_path(&daemon::data_dir(home));
         assert!(!plist.exists());
         install(home, "127.0.0.1", 24860, Some("tok".into()), false).unwrap();
         assert!(plist.exists());
@@ -125,8 +102,8 @@ mod tests {
         let home = dir.path();
         install(home, "127.0.0.1", 24860, None, false).unwrap();
         uninstall(home, false).unwrap();
-        assert!(!plist_path(home).exists());
-        assert!(!daemon::daemon_json_path(&data_dir(home)).exists());
+        assert!(!daemon::plist_path(home).exists());
+        assert!(!daemon::daemon_json_path(&daemon::data_dir(home)).exists());
     }
 
     #[test]

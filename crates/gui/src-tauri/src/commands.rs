@@ -148,26 +148,33 @@ pub async fn restore_backup(
 
 #[tauri::command]
 pub async fn proxy_start(
-    state: State<'_, AppState>,
     host: String,
     port: u16,
     auth_token: Option<String>,
 ) -> CmdResult<ProxyStatus> {
-    state
-        .proxy
-        .start(state.core.clone(), host, port, auth_token)?;
-    Ok(state.proxy.status())
+    // 启动 = launchctl load 已有 plist（host/port/auth_token 由 `asw serve install` 决定，
+    // 此处参数仅为兼容前端 invoke 签名，实际取自 daemon.json）。
+    let _ = (host, port, auth_token);
+    crate::daemon_ctl::start()?;
+    for _ in 0..8 {
+        let s = crate::daemon_ctl::status_from_config().await;
+        if s.running {
+            return Ok(s);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Ok(crate::daemon_ctl::status_from_config().await)
 }
 
 #[tauri::command]
-pub async fn proxy_stop(state: State<'_, AppState>) -> CmdResult<ProxyStatus> {
-    state.proxy.stop().await?;
-    Ok(state.proxy.status())
+pub async fn proxy_stop() -> CmdResult<ProxyStatus> {
+    crate::daemon_ctl::stop()?;
+    Ok(crate::daemon_ctl::status_from_config().await)
 }
 
 #[tauri::command]
-pub async fn proxy_status(state: State<'_, AppState>) -> CmdResult<ProxyStatus> {
-    Ok(state.proxy.status())
+pub async fn proxy_status() -> CmdResult<ProxyStatus> {
+    Ok(crate::daemon_ctl::status_from_config().await)
 }
 
 #[tauri::command]

@@ -2,8 +2,8 @@ use agent_switch_core::models::ToolKind;
 use agent_switch_core::presets::Preset;
 use serde::{Deserialize, Serialize};
 
-// CircuitDto / circuit_to_dto 下沉到 core，GUI 直接复用（避免重复实现）。
-pub use agent_switch_core::proxy::status::{circuit_to_dto as circuit_dto, CircuitDto};
+// CircuitDto 下沉到 core，GUI 直接复用（避免重复实现）。
+pub use agent_switch_core::proxy::status::CircuitDto;
 
 #[derive(Serialize, Deserialize)]
 pub struct AddProviderInput {

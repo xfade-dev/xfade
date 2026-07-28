@@ -367,7 +367,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 daemon::install(std::path::Path::new(&home), &host, port, auth_token, true)?;
                 println!(
                     "installed daemon (label {}); logs: ~/.config/agent-switch/serve.log",
-                    daemon::LABEL
+                    agent_switch_core::daemon::LABEL
                 );
                 Ok(())
             }
@@ -381,7 +381,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             Some(ServeCmd::Status) => {
                 let home =
                     std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
-                let dd = daemon::data_dir(std::path::Path::new(&home));
+                let dd = agent_switch_core::daemon::data_dir(std::path::Path::new(&home));
                 match agent_switch_core::daemon::read(&dd) {
                     None => {
                         println!("daemon: not installed");
