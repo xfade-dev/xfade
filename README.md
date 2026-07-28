@@ -39,4 +39,20 @@ cargo tauri dev          # 开发模式，热重载
 cargo tauri build        # 产物：target/release/bundle/ 下的 .app / .dmg
 ```
 
-环境契约与 CLI 一致（`HOME` / `ASW_DATA_DIR` / `ASW_MOCK_SECRETS`），GUI 与 CLI 共享同一数据目录与钥匙串，可同时使用。四页：Providers（增删改查/切换/import/备份）、Proxy（内嵌 serve 启停 + 路由 failover 编辑 + 熔断状态）、Stats（按 provider/model 聚合）、Logs（最近 200 条请求）。
+环境契约与 CLI 一致（`HOME` / `ASW_DATA_DIR` / `ASW_MOCK_SECRETS`），GUI 与 CLI 共享同一数据目录与钥匙串，可同时使用。四页：Providers（增删改查/切换/import/备份）、Proxy（控制 launchd daemon、路由 failover 编辑、熔断状态）、Stats（按 provider/model 聚合）、Logs（最近 200 条请求）。系统托盘：关窗到托盘、启动/停止代理、每工具快速切换 provider；GUI 开机自启。
+
+## daemon（macOS）
+
+代理可常驻为 launchd 服务（脱离终端、开机自启、崩溃自动重启）：
+
+```bash
+asw serve install [--port 24860] [--host 127.0.0.1] [--auth-token T]  # 安装并加载
+asw serve status                                                       # 查询运行/路由/熔断
+asw serve uninstall                                                    # 卸载（停止 + 删 plist）
+```
+
+- 日志：`~/.config/agent-switch/serve.log`。
+- 状态端点：`GET http://<host>:<port>/__asw/status`（设置 auth-token 时需 `Authorization: Bearer <token>`），返回运行/端口/路由/熔断 JSON，供 `asw serve status` 与 GUI 托盘查询。
+- GUI 托盘的"启动/停止"即 `launchctl load/unload` 已安装的 plist；首次需先用 CLI `asw serve install` 写入 plist（CLI 知道自身二进制路径；GUI 从 Finder 启动时 PATH 不含 `~/.cargo/bin`，无法自行安装）。
+- `asw serve`（无子命令）仍为前台运行，行为不变。
+- Linux/Windows 的 daemon 化为后续 follow-up；前台 `asw serve` 与 GUI 托盘关窗跨平台可用。
