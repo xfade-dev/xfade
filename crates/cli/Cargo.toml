@@ -1,7 +1,13 @@
 [package]
 name = "asw"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Switch API providers for Claude Code / Codex / OpenCode, with local proxy"
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "asw"

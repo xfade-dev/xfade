@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-switch-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "dirs 6.0.0",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "asw"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "agent-switch-core",
  "assert_cmd",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "asw-gui"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "agent-switch-core",
  "log",
