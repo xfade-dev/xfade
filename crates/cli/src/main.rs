@@ -5,6 +5,9 @@ use agent_switch_core::{presets::presets_for, Core, CoreError, Provider, ToolKin
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+mod daemon;
 
 #[derive(Parser)]
 #[command(
@@ -78,7 +81,7 @@ enum Cmd {
     },
     /// 生成 shell 补全
     Completion { shell: Shell },
-    /// 启动本地代理服务（OpenAI/Anthropic 兼容端点）
+    /// 启动本地代理服务（OpenAI/Anthropic 兼容端点）/ daemon 管理
     Serve {
         #[arg(long, default_value = "24860")]
         port: u16,
@@ -86,6 +89,8 @@ enum Cmd {
         host: String,
         #[arg(long)]
         auth_token: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<ServeCmd>,
     },
     /// 代理路由管理（主/备 provider 顺序）
     Proxy {
@@ -104,11 +109,38 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ProxyCmd {
     /// 设置代理路由（主 → 备，按参数顺序）
-    Use { names: Vec<String> },
+    Use {
+        names: Vec<String>,
+        /// 覆盖上游 model 字段（不填则透传客户端请求的 model）
+        #[arg(long)]
+        model: Option<String>,
+        /// 目标协议：chat（OpenAI 兼容）或 messages（Anthropic 原生透传）
+        #[arg(long, value_parser = ["chat", "messages"], default_value = "chat")]
+        target: String,
+    },
     /// 查看当前路由
     Status,
     /// 清空路由
     Clear,
+}
+
+#[derive(Subcommand)]
+enum ServeCmd {
+    /// 安装为 launchd 常驻 daemon（macOS，开机自启 + 崩溃重启）
+    Install {
+        #[arg(long, default_value = "24860")]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
+    /// 卸载 daemon
+    Uninstall,
+    /// 停止 daemon（uninstall 别名）
+    Stop,
+    /// 查询 daemon 状态
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -153,10 +185,10 @@ fn build_core() -> Result<Core, CoreError> {
         let data = std::env::var_os("ASW_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join(".config").join("agent-switch"));
-        let secrets: Box<dyn SecretStore> = if use_mock {
-            Box::new(FileMockStore::new(data.join("mock-secrets.json")))
+        let secrets: Arc<dyn SecretStore> = if use_mock {
+            Arc::new(FileMockStore::new(data.join("mock-secrets.json")))
         } else {
-            Box::new(KeyringStore::new())
+            Arc::new(KeyringStore::new())
         };
         return Core::with_paths(std::path::Path::new(&home), &data, secrets);
     }
@@ -189,9 +221,20 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 if let Some(preset) = presets_for(tool).into_iter().find(|p| p.id == name) {
                     let mut p = Provider::new(&name, tool, preset.base_url.map(String::from));
                     p.extra = preset.extra;
-                    let key = if p.is_official() { None } else { Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string()) };
+                    let key = if p.is_official() {
+                        None
+                    } else {
+                        Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string())
+                    };
                     core.add_provider(p, key.as_deref())?;
-                    println!("auto-created {tool}/{name} from preset{}", if name == "local-proxy" { " (key is arbitrary, proxy will replace it)" } else { "" });
+                    println!(
+                        "auto-created {tool}/{name} from preset{}",
+                        if name == "local-proxy" {
+                            " (key is arbitrary, proxy will replace it)"
+                        } else {
+                            ""
+                        }
+                    );
                 }
             }
             core.use_provider(tool, &name)?;
@@ -300,19 +343,87 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             port,
             host,
             auth_token,
-        } => {
-            let core = build_core()?;
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
-            rt.block_on(async {
-                ProxyService::new(core)
-                    .with_auth_token(auth_token)
-                    .serve(&host, port)
-                    .await
-            })
-        }
+            cmd,
+        } => match cmd {
+            None => {
+                let core = build_core()?;
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
+                rt.block_on(async {
+                    ProxyService::new(core)
+                        .with_host_port(&host, port)
+                        .with_auth_token(auth_token)
+                        .serve()
+                        .await
+                })
+            }
+            Some(ServeCmd::Install {
+                port,
+                host,
+                auth_token,
+            }) => {
+                let home =
+                    std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
+                daemon::install(std::path::Path::new(&home), &host, port, auth_token, true)?;
+                println!(
+                    "installed daemon (label {}); logs: ~/.config/agent-switch/serve.log",
+                    agent_switch_core::daemon::LABEL
+                );
+                Ok(())
+            }
+            Some(ServeCmd::Uninstall) | Some(ServeCmd::Stop) => {
+                let home =
+                    std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
+                daemon::uninstall(std::path::Path::new(&home), true)?;
+                println!("uninstalled daemon");
+                Ok(())
+            }
+            Some(ServeCmd::Status) => {
+                let home =
+                    std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
+                let dd = agent_switch_core::daemon::data_dir(std::path::Path::new(&home));
+                match agent_switch_core::daemon::read(&dd) {
+                    None => {
+                        println!("daemon: not installed");
+                        Ok(())
+                    }
+                    Some(cfg) => {
+                        let url = format!("http://{}:{}/__asw/status", cfg.host, cfg.port);
+                        let rt = tokio::runtime::Runtime::new()
+                            .map_err(|e| CoreError::Proxy(format!("rt: {e}")))?;
+                        rt.block_on(async {
+                            let client = reqwest::Client::new();
+                            let mut req = client.get(&url);
+                            if let Some(t) = &cfg.auth_token {
+                                req = req.header("Authorization", format!("Bearer {t}"));
+                            }
+                            match req.send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                                    println!(
+                                        "daemon: running :{} auth={}",
+                                        cfg.port,
+                                        cfg.auth_token.is_some()
+                                    );
+                                    println!("routes: {:?}", v["routes"]);
+                                }
+                                Ok(r) => println!("daemon: HTTP {}", r.status()),
+                                Err(_) => println!(
+                                    "daemon: not responding (check ~/.config/agent-switch/serve.log)"
+                                ),
+                            }
+                        });
+                        Ok(())
+                    }
+                }
+            }
+        },
         Cmd::Proxy { cmd } => match cmd {
-            ProxyCmd::Use { names } => {
+            ProxyCmd::Use {
+                names,
+                model,
+                target,
+            } => {
                 if names.is_empty() {
                     return Err(CoreError::ConfigParse {
                         path: String::new(),
@@ -330,7 +441,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         )));
                     }
                 }
-                core.db().set_routes(&names)?;
+                core.db().set_routes(&names, model.as_deref(), &target)?;
                 let main = &names[0];
                 let backups: Vec<&str> = names.iter().skip(1).map(|s| s.as_str()).collect();
                 if backups.is_empty() {
@@ -338,13 +449,18 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 } else {
                     println!("proxy route: {main} -> {}", backups.join(" -> "));
                 }
+                match model.as_deref() {
+                    Some(m) => println!("model: {m}"),
+                    None => println!("model: (passthrough)"),
+                }
+                println!("target: {target}");
                 Ok(())
             }
             ProxyCmd::Status => {
                 let core = build_core()?;
                 match core.db().get_routes()? {
                     None => println!("routes: (none)"),
-                    Some(routes) => {
+                    Some((routes, model_override, target_protocol)) => {
                         let main = &routes[0];
                         let backups: Vec<&str> =
                             routes.iter().skip(1).map(|s| s.as_str()).collect();
@@ -353,6 +469,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         } else {
                             println!("routes: {main} -> {}", backups.join(" -> "));
                         }
+                        match model_override.as_deref() {
+                            Some(m) => println!("model: {m}"),
+                            None => println!("model: (passthrough)"),
+                        }
+                        println!("target: {target_protocol}");
                     }
                 }
                 println!("note: 熔断状态仅在 serve 进程内可见（CLI 新进程看到的是空 circuits）");

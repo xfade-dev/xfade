@@ -19,6 +19,8 @@ const STRIP_HEADERS: &[&str] = &[
     "authorization",
     "connection",
     "transfer-encoding",
+    "anthropic-version",
+    "anthropic-beta",
 ];
 
 /// Tail ring buffer size kept while streaming to extract usage at the end (~8KB).
@@ -177,8 +179,8 @@ async fn forward_with_failover(
     model: Option<String>,
 ) -> Response {
     let start = Instant::now();
-    let routes = match svc.core.db().get_routes() {
-        Ok(Some(r)) if !r.is_empty() => r,
+    let (routes, model_override, target_protocol) = match svc.core.db().get_routes() {
+        Ok(Some(r)) if !r.0.is_empty() => r,
         _ => {
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -191,10 +193,46 @@ async fn forward_with_failover(
     let provider_map: std::collections::HashMap<&String, &crate::models::Provider> =
         providers.iter().map(|p| (&p.id, p)).collect();
 
-    // Compute the request body to send upstream, injecting stream_options if needed.
-    // Only the injection case rewrites the body; otherwise we forward the original bytes.
-    let injected = maybe_inject_stream_options(endpoint, body);
-    let out_body: &[u8] = injected.as_deref().unwrap_or(body);
+    // v0.3 conversion path: inbound `messages` + target_protocol=chat → convert
+    // to OpenAI chat/completions upstream and convert the response back to
+    // Anthropic. Otherwise (target_protocol matches endpoint, or chat/responses
+    // endpoints) fall through to v0.2 passthrough.
+    let convert_path = endpoint == "messages" && target_protocol == "chat";
+
+    // For the conversion path, build the OpenAI request body once (it does not
+    // depend on the route). For passthrough, inject stream_options if needed.
+    let converted_req: Option<Bytes> = if convert_path {
+        match super::convert::request_anthropic_to_openai(body, model_override.as_deref()) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(format!("convert request: {e}").into())
+                    .unwrap();
+            }
+        }
+    } else {
+        None
+    };
+
+    // For the converted OpenAI body, inject stream_options if stream==true (the
+    // stream flag is preserved by the converter). For passthrough, do the same
+    // against the original body.
+    let converted_injected: Option<Vec<u8>> = converted_req
+        .as_deref()
+        .and_then(|b| maybe_inject_stream_options("chat", b));
+    let out_converted: Option<&[u8]> = converted_injected.as_deref().or(converted_req.as_deref());
+
+    let passthrough_injected = maybe_inject_stream_options(endpoint, body);
+    let out_passthrough: &[u8] = passthrough_injected.as_deref().unwrap_or(body);
+
+    // Effective upstream endpoint for this request: conversion path always
+    // targets chat/completions; passthrough uses the inbound endpoint.
+    let upstream_endpoint = if convert_path { "chat" } else { endpoint };
+
+    // req_model is the model string the client sent (used to label the
+    // Anthropic response we synthesize on the conversion path).
+    let req_model = model.clone().unwrap_or_default();
 
     let mut last_err: Option<(StatusCode, String)> = None;
 
@@ -219,11 +257,20 @@ async fn forward_with_failover(
             svc.core.secrets().get(&provider.key_ref).ok()
         };
 
+        let out_body: &[u8] = if convert_path {
+            match out_converted {
+                Some(b) => b,
+                None => body,
+            }
+        } else {
+            out_passthrough
+        };
+
         match try_forward(
             &svc.client,
             method,
             &base_url,
-            endpoint,
+            upstream_endpoint,
             headers,
             out_body,
             auth_key.as_deref(),
@@ -238,27 +285,53 @@ async fn forward_with_failover(
                     svc.record_success(route_id);
 
                     if streaming {
-                        let content_type = resp
-                            .headers()
-                            .get(reqwest::header::CONTENT_TYPE)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("text/event-stream")
-                            .to_string();
+                        let content_type = if convert_path {
+                            // We synthesize Anthropic SSE; force text/event-stream.
+                            "text/event-stream".to_string()
+                        } else {
+                            resp.headers()
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("text/event-stream")
+                                .to_string()
+                        };
 
                         let provider_id_owned = route_id.clone();
                         let endpoint_owned = endpoint.to_string();
                         let model_owned = model.clone();
                         let db = svc.core.db().clone();
 
-                        let body = make_tapped_streaming_body(
-                            resp.bytes_stream(),
-                            db,
-                            endpoint_owned,
-                            model_owned,
-                            provider_id_owned,
-                            status,
-                            start,
-                        );
+                        let body = if convert_path {
+                            // Convert the OpenAI SSE stream into Anthropic SSE,
+                            // then tap the converted (Anthropic) output for usage.
+                            // The converter expects a `Stream<Item = Bytes>`; map the
+                            // reqwest result stream, terminating on error.
+                            let upstream =
+                                resp.bytes_stream().filter_map(|r| async move { r.ok() });
+                            let converted = super::convert::stream_openai_to_anthropic(
+                                upstream,
+                                req_model.clone(),
+                            );
+                            make_converted_tapped_streaming_body(
+                                converted,
+                                db,
+                                endpoint_owned,
+                                model_owned,
+                                provider_id_owned,
+                                status,
+                                start,
+                            )
+                        } else {
+                            make_tapped_streaming_body(
+                                resp.bytes_stream(),
+                                db,
+                                endpoint_owned,
+                                model_owned,
+                                provider_id_owned,
+                                status,
+                                start,
+                            )
+                        };
 
                         let mut resp_builder = Response::builder().status(status);
                         if let Some(hv) = resp_builder.headers_mut() {
@@ -291,6 +364,47 @@ async fn forward_with_failover(
                         }
                     };
                     let duration_ms = start.elapsed().as_millis() as i64;
+
+                    if convert_path {
+                        // Convert OpenAI JSON response → Anthropic JSON.
+                        match super::convert::response_openai_to_anthropic(&bytes, &req_model) {
+                            Ok(anthropic_bytes) => {
+                                let usage = Usage::from_json(&anthropic_bytes);
+                                log_request(
+                                    svc,
+                                    endpoint,
+                                    &model,
+                                    route_id,
+                                    status.as_u16() as i64,
+                                    usage,
+                                    duration_ms,
+                                    None,
+                                );
+                                return Response::builder()
+                                    .status(status)
+                                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(anthropic_bytes))
+                                    .unwrap();
+                            }
+                            Err(e) => {
+                                log_request(
+                                    svc,
+                                    endpoint,
+                                    &model,
+                                    route_id,
+                                    status.as_u16() as i64,
+                                    Usage::default(),
+                                    duration_ms,
+                                    Some(format!("convert response: {e}")),
+                                );
+                                return Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .body(format!("convert response: {e}").into())
+                                    .unwrap();
+                            }
+                        }
+                    }
+
                     let usage = Usage::from_json(&bytes);
                     log_request(
                         svc,
@@ -441,6 +555,129 @@ where
     Body::from_stream(finalized)
 }
 
+/// Build a streaming axum `Body` for the conversion path: the input is a stream
+/// of already-converted Anthropic SSE `Bytes` frames. Each frame is forwarded
+/// to the client unchanged, and a tail ring buffer is maintained so that when
+/// the stream ends, usage is extracted from the converted Anthropic SSE tail
+/// (`Usage::from_sse_tail` handles Anthropic events) and a request log row is
+/// written.
+///
+/// This parallels `make_tapped_streaming_body` but operates on a `Stream<Item =
+/// Bytes>` (the converter's output) rather than a `Stream<Item =
+/// Result<Bytes, reqwest::Error>>` (raw upstream).
+fn make_converted_tapped_streaming_body<S>(
+    converted: S,
+    db: crate::store::db::Database,
+    endpoint: String,
+    model: Option<String>,
+    provider_id: String,
+    status: StatusCode,
+    start: Instant,
+) -> Body
+where
+    S: futures::Stream<Item = Bytes> + Send + 'static,
+{
+    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
+    let tail_for_stream = tail.clone();
+
+    let mapped = converted.then(move |chunk| {
+        let tail = tail_for_stream.clone();
+        async move {
+            let mut t = tail.lock().unwrap();
+            t.extend_from_slice(&chunk);
+            if t.len() > SSE_TAIL_CAP {
+                let excess = t.len() - SSE_TAIL_CAP;
+                t.drain(..excess);
+            }
+            Ok::<Bytes, std::io::Error>(chunk)
+        }
+    });
+
+    let finalized = ConvertedTailStream {
+        inner: Box::pin(mapped),
+        tail,
+        endpoint,
+        model,
+        provider_id,
+        db,
+        status,
+        start,
+        done_logged: false,
+    };
+
+    Body::from_stream(finalized)
+}
+
+/// A stream wrapper for the conversion path that forwards converted Anthropic
+/// SSE chunks and, when the inner stream is exhausted, extracts usage from the
+/// accumulated tail and writes a log row. Mirrors `TailStream` but for an
+/// infallible `Bytes`-producing inner stream.
+struct ConvertedTailStream {
+    inner: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    tail: Arc<Mutex<Vec<u8>>>,
+    endpoint: String,
+    model: Option<String>,
+    provider_id: String,
+    db: crate::store::db::Database,
+    status: StatusCode,
+    start: Instant,
+    done_logged: bool,
+}
+
+impl futures::Stream for ConvertedTailStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                if item.is_err() && !this.done_logged {
+                    this.done_logged = true;
+                    let tail_bytes = this.tail.lock().unwrap().clone();
+                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
+                    let duration_ms = this.start.elapsed().as_millis() as i64;
+                    let _ = this.db.insert_request_log(&RequestLog {
+                        ts: now_rfc3339(),
+                        endpoint: this.endpoint.clone(),
+                        model: this.model.clone(),
+                        provider_id: this.provider_id.clone(),
+                        status: this.status.as_u16() as i64,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        duration_ms,
+                        error: Some("upstream stream interrupted".to_string()),
+                    });
+                }
+                std::task::Poll::Ready(Some(item))
+            }
+            std::task::Poll::Ready(None) => {
+                if !this.done_logged {
+                    this.done_logged = true;
+                    let tail_bytes = this.tail.lock().unwrap().clone();
+                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
+                    let duration_ms = this.start.elapsed().as_millis() as i64;
+                    let _ = this.db.insert_request_log(&RequestLog {
+                        ts: now_rfc3339(),
+                        endpoint: this.endpoint.clone(),
+                        model: this.model.clone(),
+                        provider_id: this.provider_id.clone(),
+                        status: this.status.as_u16() as i64,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        duration_ms,
+                        error: None,
+                    });
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// A stream wrapper that forwards chunks from `inner` and, when `inner` is
 /// exhausted, extracts usage from the accumulated `tail` and writes a log row.
 struct TailStream {
@@ -528,36 +765,11 @@ pub async fn handle(
 ) -> Response {
     let endpoint = endpoint_from_path(uri.path());
 
-    if let Some(token) = &svc.auth_token {
-        let auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if auth != format!("Bearer {token}") {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body("unauthorized".into())
-                .unwrap();
-        }
-    }
-
     let model = extract_model(&body);
     forward_with_failover(&svc, "POST", endpoint, &headers, &body, model).await
 }
 
 pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
     let endpoint = "models";
-    if let Some(token) = &svc.auth_token {
-        let auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if auth != format!("Bearer {token}") {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body("unauthorized".into())
-                .unwrap();
-        }
-    }
     forward_with_failover(&svc, "GET", endpoint, &headers, &[], None).await
 }

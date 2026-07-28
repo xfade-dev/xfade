@@ -7,7 +7,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// 单条请求日志（数值均为 i64）
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct RequestLog {
     pub ts: String,
     pub endpoint: String,
@@ -21,12 +21,14 @@ pub struct RequestLog {
 }
 
 /// 统计聚合维度
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum StatsGroupBy {
     Provider,
     Model,
 }
 
 /// 一行聚合统计
+#[derive(Debug, serde::Serialize)]
 pub struct StatsRow {
     pub group: String,
     pub requests: i64,
@@ -40,6 +42,9 @@ pub struct StatsRow {
 pub struct Database {
     conn: std::sync::Arc<Mutex<Connection>>,
 }
+
+/// 代理路由配置：主→备路由列表、模型覆盖、目标协议。
+pub type RoutesConfig = (Vec<String>, Option<String>, String);
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -62,7 +67,8 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.conn.lock().unwrap().execute_batch(
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS providers (
                 tool TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -75,6 +81,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS proxy_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 routes TEXT NOT NULL,
+                model_override TEXT,
+                target_protocol TEXT NOT NULL DEFAULT 'chat',
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS request_logs (
@@ -87,6 +95,27 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);",
         )?;
+        // Idempotent column migration for pre-v0.3 databases where proxy_state
+        // existed without model_override / target_protocol.
+        let existing_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(proxy_state)")?;
+            let mut rows = stmt.query([])?;
+            let mut cols = std::collections::HashSet::new();
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                cols.insert(name);
+            }
+            cols
+        };
+        if !existing_cols.contains("model_override") {
+            conn.execute("ALTER TABLE proxy_state ADD COLUMN model_override TEXT", [])?;
+        }
+        if !existing_cols.contains("target_protocol") {
+            conn.execute(
+                "ALTER TABLE proxy_state ADD COLUMN target_protocol TEXT NOT NULL DEFAULT 'chat'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -177,8 +206,13 @@ impl Database {
         Ok(())
     }
 
-    /// 设置代理路由（主→备 顺序）
-    pub fn set_routes(&self, routes: &[String]) -> Result<()> {
+    /// 设置代理路由（主→备 顺序）+ 模型覆盖 + 目标协议
+    pub fn set_routes(
+        &self,
+        routes: &[String],
+        model_override: Option<&str>,
+        target_protocol: &str,
+    ) -> Result<()> {
         let now =
             OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -187,22 +221,38 @@ impl Database {
                     msg: e.to_string(),
                 })?;
         self.conn.lock().unwrap().execute(
-            "INSERT INTO proxy_state (id, routes, updated_at) VALUES (1, ?1, ?2)
-             ON CONFLICT (id) DO UPDATE SET routes = excluded.routes, updated_at = excluded.updated_at",
-            params![serde_json::to_string(routes)?, now],
+            "INSERT INTO proxy_state (id, routes, model_override, target_protocol, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET
+                routes = excluded.routes,
+                model_override = excluded.model_override,
+                target_protocol = excluded.target_protocol,
+                updated_at = excluded.updated_at",
+            params![
+                serde_json::to_string(routes)?,
+                model_override,
+                target_protocol,
+                now
+            ],
         )?;
         Ok(())
     }
 
-    /// 读取代理路由；未设置返回 None
-    pub fn get_routes(&self) -> Result<Option<Vec<String>>> {
+    /// 读取代理路由及关联配置；未设置返回 None。
+    /// 返回 (routes, model_override, target_protocol)
+    pub fn get_routes(&self) -> Result<Option<RoutesConfig>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT routes FROM proxy_state WHERE id = 1")?;
+        let mut stmt = conn.prepare(
+            "SELECT routes, model_override, target_protocol FROM proxy_state WHERE id = 1",
+        )?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
             Some(row) => {
                 let s: String = row.get(0)?;
-                Ok(Some(serde_json::from_str(&s)?))
+                let routes: Vec<String> = serde_json::from_str(&s)?;
+                let model_override: Option<String> = row.get(1)?;
+                let target_protocol: String = row.get(2)?;
+                Ok(Some((routes, model_override, target_protocol)))
             }
             None => Ok(None),
         }
@@ -386,13 +436,89 @@ mod tests {
     fn proxy_routes_crud() {
         let db = Database::open_memory().unwrap();
         assert!(db.get_routes().unwrap().is_none());
-        db.set_routes(&["yy".into(), "bak".into()]).unwrap();
-        assert_eq!(
-            db.get_routes().unwrap().unwrap(),
-            vec!["yy".to_string(), "bak".to_string()]
-        );
+        db.set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["yy".to_string(), "bak".to_string()]);
+        assert_eq!(model_override, None);
+        assert_eq!(target_protocol, "chat");
         db.clear_routes().unwrap();
         assert!(db.get_routes().unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_routes_with_model_and_target() {
+        let db = Database::open_memory().unwrap();
+        db.set_routes(&["yy".into()], Some("gpt-5.6-luna"), "messages")
+            .unwrap();
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["yy".to_string()]);
+        assert_eq!(model_override.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(target_protocol, "messages");
+    }
+
+    #[test]
+    fn proxy_routes_update_preserves_model_and_target() {
+        let db = Database::open_memory().unwrap();
+        db.set_routes(&["yy".into()], Some("gpt-5.6-luna"), "chat")
+            .unwrap();
+        // Update routes only, keeping model+target
+        db.set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["yy".to_string(), "bak".to_string()]);
+        // set_routes overwrites all fields; None here means model_override cleared
+        assert_eq!(model_override, None);
+        assert_eq!(target_protocol, "chat");
+    }
+
+    #[test]
+    fn proxy_state_migration_from_old_schema() {
+        // Simulate an old v0.2 database (no model_override/target_protocol columns)
+        // by creating the table manually without the new columns, then opening via
+        // Database::open (which runs migrate()) and verifying defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE proxy_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    routes TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE providers (
+                    tool TEXT NOT NULL, id TEXT NOT NULL, base_url TEXT,
+                    key_ref TEXT NOT NULL, extra TEXT NOT NULL DEFAULT 'null',
+                    is_active INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tool, id)
+                );
+                CREATE TABLE request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL, endpoint TEXT NOT NULL, model TEXT,
+                    provider_id TEXT NOT NULL, status INTEGER NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER NOT NULL, error TEXT
+                );
+                INSERT INTO proxy_state (id, routes, updated_at)
+                VALUES (1, '[\"old\"]', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        // Now open via Database which should run migrate() and add the columns.
+        let db = Database::open(&db_path).unwrap();
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["old".to_string()]);
+        // Migration defaults: model_override None, target_protocol 'chat'
+        assert_eq!(model_override, None);
+        assert_eq!(target_protocol, "chat");
+        // And we can update with new values
+        db.set_routes(&["yy".into()], Some("gpt-5.6-luna"), "messages")
+            .unwrap();
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["yy".to_string()]);
+        assert_eq!(model_override.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(target_protocol, "messages");
     }
 
     #[test]
@@ -433,5 +559,37 @@ mod tests {
             .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model)
             .unwrap();
         assert_eq!(by_model.len(), 2);
+    }
+
+    #[test]
+    fn request_log_serializes() {
+        let log = RequestLog {
+            ts: "2026-07-27T00:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("gpt-x".into()),
+            provider_id: "yy".into(),
+            status: 200,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            duration_ms: 10,
+            error: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&log).unwrap();
+        assert_eq!(v["endpoint"], "chat");
+        assert_eq!(v["status"], 200);
+    }
+
+    #[test]
+    fn stats_group_by_roundtrip() {
+        for b in [StatsGroupBy::Provider, StatsGroupBy::Model] {
+            let s = serde_json::to_string(&b).unwrap();
+            let back: StatsGroupBy = serde_json::from_str(&s).unwrap();
+            let _ = back;
+        }
+        // 也校验字段命名（默认 PascalCase 即变体名）
+        assert_eq!(
+            serde_json::to_string(&StatsGroupBy::Provider).unwrap(),
+            "\"Provider\""
+        );
     }
 }
