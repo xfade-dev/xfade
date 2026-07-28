@@ -118,7 +118,15 @@ impl ToolAdapter for CodexAdapter {
             toml::to_string_pretty(&cfg)
                 .map_err(|e| CoreError::Toml(e.to_string()))?
                 .as_bytes(),
-        )
+        )?;
+        // F1: 扫描全文件残留的废弃 wire_api="chat"，新版 Codex 全文件校验会拒绝启动
+        for pid in find_legacy_wire_api(&cfg) {
+            eprintln!(
+                "[asw] 警告: config.toml 中 model_providers.{pid} 仍使用废弃的 wire_api=\"chat\"，\
+                 新版 Codex 将拒绝启动，请改为 \"responses\""
+            );
+        }
+        Ok(())
     }
 
     fn read_current(&self) -> Result<Option<(Provider, Option<String>)>> {
@@ -147,6 +155,20 @@ impl ToolAdapter for CodexAdapter {
             .map(String::from);
         Ok(Some((p, key)))
     }
+}
+
+/// 扫描 config 中 `model_providers.*.wire_api == "chat"` 的 provider id（废弃值）。
+/// 新版 Codex 对全文件校验，任何节含 chat 即拒绝启动。
+fn find_legacy_wire_api(cfg: &toml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(provs) = cfg.get("model_providers").and_then(|v| v.as_table()) {
+        for (pid, p) in provs {
+            if p.get("wire_api").and_then(|v| v.as_str()) == Some("chat") {
+                out.push(pid.clone());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -220,6 +242,16 @@ mod tests {
         assert!(auth.get("tokens").is_none());
         assert_eq!(auth["preferred_auth_method"], "apikey");
         assert_eq!(auth["OPENAI_API_KEY"], "sk-1");
+    }
+
+    #[test]
+    fn find_legacy_wire_api_detects_chat() {
+        let cfg: toml::Value = toml::from_str(
+            "[model_providers.kimi]\nname=\"kimi\"\nbase_url=\"https://x\"\nwire_api=\"chat\"\n\
+             [model_providers.oa]\nname=\"oa\"\nbase_url=\"https://y\"\nwire_api=\"responses\"\n",
+        )
+        .unwrap();
+        assert_eq!(find_legacy_wire_api(&cfg), vec!["kimi".to_string()]);
     }
 
     #[test]
