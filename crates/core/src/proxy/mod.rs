@@ -4,6 +4,8 @@ pub mod forward;
 pub mod testsupport;
 pub mod usage;
 
+mod auth;
+
 use crate::error::Result;
 use crate::service::Core;
 use axum::{
@@ -117,12 +119,18 @@ impl ProxyService {
 
     pub fn build_router(self) -> Router {
         let state = Arc::new(self);
-        Router::new()
-            .route("/health", get(|| async { "ok" }))
+        let protected = Router::<Arc<ProxyService>>::new()
             .route("/v1/chat/completions", post(forward::handle))
             .route("/v1/responses", post(forward::handle))
             .route("/v1/messages", post(forward::handle))
             .route("/v1/models", get(forward::handle_get))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::auth_guard,
+            ));
+        Router::<Arc<ProxyService>>::new()
+            .route("/health", get(|| async { "ok" }))
+            .merge(protected)
             .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(state)
     }

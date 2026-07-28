@@ -765,36 +765,11 @@ pub async fn handle(
 ) -> Response {
     let endpoint = endpoint_from_path(uri.path());
 
-    if let Some(token) = &svc.auth_token {
-        let auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if auth != format!("Bearer {token}") {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body("unauthorized".into())
-                .unwrap();
-        }
-    }
-
     let model = extract_model(&body);
     forward_with_failover(&svc, "POST", endpoint, &headers, &body, model).await
 }
 
 pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
     let endpoint = "models";
-    if let Some(token) = &svc.auth_token {
-        let auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if auth != format!("Bearer {token}") {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body("unauthorized".into())
-                .unwrap();
-        }
-    }
     forward_with_failover(&svc, "GET", endpoint, &headers, &[], None).await
 }
