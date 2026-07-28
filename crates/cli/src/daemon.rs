@@ -49,6 +49,8 @@ pub fn install(
     };
     daemon::write(&dd, &cfg)?;
     if load {
+        // 幂等：先 unload 再 load，避免已加载时 launchctl load 报错（GUI 可重复点启动）
+        daemon::unload(home)?;
         daemon::load(home)?;
     }
     Ok(())

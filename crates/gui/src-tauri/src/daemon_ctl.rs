@@ -3,6 +3,8 @@ use agent_switch_core::daemon::{self, DaemonConfig};
 use agent_switch_core::proxy::status::StatusDto;
 use reqwest::Client;
 use std::path::Path;
+use tauri::AppHandle;
+use tauri_plugin_shell::ShellExt;
 
 fn stopped() -> ProxyStatus {
     ProxyStatus {
@@ -12,10 +14,6 @@ fn stopped() -> ProxyStatus {
         auth_enabled: false,
         circuits: vec![],
     }
-}
-
-fn home() -> Result<String, String> {
-    std::env::var("HOME").map_err(|_| "HOME not set".to_string())
 }
 
 /// 读 daemon.json 配置；未安装返回 None。
@@ -55,16 +53,75 @@ pub async fn status_from_config() -> ProxyStatus {
     }
 }
 
-/// 启动 daemon = `launchctl load` 已有 plist（plist 由 `asw serve install` 写入）。
-pub fn start() -> Result<(), String> {
-    let h = home()?;
-    daemon::load(Path::new(&h)).map_err(|e| e.to_string())
+/// `asw serve install` 的参数（host/port/auth_token）。
+pub fn install_args(host: &str, port: u16, auth_token: Option<String>) -> Vec<String> {
+    let mut v = vec![
+        "serve".into(),
+        "install".into(),
+        "--host".into(),
+        host.into(),
+        "--port".into(),
+        port.to_string(),
+    ];
+    if let Some(t) = auth_token {
+        v.push("--auth-token".into());
+        v.push(t);
+    }
+    v
 }
 
-/// 停止 daemon = `launchctl unload` plist。
-pub fn stop() -> Result<(), String> {
-    let h = home()?;
-    daemon::unload(Path::new(&h)).map_err(|e| e.to_string())
+/// `asw serve uninstall` 的参数。
+pub fn uninstall_args() -> Vec<String> {
+    vec!["serve".into(), "uninstall".into()]
+}
+
+/// 启动 daemon：经 sidecar 执行 `asw serve install`（写 plist + launchctl load）。
+/// install 幂等（cli 内部 unload-then-load），可重复调用。sidecar 的 current_exe
+/// 指向 .app 内的 asw，plist 引用正确。
+pub async fn start(
+    app: &AppHandle,
+    host: String,
+    port: u16,
+    auth_token: Option<String>,
+) -> Result<(), String> {
+    let args = install_args(&host, port, auth_token);
+    let status = app
+        .shell()
+        .sidecar("asw")
+        .map_err(|e| e.to_string())?
+        .args(&args)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "asw serve install failed (exit {:?})",
+            status.code()
+        ))
+    }
+}
+
+/// 停止 daemon：经 sidecar 执行 `asw serve uninstall`。
+pub async fn stop(app: &AppHandle) -> Result<(), String> {
+    let args = uninstall_args();
+    let status = app
+        .shell()
+        .sidecar("asw")
+        .map_err(|e| e.to_string())?
+        .args(&args)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "asw serve uninstall failed (exit {:?})",
+            status.code()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +180,33 @@ mod tests {
         assert_eq!(cfg.port, 24860);
         assert_eq!(cfg.auth_token.as_deref(), Some("t"));
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn install_args_shape() {
+        let with_tok = install_args("127.0.0.1", 24860, Some("t".into()));
+        assert_eq!(
+            with_tok,
+            vec![
+                "serve",
+                "install",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "24860",
+                "--auth-token",
+                "t"
+            ]
+        );
+        let no_tok = install_args("127.0.0.1", 9000, None);
+        assert_eq!(
+            no_tok,
+            vec!["serve", "install", "--host", "127.0.0.1", "--port", "9000"]
+        );
+    }
+
+    #[test]
+    fn uninstall_args_shape() {
+        assert_eq!(uninstall_args(), vec!["serve", "uninstall"]);
     }
 }

@@ -41,6 +41,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_providers,
             commands::add_provider,

@@ -148,14 +148,13 @@ pub async fn restore_backup(
 
 #[tauri::command]
 pub async fn proxy_start(
+    app: tauri::AppHandle,
     host: String,
     port: u16,
     auth_token: Option<String>,
 ) -> CmdResult<ProxyStatus> {
-    // 启动 = launchctl load 已有 plist（host/port/auth_token 由 `asw serve install` 决定，
-    // 此处参数仅为兼容前端 invoke 签名，实际取自 daemon.json）。
-    let _ = (host, port, auth_token);
-    crate::daemon_ctl::start()?;
+    // 经 sidecar 执行 `asw serve install`（GUI 自装 daemon，无需 CLI 前置安装）。
+    crate::daemon_ctl::start(&app, host, port, auth_token).await?;
     for _ in 0..8 {
         let s = crate::daemon_ctl::status_from_config().await;
         if s.running {
@@ -167,8 +166,8 @@ pub async fn proxy_start(
 }
 
 #[tauri::command]
-pub async fn proxy_stop() -> CmdResult<ProxyStatus> {
-    crate::daemon_ctl::stop()?;
+pub async fn proxy_stop(app: tauri::AppHandle) -> CmdResult<ProxyStatus> {
+    crate::daemon_ctl::stop(&app).await?;
     Ok(crate::daemon_ctl::status_from_config().await)
 }
 

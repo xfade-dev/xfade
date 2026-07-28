@@ -1,2 +1,5 @@
 node_modules
 dist
+
+# tauri sidecar (built)
+crates/gui/src-tauri/binaries/

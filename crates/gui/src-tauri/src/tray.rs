@@ -81,10 +81,22 @@ fn on_menu_event(app: &AppHandle, e: MenuEvent) {
             }
         }
         "start" => {
-            let _ = crate::daemon_ctl::start();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let cfg = crate::daemon_ctl::config();
+                let (h, p, t) = cfg.map(|c| (c.host, c.port, c.auth_token)).unwrap_or((
+                    "127.0.0.1".into(),
+                    24860,
+                    None,
+                ));
+                let _ = crate::daemon_ctl::start(&app, h, p, t).await;
+            });
         }
         "stop" => {
-            let _ = crate::daemon_ctl::stop();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::daemon_ctl::stop(&app).await;
+            });
         }
         "quit" => {
             app.exit(0);
