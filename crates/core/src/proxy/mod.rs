@@ -5,6 +5,7 @@ pub mod testsupport;
 pub mod usage;
 
 mod auth;
+pub mod status;
 
 use crate::error::Result;
 use crate::service::Core;
@@ -124,6 +125,7 @@ impl ProxyService {
             .route("/v1/responses", post(forward::handle))
             .route("/v1/messages", post(forward::handle))
             .route("/v1/models", get(forward::handle_get))
+            .route("/__asw/status", get(status::handle))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth::auth_guard,
@@ -385,6 +387,78 @@ mod tests {
             rebind.is_ok(),
             "port should be released after graceful shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_returns_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], Some("gpt-x"), "chat")
+            .unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            ProxyService::new(core)
+                .with_host_port("127.0.0.1", port)
+                .serve_with_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let v: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/__asw/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["running"], true);
+        assert_eq!(v["port"], port);
+        assert_eq!(v["auth_enabled"], false);
+        assert_eq!(v["routes"][0], "yy");
+        assert_eq!(v["model_override"], "gpt-x");
+        assert_eq!(v["target_protocol"], "chat");
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_requires_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            ProxyService::new(core)
+                .with_host_port("127.0.0.1", port)
+                .with_auth_token(Some("t1".into()))
+                .serve_with_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let s = reqwest::get(format!("http://127.0.0.1:{port}/__asw/status"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(s, 401);
+        let s2 = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/__asw/status"))
+            .header("Authorization", "Bearer t1")
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(s2, 200);
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     // ----- C4: anthropic→openai conversion end-to-end tests -----

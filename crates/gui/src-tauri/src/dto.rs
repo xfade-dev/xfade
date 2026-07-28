@@ -1,8 +1,9 @@
 use agent_switch_core::models::ToolKind;
 use agent_switch_core::presets::Preset;
-use agent_switch_core::proxy::Circuit;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+
+// CircuitDto / circuit_to_dto 下沉到 core，GUI 直接复用（避免重复实现）。
+pub use agent_switch_core::proxy::status::{circuit_to_dto as circuit_dto, CircuitDto};
 
 #[derive(Serialize, Deserialize)]
 pub struct AddProviderInput {
@@ -43,29 +44,6 @@ impl From<Preset> for PresetDto {
             extra: p.extra,
             is_official,
         }
-    }
-}
-
-#[derive(Serialize)]
-pub struct CircuitDto {
-    pub provider_id: String,
-    pub fails: u32,
-    pub cooldown_remaining_secs: Option<u64>,
-}
-
-pub fn circuit_dto(provider_id: &str, c: &Circuit) -> CircuitDto {
-    let cooldown_remaining_secs = c.cooldown_until.and_then(|t| {
-        let now = Instant::now();
-        if t > now {
-            Some(t.saturating_duration_since(now).as_secs())
-        } else {
-            None
-        }
-    });
-    CircuitDto {
-        provider_id: provider_id.to_string(),
-        fails: c.fails,
-        cooldown_remaining_secs,
     }
 }
 
