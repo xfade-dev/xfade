@@ -295,7 +295,7 @@ impl Database {
             "SELECT {group_expr}, COUNT(*),
                     COALESCE(SUM(prompt_tokens), 0),
                     COALESCE(SUM(completion_tokens), 0),
-                    SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
                     CAST(AVG(duration_ms) AS INTEGER)
              FROM request_logs WHERE ts >= ?1
              GROUP BY {group_expr} ORDER BY 2 DESC"
@@ -548,13 +548,26 @@ mod tests {
             error: Some("rate limited".into()),
         })
         .unwrap();
+        // F5: status=0（上游连接失败）应计入 errors
+        db.insert_request_log(&RequestLog {
+            ts: "2026-07-26T12:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            provider_id: "yy".into(),
+            status: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            duration_ms: 50,
+            error: Some("connection refused".into()),
+        })
+        .unwrap();
         let rows = db
             .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider)
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].requests, 3);
         assert_eq!(rows[0].prompt_tokens, 100);
-        assert_eq!(rows[0].errors, 1);
+        assert_eq!(rows[0].errors, 2);
         let by_model = db
             .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model)
             .unwrap();
