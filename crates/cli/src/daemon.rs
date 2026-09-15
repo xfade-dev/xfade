@@ -1,6 +1,6 @@
+use std::path::Path;
 use xfade_core::daemon::{self, DaemonConfig};
 use xfade_core::{CoreError, Result};
-use std::path::Path;
 
 /// Install the daemon: macOS writes a plist, Linux writes a systemd unit, both write daemon.json.
 /// `load=true` loads immediately; `load=false` is for tests only.

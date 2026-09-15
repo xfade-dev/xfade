@@ -64,13 +64,12 @@ impl ToolAdapter for PiAdapter {
                 .get("_original_default_provider")
                 .and_then(|v| v.as_str())
             {
-                settings_obj.insert(
-                    "defaultProvider".to_string(),
-                    json!(original),
-                );
+                settings_obj.insert("defaultProvider".to_string(), json!(original));
             }
             // Remove xfade provider entry from models.json.
-            if let Some(providers) = models_obj.get_mut("providers").and_then(|v| v.as_object_mut())
+            if let Some(providers) = models_obj
+                .get_mut("providers")
+                .and_then(|v| v.as_object_mut())
             {
                 providers.remove("xfade");
             }
@@ -81,14 +80,17 @@ impl ToolAdapter for PiAdapter {
             settings_obj.insert("defaultProvider".to_string(), json!("xfade"));
 
             // Add/update xfade provider in models.json.
-            let providers = models_obj
-                .entry("providers")
-                .or_insert_with(|| json!({}));
-            let providers = providers.as_object_mut().ok_or_else(|| CoreError::ConfigParse {
-                path: self.models_path().display().to_string(),
-                msg: "models.json 'providers' must be an object".into(),
-            })?;
-            let base_url = provider.base_url.as_deref().unwrap_or("http://127.0.0.1:9413");
+            let providers = models_obj.entry("providers").or_insert_with(|| json!({}));
+            let providers = providers
+                .as_object_mut()
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: self.models_path().display().to_string(),
+                    msg: "models.json 'providers' must be an object".into(),
+                })?;
+            let base_url = provider
+                .base_url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:9413");
             let api_type = provider
                 .extra
                 .get("api")
@@ -113,9 +115,7 @@ impl ToolAdapter for PiAdapter {
 
     fn read_current(&self) -> Result<Option<(Provider, Option<String>)>> {
         let models = load_json_or_empty(&self.models_path())?;
-        let providers = models
-            .get("providers")
-            .and_then(|v| v.as_object());
+        let providers = models.get("providers").and_then(|v| v.as_object());
         let Some(providers) = providers else {
             return Ok(None);
         };
@@ -161,18 +161,12 @@ mod tests {
     }
 
     fn read_settings(dir: &tempfile::TempDir) -> Value {
-        let s = std::fs::read_to_string(
-            dir.path().join(".pi/agent/settings.json"),
-        )
-        .unwrap();
+        let s = std::fs::read_to_string(dir.path().join(".pi/agent/settings.json")).unwrap();
         serde_json::from_str(&s).unwrap()
     }
 
     fn read_models(dir: &tempfile::TempDir) -> Value {
-        let s = std::fs::read_to_string(
-            dir.path().join(".pi/agent/models.json"),
-        )
-        .unwrap();
+        let s = std::fs::read_to_string(dir.path().join(".pi/agent/models.json")).unwrap();
         serde_json::from_str(&s).unwrap()
     }
 

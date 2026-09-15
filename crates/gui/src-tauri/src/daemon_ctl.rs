@@ -1,10 +1,10 @@
 use crate::dto::ProxyStatus;
-use xfade_core::daemon::{self, DaemonConfig};
-use xfade_core::proxy::status::StatusDto;
 use reqwest::Client;
 use std::path::Path;
 use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
+use xfade_core::daemon::{self, DaemonConfig};
+use xfade_core::proxy::status::StatusDto;
 
 fn stopped() -> ProxyStatus {
     ProxyStatus {
@@ -127,10 +127,10 @@ pub async fn stop(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use xfade_core::proxy::ProxyService;
     use xfade_core::store::secrets::MockStore;
     use xfade_core::Core;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn status_queries_running_daemon() {

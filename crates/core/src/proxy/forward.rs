@@ -288,9 +288,28 @@ async fn handle_success(
     svc.record_success(route_id);
 
     if streaming {
-        handle_success_streaming(svc, route_id, resp, endpoint, model, start, convert_path, req_model)
+        handle_success_streaming(
+            svc,
+            route_id,
+            resp,
+            endpoint,
+            model,
+            start,
+            convert_path,
+            req_model,
+        )
     } else {
-        handle_success_non_streaming(svc, route_id, resp, endpoint, model, start, convert_path, req_model).await
+        handle_success_non_streaming(
+            svc,
+            route_id,
+            resp,
+            endpoint,
+            model,
+            start,
+            convert_path,
+            req_model,
+        )
+        .await
     }
 }
 
@@ -371,7 +390,16 @@ async fn handle_success_non_streaming(
         Ok(b) => b,
         Err(e) => {
             let duration_ms = start.elapsed().as_millis() as i64;
-            log_request(svc, endpoint, &model, route_id, 0, Usage::default(), duration_ms, Some(format!("read body: {e}")));
+            log_request(
+                svc,
+                endpoint,
+                &model,
+                route_id,
+                0,
+                Usage::default(),
+                duration_ms,
+                Some(format!("read body: {e}")),
+            );
             svc.record_failure(route_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -386,7 +414,16 @@ async fn handle_success_non_streaming(
         match super::convert::response_openai_to_anthropic(&bytes, &req_model) {
             Ok(anthropic_bytes) => {
                 let usage = Usage::from_json(&anthropic_bytes);
-                log_request(svc, endpoint, &model, route_id, status.as_u16() as i64, usage, duration_ms, None);
+                log_request(
+                    svc,
+                    endpoint,
+                    &model,
+                    route_id,
+                    status.as_u16() as i64,
+                    usage,
+                    duration_ms,
+                    None,
+                );
                 return Response::builder()
                     .status(status)
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -394,7 +431,16 @@ async fn handle_success_non_streaming(
                     .unwrap();
             }
             Err(e) => {
-                log_request(svc, endpoint, &model, route_id, status.as_u16() as i64, Usage::default(), duration_ms, Some(format!("convert response: {e}")));
+                log_request(
+                    svc,
+                    endpoint,
+                    &model,
+                    route_id,
+                    status.as_u16() as i64,
+                    Usage::default(),
+                    duration_ms,
+                    Some(format!("convert response: {e}")),
+                );
                 return Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .body(format!("convert response: {e}").into())
@@ -404,7 +450,16 @@ async fn handle_success_non_streaming(
     }
 
     let usage = Usage::from_json(&bytes);
-    log_request(svc, endpoint, &model, route_id, status.as_u16() as i64, usage, duration_ms, None);
+    log_request(
+        svc,
+        endpoint,
+        &model,
+        route_id,
+        status.as_u16() as i64,
+        usage,
+        duration_ms,
+        None,
+    );
     Response::builder()
         .status(status)
         .body(Body::from(bytes))
@@ -428,7 +483,16 @@ async fn handle_upstream_error(
         let bytes = resp.bytes().await.unwrap_or_default();
         let duration_ms = start.elapsed().as_millis() as i64;
         let usage = Usage::from_json(&bytes);
-        log_request(svc, endpoint, model, route_id, status.as_u16() as i64, usage, duration_ms, None);
+        log_request(
+            svc,
+            endpoint,
+            model,
+            route_id,
+            status.as_u16() as i64,
+            usage,
+            duration_ms,
+            None,
+        );
         svc.record_failure(route_id);
         // Signal caller to continue failover via the error variant.
         return Response::builder()
@@ -441,7 +505,16 @@ async fn handle_upstream_error(
     let bytes = resp.bytes().await.unwrap_or_default();
     let duration_ms = start.elapsed().as_millis() as i64;
     let usage = Usage::from_json(&bytes);
-    log_request(svc, endpoint, model, route_id, status.as_u16() as i64, usage, duration_ms, None);
+    log_request(
+        svc,
+        endpoint,
+        model,
+        route_id,
+        status.as_u16() as i64,
+        usage,
+        duration_ms,
+        None,
+    );
     Response::builder()
         .status(status)
         .body(Body::from(bytes))
@@ -495,14 +568,35 @@ async fn failover_loop(
         };
         let upstream_endpoint = if convert_path { "chat" } else { endpoint };
 
-        match try_forward(&svc.client, method, &base_url, upstream_endpoint, headers, out_body, auth_key.as_deref()).await {
+        match try_forward(
+            &svc.client,
+            method,
+            &base_url,
+            upstream_endpoint,
+            headers,
+            out_body,
+            auth_key.as_deref(),
+        )
+        .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() || status.is_redirection() {
-                    return handle_success(svc, route_id, resp, endpoint, model, start, convert_path, req_model.to_string()).await;
+                    return handle_success(
+                        svc,
+                        route_id,
+                        resp,
+                        endpoint,
+                        model,
+                        start,
+                        convert_path,
+                        req_model.to_string(),
+                    )
+                    .await;
                 }
                 if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    let _resp = handle_upstream_error(svc, route_id, resp, endpoint, &model, start).await;
+                    let _resp =
+                        handle_upstream_error(svc, route_id, resp, endpoint, &model, start).await;
                     last_err = Some((status, String::new()));
                     continue;
                 }
@@ -511,7 +605,16 @@ async fn failover_loop(
             }
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
-                log_request(svc, endpoint, &model, route_id, 0, Usage::default(), duration_ms, Some(e.clone()));
+                log_request(
+                    svc,
+                    endpoint,
+                    &model,
+                    route_id,
+                    0,
+                    Usage::default(),
+                    duration_ms,
+                    Some(e.clone()),
+                );
                 svc.record_failure(route_id);
                 last_err = Some((StatusCode::BAD_GATEWAY, e));
                 continue;
@@ -520,7 +623,10 @@ async fn failover_loop(
     }
 
     match last_err {
-        Some((status, text)) => Response::builder().status(status).body(text.into()).unwrap(),
+        Some((status, text)) => Response::builder()
+            .status(status)
+            .body(text.into())
+            .unwrap(),
         None => Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body("no usable provider".into())
@@ -608,17 +714,14 @@ fn is_empty_choices_line(line: &[u8]) -> bool {
 /// frame that breaks streaming clients (litellm "Empty response", Pi "finish_reason").
 /// Non-OpenAI SSE (Anthropic events) passes through untouched, since its `data:`
 /// payloads never carry an empty `choices` array.
-fn filter_empty_choices<S>(
-    upstream: S,
-) -> impl futures::Stream<Item = std::io::Result<Bytes>>
+fn filter_empty_choices<S>(upstream: S) -> impl futures::Stream<Item = std::io::Result<Bytes>>
 where
     S: futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
     use std::collections::VecDeque;
 
     struct State {
-        upstream:
-            std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+        upstream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
         pending: Vec<u8>,
         out: VecDeque<Bytes>,
         finished: bool,
@@ -955,7 +1058,9 @@ mod tests {
 
     #[test]
     fn is_empty_choices_line_matches_empty_array() {
-        assert!(is_empty_choices_line(b"data: {\"choices\":[],\"usage\":{}}\n"));
+        assert!(is_empty_choices_line(
+            b"data: {\"choices\":[],\"usage\":{}}\n"
+        ));
         assert!(is_empty_choices_line(b"data: {\"choices\": []}\n"));
     }
 
@@ -968,7 +1073,9 @@ mod tests {
         // [DONE]
         assert!(!is_empty_choices_line(b"data: [DONE]\n"));
         // Anthropic SSE frame (no choices field)
-        assert!(!is_empty_choices_line(b"data: {\"type\":\"message_delta\"}\n"));
+        assert!(!is_empty_choices_line(
+            b"data: {\"type\":\"message_delta\"}\n"
+        ));
         // event:/empty lines
         assert!(!is_empty_choices_line(b"event: message_start\n"));
         assert!(!is_empty_choices_line(b"\n"));

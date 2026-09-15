@@ -280,7 +280,10 @@ fn proxy_use_status_clear() {
         .args(["proxy", "use", "nope"])
         .assert()
         .failure();
-    xfade(home.path()).args(["proxy", "clear"]).assert().success();
+    xfade(home.path())
+        .args(["proxy", "clear"])
+        .assert()
+        .success();
 }
 
 #[test]
