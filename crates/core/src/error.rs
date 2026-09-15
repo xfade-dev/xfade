@@ -11,6 +11,9 @@ pub enum CoreError {
     #[error("provider not found: {0}")]
     ProviderNotFound(String),
 
+    #[error("missing API key: {0}")]
+    MissingApiKey(String),
+
     #[error("cannot remove active provider: {0}")]
     ActiveProviderRemoval(String),
 
@@ -26,8 +29,11 @@ pub enum CoreError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("toml error: {0}")]
-    Toml(String),
+    #[error("toml deserialize error: {0}")]
+    TomlDeserialize(#[from] toml::de::Error),
+
+    #[error("toml serialize error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
 
     #[error("proxy error: {0}")]
     Proxy(String),

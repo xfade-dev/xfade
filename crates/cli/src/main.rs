@@ -1,19 +1,17 @@
-use agent_switch_core::proxy::ProxyService;
-use agent_switch_core::store::db::StatsGroupBy;
-use agent_switch_core::store::secrets::{FileMockStore, KeyringStore, SecretStore};
-use agent_switch_core::{presets::presets_for, Core, CoreError, Provider, ToolKind};
+use xfade_core::proxy::ProxyService;
+use xfade_core::store::db::StatsGroupBy;
+use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 mod daemon;
 
 #[derive(Parser)]
 #[command(
-    name = "asw",
+    name = "xfade",
     version,
-    about = "Switch API providers for AI coding tools"
+    about = "Route AI providers for AI coding tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -22,34 +20,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 添加 provider（无 --name 时进入交互模式）
+    /// Add a provider (omit NAME to enter interactive mode)
     Add {
+        /// Provider name, e.g. `xfade add kimi --tool claude ...`
+        name: Option<String>,
         #[arg(long)]
         tool: Option<ToolKind>,
-        #[arg(long)]
-        name: Option<String>,
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long)]
         key: Option<String>,
-        /// 工具特有配置，可重复：--set model=kimi-k2.5
+        /// Tool-specific config, repeatable: --set model=kimi-k2.5
         #[arg(long = "set", value_parser = parse_kv)]
         sets: Vec<(String, String)>,
+        /// Force official login (ignore the global base_url)
+        #[arg(long)]
+        official: bool,
     },
-    /// 列出 providers
+    /// List providers
     Ls {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
-    /// 切换 provider
+    /// Switch provider
     Use {
         name: String,
         #[arg(long)]
         tool: Option<ToolKind>,
     },
-    /// 显示各工具当前生效的 provider
+    /// Show the currently-active provider per tool
     Current,
-    /// 修改 provider
+    /// Edit a provider
     Edit {
         name: String,
         #[arg(long)]
@@ -61,27 +62,32 @@ enum Cmd {
         #[arg(long = "set", value_parser = parse_kv)]
         sets: Vec<(String, String)>,
     },
-    /// 删除 provider（active 不可删）
+    /// Remove a provider (the active one cannot be removed)
     Rm {
         name: String,
         #[arg(long)]
         tool: Option<ToolKind>,
     },
-    /// 列出内置预设
+    /// List built-in presets
     Presets,
-    /// 手动导入工具当前配置为 imported 快照
+    /// View or set global config (e.g. secrets backend)
+    Config {
+        #[command(subcommand)]
+        cmd: Option<ConfigCmd>,
+    },
+    /// Manually import the tool's current config as the imported snapshot
     Import {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
-    /// 备份管理
+    /// Backup management
     Backup {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
-    /// 生成 shell 补全
+    /// Generate shell completions
     Completion { shell: Shell },
-    /// 启动本地代理服务（OpenAI/Anthropic 兼容端点）/ daemon 管理
+    /// Start the local proxy service (OpenAI/Anthropic-compatible endpoints) / manage the daemon
     Serve {
         #[arg(long, default_value = "24860")]
         port: u16,
@@ -92,12 +98,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
     },
-    /// 代理路由管理（主/备 provider 顺序）
+    /// Proxy route management (primary/fallback provider order)
     Proxy {
         #[command(subcommand)]
         cmd: ProxyCmd,
     },
-    /// 请求统计聚合
+    /// Request stats aggregation
     Stats {
         #[arg(long, default_value = "7d")]
         since: String,
@@ -107,26 +113,35 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    /// Set a config value, e.g. `xfade config set secrets file`
+    Set {
+        key: String,
+        value: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProxyCmd {
-    /// 设置代理路由（主 → 备，按参数顺序）
+    /// Set proxy routes (primary → fallback, in argument order)
     Use {
         names: Vec<String>,
-        /// 覆盖上游 model 字段（不填则透传客户端请求的 model）
+        /// Override the upstream model field (passthrough the client's model when omitted)
         #[arg(long)]
         model: Option<String>,
-        /// 目标协议：chat（OpenAI 兼容）或 messages（Anthropic 原生透传）
+        /// Target protocol: chat (OpenAI-compatible) or messages (Anthropic native passthrough)
         #[arg(long, value_parser = ["chat", "messages"], default_value = "chat")]
         target: String,
     },
-    /// 查看当前路由
+    /// View current routes
     Status,
-    /// 清空路由
+    /// Clear routes
     Clear,
 }
 
 #[derive(Subcommand)]
 enum ServeCmd {
-    /// 安装为 launchd 常驻 daemon（macOS，开机自启 + 崩溃重启）
+    /// Install as a launchd resident daemon (macOS, autostart on boot + restart on crash)
     Install {
         #[arg(long, default_value = "24860")]
         port: u16,
@@ -135,11 +150,11 @@ enum ServeCmd {
         #[arg(long)]
         auth_token: Option<String>,
     },
-    /// 卸载 daemon
+    /// Uninstall the daemon
     Uninstall,
-    /// 停止 daemon（uninstall 别名）
+    /// Stop the daemon (alias of uninstall)
     Stop,
-    /// 查询 daemon 状态
+    /// Query daemon status
     Status,
 }
 
@@ -162,7 +177,7 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("expected key=value, got {s}"))
 }
 
-/// --set 值：能解析为 JSON 就用 JSON（支持对象/数组/数字/布尔），否则按字符串
+/// --set value: use JSON when it parses (objects/arrays/numbers/booleans), otherwise treat as a string
 fn parse_set_value(s: &str) -> serde_json::Value {
     serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
 }
@@ -175,24 +190,16 @@ fn main() {
     }
 }
 
-/// 环境契约（与 tests/cli.rs 的 asw() 辅助函数严格一致）：
-/// - `HOME`：工具配置根。测试注入 tempdir；真实环境即用户主目录。
-/// - `ASW_DATA_DIR`：自身数据目录（db/backups），缺省 `$HOME/.config/agent-switch`。
-/// - `ASW_MOCK_SECRETS=1`：用文件 MockStore（ASW_DATA_DIR/mock-secrets.json）替代系统钥匙串（仅测试/冒烟）。
 fn build_core() -> Result<Core, CoreError> {
-    let use_mock = std::env::var("ASW_MOCK_SECRETS").ok().as_deref() == Some("1");
-    if let Ok(home) = std::env::var("HOME") {
-        let data = std::env::var_os("ASW_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".config").join("agent-switch"));
-        let secrets: Arc<dyn SecretStore> = if use_mock {
-            Arc::new(FileMockStore::new(data.join("mock-secrets.json")))
-        } else {
-            Arc::new(KeyringStore::new())
-        };
-        return Core::with_paths(std::path::Path::new(&home), &data, secrets);
-    }
-    Core::for_current_user() // 无 HOME 的极端环境（如部分 Windows 服务）兜底
+    Core::from_env()
+}
+
+/// Resolve the self data dir (`XFADE_DATA_DIR`, defaulting to `~/.config/xfade`).
+fn data_dir() -> Result<PathBuf, CoreError> {
+    let home = std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
+    Ok(std::env::var_os("XFADE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(&home).join(".config").join("xfade")))
 }
 
 fn run(cli: Cli) -> Result<(), CoreError> {
@@ -203,7 +210,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             base_url,
             key,
             sets,
-        } => cmd_add(tool, name, base_url, key, sets),
+            official,
+        } => cmd_add(tool, name, base_url, key, sets, official),
         Cmd::Ls { tool } => {
             let core = build_core()?;
             let list = core.list(tool)?;
@@ -213,28 +221,36 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Use { name, tool } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
-            // 特例：provider 不存在但匹配预设 → 自动从预设创建。
-            // 对 local-proxy 尤其有用（key 任意值，代理会替换）；
-            // 其他预设（kimi/glm 等）也自动创建，但 key 用占位，用户需后续 `asw edit <name> --key`。
+            // Special case: provider doesn't exist but matches a preset → auto-create from the preset.
+            // - official: no key needed.
+            // - local-proxy: key is arbitrary (the proxy replaces it with the routed provider's key).
+            // - other third-party presets (kimi/glm/...): they need a real API key, so refuse to
+            //   auto-create with a bogus placeholder — writing a placeholder into the tool config
+            //   (e.g. ANTHROPIC_AUTH_TOKEN) breaks the tool's auth immediately.
             let exists = core.list(Some(tool))?.iter().any(|p| p.id == name);
             if !exists {
                 if let Some(preset) = presets_for(tool).into_iter().find(|p| p.id == name) {
-                    let mut p = Provider::new(&name, tool, preset.base_url.map(String::from));
-                    p.extra = preset.extra;
-                    let key = if p.is_official() {
-                        None
-                    } else {
-                        Some("placeholder: run `asw edit <name> --key <sk-...>`".to_string())
-                    };
-                    core.add_provider(p, key.as_deref())?;
-                    println!(
-                        "auto-created {tool}/{name} from preset{}",
-                        if name == "local-proxy" {
-                            " (key is arbitrary, proxy will replace it)"
+                    let is_local_proxy = name == "local-proxy";
+                    if preset.is_official() || is_local_proxy {
+                        let mut p = Provider::new(&name, tool, preset.base_url);
+                        p.extra = preset.extra;
+                        let key = if is_local_proxy {
+                            Some("xfade-local-proxy".to_string())
                         } else {
-                            ""
-                        }
-                    );
+                            None
+                        };
+                        core.add_provider(p, key.as_deref())?;
+                        println!("auto-created {tool}/{name} from preset");
+                    } else {
+                        return Err(CoreError::MissingApiKey(format!(
+                            "'{name}' is a third-party preset and needs an API key.\n\
+                             First add it with a key:\n\
+                             \x20 xfade add {name} --tool {tool} --base-url {} --key <sk-...>\n\
+                             Then switch:\n\
+                             \x20 xfade use {name} --tool {tool}",
+                            preset.base_url.as_deref().unwrap_or("")
+                        )));
+                    }
                 }
             }
             core.use_provider(tool, &name)?;
@@ -270,12 +286,70 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         "  {:<12} {:<20} {}",
                         p.id,
                         p.label,
-                        p.base_url.unwrap_or("(官方)")
+                        p.base_url.unwrap_or_else(|| "(official)".to_string())
                     );
                 }
             }
             Ok(())
         }
+        Cmd::Config { cmd } => match cmd {
+            None => {
+                let dir = data_dir()?;
+                let cfg = Config::load(&dir);
+                println!("secrets: {}", cfg.secrets);
+                println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
+                println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
+                println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
+                let api_key = build_core()?.global_api_key();
+                match api_key {
+                    Some(k) => println!("api_key: {}...", &k[..k.len().min(8)]),
+                    None => println!("api_key: (unset)"),
+                }
+                Ok(())
+            }
+            Some(ConfigCmd::Set { key, value }) => {
+                match key.as_str() {
+                    "secrets" => {
+                        let dir = data_dir()?;
+                        let mut cfg = Config::load(&dir);
+                        cfg.secrets = value.parse().map_err(|e: String| CoreError::ConfigParse {
+                            path: key.clone(),
+                            msg: e,
+                        })?;
+                        cfg.save(&dir)?;
+                    }
+                    "base_url" => {
+                        let dir = data_dir()?;
+                        let mut cfg = Config::load(&dir);
+                        cfg.base_url = Some(value.clone());
+                        cfg.save(&dir)?;
+                    }
+                    "model" => {
+                        let dir = data_dir()?;
+                        let mut cfg = Config::load(&dir);
+                        cfg.model = Some(value.clone());
+                        cfg.save(&dir)?;
+                    }
+                    "api" => {
+                        let dir = data_dir()?;
+                        let mut cfg = Config::load(&dir);
+                        cfg.api = Some(value.clone());
+                        cfg.save(&dir)?;
+                    }
+                    "api_key" => {
+                        build_core()?.set_global_api_key(&value)?;
+                    }
+                    other => {
+                        return Err(CoreError::ConfigParse {
+                            path: other.to_string(),
+                            msg: "unknown config key (expected: secrets|base_url|model|api|api_key)".into(),
+                        });
+                    }
+                }
+                println!("set {key} = {value}");
+                Ok(())
+            }
+        },
         Cmd::Edit {
             name,
             tool,
@@ -366,8 +440,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
                 daemon::install(std::path::Path::new(&home), &host, port, auth_token, true)?;
                 println!(
-                    "installed daemon (label {}); logs: ~/.config/agent-switch/serve.log",
-                    agent_switch_core::daemon::LABEL
+                    "installed daemon (label {}); logs: ~/.config/xfade/serve.log",
+                    xfade_core::daemon::LABEL
                 );
                 Ok(())
             }
@@ -381,14 +455,14 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             Some(ServeCmd::Status) => {
                 let home =
                     std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
-                let dd = agent_switch_core::daemon::data_dir(std::path::Path::new(&home));
-                match agent_switch_core::daemon::read(&dd) {
+                let dd = xfade_core::daemon::data_dir(std::path::Path::new(&home));
+                match xfade_core::daemon::read(&dd) {
                     None => {
                         println!("daemon: not installed");
                         Ok(())
                     }
                     Some(cfg) => {
-                        let url = format!("http://{}:{}/__asw/status", cfg.host, cfg.port);
+                        let url = format!("http://{}:{}/__xfade/status", cfg.host, cfg.port);
                         let rt = tokio::runtime::Runtime::new()
                             .map_err(|e| CoreError::Proxy(format!("rt: {e}")))?;
                         rt.block_on(async {
@@ -409,7 +483,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                                 }
                                 Ok(r) => println!("daemon: HTTP {}", r.status()),
                                 Err(_) => println!(
-                                    "daemon: not responding (check ~/.config/agent-switch/serve.log)"
+                                    "daemon: not responding (check ~/.config/xfade/serve.log)"
                                 ),
                             }
                         });
@@ -427,7 +501,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 if names.is_empty() {
                     return Err(CoreError::ConfigParse {
                         path: String::new(),
-                        msg: "no provider names given; usage: asw proxy use <name> [<name>...]"
+                        msg: "no provider names given; usage: xfade proxy use <name> [<name>...]"
                             .into(),
                     });
                 }
@@ -437,7 +511,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 for n in &names {
                     if !known.contains(n) {
                         return Err(CoreError::ProviderNotFound(format!(
-                            "{n} (not in any tool; run `asw ls` to list)"
+                            "{n} (not in any tool; run `xfade ls` to list)"
                         )));
                     }
                 }
@@ -476,7 +550,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         println!("target: {target_protocol}");
                     }
                 }
-                println!("note: 熔断状态仅在 serve 进程内可见（CLI 新进程看到的是空 circuits）");
+                println!("note: circuit status is only visible inside the serve process (a fresh CLI process sees empty circuits)");
                 Ok(())
             }
             ProxyCmd::Clear => {
@@ -514,7 +588,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
     }
 }
 
-/// 解析 `<N>d` 为 RFC3339 时间戳前缀（now - N 天）。
+/// Parse `<N>d` into an RFC3339 timestamp prefix (now - N days).
 fn parse_since(s: &str) -> Result<String, CoreError> {
     let s = s.trim();
     let days = if let Some(rest) = s.strip_suffix('d') {
@@ -536,24 +610,28 @@ fn parse_since(s: &str) -> Result<String, CoreError> {
         })
 }
 
-/// 交互判定：只要 --name 已提供就不再进交互。
-/// --name 有 + --base-url 无 => 官方 provider（base_url=None），无需 key；
-/// --name 缺失 => 交互：选预设或自定义。
+/// Interactive-mode decision: skip interactivity once NAME (positional) is provided.
+/// NAME present + --base-url absent => official provider (base_url=None), no key needed;
+/// NAME absent => interactive: choose a preset or custom.
 fn cmd_add(
     tool: Option<ToolKind>,
     name: Option<String>,
     base_url: Option<String>,
     key: Option<String>,
     sets: Vec<(String, String)>,
+    official: bool,
 ) -> Result<(), CoreError> {
     let core = build_core()?;
+    let global = core.config();
+    let global_key = core.global_api_key();
+    let interactive = name.is_none();
 
     let tool = match tool {
         Some(t) => t,
         None => {
             let items: Vec<String> = ToolKind::ALL.iter().map(|t| t.to_string()).collect();
             let idx = dialoguer::Select::new()
-                .with_prompt("选择工具")
+                .with_prompt("Select tool")
                 .items(&items)
                 .interact()
                 .map_err(|e| CoreError::Keyring(e.to_string()))?;
@@ -561,23 +639,23 @@ fn cmd_add(
         }
     };
 
-    let (name, base_url, mut extra) = match name {
+    let (name, mut base_url, mut extra) = match name {
         Some(n) => (n, base_url, serde_json::Value::Null),
         None => {
             let presets = presets_for(tool);
             let labels: Vec<String> = presets
                 .iter()
                 .map(|p| p.label.to_string())
-                .chain(["自定义".into()])
+                .chain(["Custom".into()])
                 .collect();
             let idx = dialoguer::Select::new()
-                .with_prompt("选择供应商")
+                .with_prompt("Select provider")
                 .items(&labels)
                 .interact()
                 .map_err(|e| CoreError::Keyring(e.to_string()))?;
             if idx == presets.len() {
                 let n = dialoguer::Input::<String>::new()
-                    .with_prompt("名称")
+                    .with_prompt("Name")
                     .interact_text()
                     .map_err(|e| CoreError::Keyring(e.to_string()))?;
                 let u = dialoguer::Input::<String>::new()
@@ -589,18 +667,30 @@ fn cmd_add(
                 let p = &presets[idx];
                 (
                     p.id.to_string(),
-                    p.base_url.map(String::from),
+                    p.base_url.clone(),
                     p.extra.clone(),
                 )
             }
         }
     };
 
+    // Non-interactive global defaults: --official wins, then a missing base_url
+    // falls back to the global base_url.
+    if !interactive {
+        if official {
+            base_url = None;
+        } else if base_url.is_none() {
+            base_url = global.base_url.clone();
+        }
+    }
+
     let key = if base_url.is_none() {
         None
     } else {
         Some(match key {
             Some(k) => k,
+            // Non-interactive: fall back to the global API key when --key is omitted.
+            None if !interactive && global_key.is_some() => global_key.clone().unwrap(),
             None => dialoguer::Password::new()
                 .with_prompt("API Key")
                 .interact()
@@ -612,6 +702,18 @@ fn cmd_add(
     for (k, v) in sets {
         map.insert(k, parse_set_value(&v));
     }
+    // Non-interactive: global default model applies when the provider didn't set one.
+    if !interactive && !map.contains_key("model") {
+        if let Some(m) = &global.model {
+            map.insert("model".to_string(), serde_json::Value::String(m.clone()));
+        }
+    }
+    // Non-interactive: global default api type (Pi/OMP) applies when not set.
+    if !interactive && !map.contains_key("api") {
+        if let Some(a) = &global.api {
+            map.insert("api".to_string(), serde_json::Value::String(a.clone()));
+        }
+    }
     if !map.is_empty() {
         extra = serde_json::Value::Object(map);
     }
@@ -622,13 +724,13 @@ fn cmd_add(
     core.add_provider(p, key.as_deref())?;
     println!("added {tool}/{name}");
     if !official {
-        println!("run `asw use {name} --tool {tool}` to switch");
+        println!("run `xfade use {name} --tool {tool}` to switch");
     }
     Ok(())
 }
 
-/// use/rm/edit 缺省 --tool 时：全库查同名 provider；
-/// 唯一 → 用之；多个 → 报错提示加 --tool；零 → ProviderNotFound
+/// When use/rm/edit omit --tool: search the whole DB for a provider with that name;
+/// one match → use it; multiple → error prompting for --tool; zero → ProviderNotFound.
 fn resolve_tool(core: &Core, name: &str, tool: Option<ToolKind>) -> Result<ToolKind, CoreError> {
     if let Some(t) = tool {
         return Ok(t);

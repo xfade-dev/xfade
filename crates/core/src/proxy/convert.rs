@@ -4,7 +4,7 @@
 //! - Request-side conversion (Anthropic → OpenAI), see `request_anthropic_to_openai`.
 //! - Response-side conversion (OpenAI → Anthropic), non-stream + streaming
 //!   state machine, see `response_openai_to_anthropic` and
-//!   `stream_openai_to_anthropic`. See spec §3 响应侧.
+//!   `stream_openai_to_anthropic`. See spec §3 response side.
 
 use crate::error::{CoreError, Result};
 use axum::body::Bytes;
@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 /// Convert an Anthropic `/v1/messages` request body into an OpenAI
 /// `/v1/chat/completions` request body.
 ///
-/// Behavior (see spec §3 请求侧):
+/// Behavior (see spec §3 request side):
 /// - `system` (string or content-block array) → first `{role:"system", content:<joined text>}` message
 /// - `messages[].content` blocks:
 ///   - text → content string (single block) or array part (multi block)
@@ -395,7 +395,7 @@ fn convert_tool_choice(tc: &Value) -> Option<Value> {
 /// Convert an OpenAI non-streaming chat completion response body into an
 /// Anthropic `/v1/messages` non-streaming response body.
 ///
-/// Behavior (see spec §3 响应侧 非流式):
+/// Behavior (see spec §3 response side, non-streaming):
 /// - `choices[0].message.content` → `content[0]` text block (when non-null)
 /// - `choices[0].message.tool_calls[]` → `content[]` tool_use blocks
 ///   (input = arguments JSON parsed; on parse failure use `{}`)
@@ -529,7 +529,7 @@ fn sse_event(event_type: &str, data: &Value) -> Bytes {
 /// `data: <json>\n\n` frame) into a stream of Anthropic messages-API SSE event
 /// frames.
 ///
-/// Implements the state machine described in spec §3 响应侧 流式:
+/// Implements the state machine described in spec §3 response side, streaming:
 /// - first chunk with `delta.role` → `message_start` + open text block
 /// - `delta.content` → `content_block_delta(text_delta)`
 /// - `delta.tool_calls[i]` → close text block if open; open tool_use block;
@@ -986,7 +986,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_use_aggregation() {
-        // tool_calls arguments 分片："{\"pa", `th":"/"}`, 拼成 `{"path":"/"}`
+        // tool_calls arguments fragments: "{\"pa" + `th":"/"}`, joined into `{"path":"/"}`
         let chunks = vec![
             ok_chunk(br#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"ls","arguments":"{\"pa"}}]}}]}"#),
             ok_chunk(br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"/\"}"}}]}}]}"#),
@@ -995,11 +995,11 @@ mod tests {
         let stream = futures::stream::iter(chunks);
         let out_bytes = collect_stream(stream_openai_to_anthropic(stream, "m".into())).await;
         let s = String::from_utf8(out_bytes).unwrap();
-        // 应有 content_block_start tool_use
+        // should have a content_block_start tool_use
         assert!(s.contains(r#""type":"tool_use""#));
         assert!(s.contains(r#""id":"t1""#));
         assert!(s.contains(r#""name":"ls""#));
-        // 聚合后完整 JSON 一次发出
+        // aggregated full JSON emitted in one shot
         assert!(s.contains(r#""input_json_delta""#));
         assert!(s.contains(r#""partial_json":"{\"path\":\"/\"}""#));
         assert!(s.contains("content_block_stop"));

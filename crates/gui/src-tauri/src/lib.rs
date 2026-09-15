@@ -4,32 +4,12 @@ mod dto;
 mod state;
 mod tray;
 
-use agent_switch_core::store::secrets::{FileMockStore, KeyringStore, SecretStore};
-use agent_switch_core::Core;
+use xfade_core::Core;
 use state::AppState;
-use std::sync::Arc;
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_autostart::MacosLauncher;
 
-/// 环境契约（与 CLI 一致）：
-/// - `HOME`：工具配置根。
-/// - `ASW_DATA_DIR`：自身数据目录（db/backups），缺省 `$HOME/.config/agent-switch`。
-/// - `ASW_MOCK_SECRETS=1`：用文件 MockStore 替代系统钥匙串（仅测试/冒烟）。
 fn build_core() -> Result<Core, String> {
-    let use_mock = std::env::var("ASW_MOCK_SECRETS").ok().as_deref() == Some("1");
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let data = std::env::var_os("ASW_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(&home)
-                .join(".config")
-                .join("agent-switch")
-        });
-    let secrets: Arc<dyn SecretStore> = if use_mock {
-        Arc::new(FileMockStore::new(data.join("mock-secrets.json")))
-    } else {
-        Arc::new(KeyringStore::new())
-    };
-    Core::with_paths(std::path::Path::new(&home), &data, secrets).map_err(|e| e.to_string())
+    Core::from_env().map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -53,6 +33,8 @@ pub fn run() {
             commands::import_provider,
             commands::list_backups,
             commands::restore_backup,
+            commands::get_config,
+            commands::set_config,
             commands::proxy_start,
             commands::proxy_stop,
             commands::proxy_status,
@@ -77,8 +59,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            // 开机自启（launchd login item）
-            let _ = app.autolaunch().enable();
+            // Autostart is user-controlled via the tray's "Launch at login" checkbox;
+            // it is NOT force-enabled here.
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -8,16 +8,29 @@ pub enum ToolKind {
     ClaudeCode,
     Codex,
     OpenCode,
+    Pi,
+    OhMyPi,
+    Aider,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 3] = [ToolKind::ClaudeCode, ToolKind::Codex, ToolKind::OpenCode];
+    pub const ALL: [ToolKind; 6] = [
+        ToolKind::ClaudeCode,
+        ToolKind::Codex,
+        ToolKind::OpenCode,
+        ToolKind::Pi,
+        ToolKind::OhMyPi,
+        ToolKind::Aider,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             ToolKind::ClaudeCode => "claude",
             ToolKind::Codex => "codex",
             ToolKind::OpenCode => "opencode",
+            ToolKind::Pi => "pi",
+            ToolKind::OhMyPi => "omp",
+            ToolKind::Aider => "aider",
         }
     }
 }
@@ -35,8 +48,11 @@ impl FromStr for ToolKind {
             "claude" | "claude-code" => Ok(ToolKind::ClaudeCode),
             "codex" => Ok(ToolKind::Codex),
             "opencode" => Ok(ToolKind::OpenCode),
+            "pi" => Ok(ToolKind::Pi),
+            "omp" | "oh-my-pi" | "ohmy" => Ok(ToolKind::OhMyPi),
+            "aider" => Ok(ToolKind::Aider),
             _ => Err(format!(
-                "unknown tool: {s} (expected claude|codex|opencode)"
+                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider)"
             )),
         }
     }
@@ -58,7 +74,7 @@ impl Provider {
     pub fn new(id: impl Into<String>, tool: ToolKind, base_url: Option<String>) -> Self {
         let id = id.into();
         Self {
-            key_ref: format!("agent-switch/{}/{}", tool.as_str(), id),
+            key_ref: format!("xfade/{}/{}", tool.as_str(), id),
             id,
             tool,
             base_url,
@@ -67,7 +83,7 @@ impl Provider {
         }
     }
 
-    /// base_url 为 None 表示官方登录（清除第三方配置）
+    /// `base_url == None` means official login (clears third-party config).
     pub fn is_official(&self) -> bool {
         self.base_url.is_none()
     }
@@ -88,7 +104,7 @@ mod tests {
     #[test]
     fn provider_key_ref_scoped_by_tool_and_id() {
         let p = Provider::new("kimi", ToolKind::Codex, Some("https://x".into()));
-        assert_eq!(p.key_ref, "agent-switch/codex/kimi");
+        assert_eq!(p.key_ref, "xfade/codex/kimi");
         assert!(!p.is_active);
         assert!(p.extra.is_null());
     }

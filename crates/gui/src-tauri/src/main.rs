@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    asw_gui_lib::run();
+    xfade_gui_lib::run();
 }

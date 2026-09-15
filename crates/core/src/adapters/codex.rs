@@ -70,16 +70,19 @@ impl ToolAdapter for CodexAdapter {
             root.remove("model_provider");
         } else {
             let id = &provider.id;
-            let url = provider.base_url.as_deref().unwrap();
+            let url = provider.base_url.as_deref().ok_or_else(|| CoreError::ConfigParse {
+                path: "provider".into(),
+                msg: format!("third-party provider '{id}' is missing base_url"),
+            })?;
             let wire_api = provider
                 .extra
                 .get("wire_api")
                 .and_then(|v| v.as_str())
-                .unwrap_or("responses"); // 新版 Codex 已废弃 wire_api = "chat"
+                .unwrap_or("responses"); // newer Codex has deprecated wire_api = "chat"
 
-            // 注意：不写 env_key。Codex 对配了 env_key 的 provider 强制从该环境变量
-            // 读 key（完全忽略 auth.json）；省略 env_key 才会回退到 auth.json 的
-            // OPENAI_API_KEY——与本工具的 keyring → auth.json 流程一致。
+            // Note: don't write env_key. Codex forces a provider with env_key to read the key
+            // from that env var (ignoring auth.json entirely); omitting env_key falls back to
+            // auth.json's OPENAI_API_KEY — consistent with this tool's keyring → auth.json flow.
             let mut prov = toml::map::Map::new();
             prov.insert("name".into(), toml::Value::String(id.clone()));
             prov.insert("base_url".into(), toml::Value::String(url.to_string()));
@@ -102,7 +105,7 @@ impl ToolAdapter for CodexAdapter {
                 auth = json!({});
             }
             let obj = auth.as_object_mut().unwrap();
-            // F2: 移除官方 OAuth tokens（会劫持 Authorization），切回 apikey 认证
+            // Remove official OAuth tokens (which hijack Authorization), switching back to apikey auth.
             if obj.remove("tokens").is_some() {
                 obj.insert("preferred_auth_method".into(), json!("apikey"));
             }
@@ -116,14 +119,14 @@ impl ToolAdapter for CodexAdapter {
         atomic_write(
             &self.config_path(),
             toml::to_string_pretty(&cfg)
-                .map_err(|e| CoreError::Toml(e.to_string()))?
+                .map_err(CoreError::from)?
                 .as_bytes(),
         )?;
-        // F1: 扫描全文件残留的废弃 wire_api="chat"，新版 Codex 全文件校验会拒绝启动
+        // Scan the whole file for leftover deprecated wire_api="chat", which newer Codex's full-file validation rejects at startup.
         for pid in find_legacy_wire_api(&cfg) {
             eprintln!(
-                "[asw] 警告: config.toml 中 model_providers.{pid} 仍使用废弃的 wire_api=\"chat\"，\
-                 新版 Codex 将拒绝启动，请改为 \"responses\""
+                "[xfade] warning: model_providers.{pid} in config.toml still uses deprecated wire_api=\"chat\";\
+                 newer Codex will refuse to start, please change it to \"responses\""
             );
         }
         Ok(())
@@ -144,7 +147,7 @@ impl ToolAdapter for CodexAdapter {
             .and_then(|p| p.get("wire_api"))
             .and_then(|v| v.as_str())
         {
-            // 上游已废弃 chat：导入时规范化，避免快照复活不可加载的配置
+            // upstream deprecated chat: normalize on import so the snapshot doesn't revive an unloadable config
             let w = if w == "chat" { "responses" } else { w };
             p.extra = json!({ "wire_api": w });
         }
@@ -157,8 +160,8 @@ impl ToolAdapter for CodexAdapter {
     }
 }
 
-/// 扫描 config 中 `model_providers.*.wire_api == "chat"` 的 provider id（废弃值）。
-/// 新版 Codex 对全文件校验，任何节含 chat 即拒绝启动。
+/// Scan the config for provider ids whose `model_providers.*.wire_api == "chat"` (deprecated value).
+/// Newer Codex validates the whole file and refuses to start if any section contains chat.
 fn find_legacy_wire_api(cfg: &toml::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(provs) = cfg.get("model_providers").and_then(|v| v.as_table()) {
@@ -205,7 +208,7 @@ mod tests {
             "https://api.moonshot.cn/v1"
         );
         assert_eq!(prov["wire_api"].as_str().unwrap(), "responses");
-        assert!(prov.get("env_key").is_none()); // 不写 env_key，走 auth.json
+        assert!(prov.get("env_key").is_none()); // don't write env_key; go through auth.json
 
         let auth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),
@@ -292,7 +295,7 @@ mod tests {
     fn wire_api_from_extra() {
         let (dir, ad) = setup();
         let mut p = Provider::new("oa", ToolKind::Codex, Some("https://x".into()));
-        p.extra = json!({"wire_api": "chat"}); // 验证 extra 能覆盖默认值
+        p.extra = json!({"wire_api": "chat"}); // verify extra can override the default
         ad.apply(&p, Some("k")).unwrap();
         let cfg = read_config(&dir);
         assert_eq!(

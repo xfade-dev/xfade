@@ -1,7 +1,6 @@
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::{Circuit, ProxyService};
 
@@ -12,17 +11,18 @@ pub struct CircuitDto {
     pub cooldown_remaining_secs: Option<u64>,
 }
 
-/// `Circuit` → `CircuitDto`：把 `cooldown_until: Instant` 换算为剩余冷却秒数。
-/// core 与 GUI 共用，避免重复实现。
+/// `Circuit` → `CircuitDto`: convert `cooldown_until_secs` into remaining cooldown seconds.
+/// Shared by core and GUI to avoid duplicating the logic.
 pub fn circuit_to_dto(provider_id: &str, c: &Circuit) -> CircuitDto {
-    let cooldown_remaining_secs = c.cooldown_until.and_then(|t| {
-        let now = Instant::now();
-        if t > now {
-            Some(t.saturating_duration_since(now).as_secs())
-        } else {
-            None
-        }
-    });
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let cooldown_remaining_secs = if c.cooldown_until_secs > 0 && now_secs < c.cooldown_until_secs {
+        Some((c.cooldown_until_secs - now_secs) as u64)
+    } else {
+        None
+    };
     CircuitDto {
         provider_id: provider_id.to_string(),
         fails: c.fails,
@@ -42,8 +42,8 @@ pub struct StatusDto {
     pub circuits: Vec<CircuitDto>,
 }
 
-/// `GET /__asw/status`：返回代理运行状态、路由配置与各 provider 熔断状态。
-/// 经 auth_guard 校验（若设置了 auth_token）。
+/// `GET /__xfade/status`: return the proxy run state, route config, and per-provider circuit status.
+/// Checked by auth_guard (if an auth_token is set).
 pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
     let (routes, model_override, target_protocol) = svc
         .core

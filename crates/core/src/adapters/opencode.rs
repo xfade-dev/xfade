@@ -95,6 +95,13 @@ impl ToolAdapter for OpenCodeAdapter {
             }
         } else {
             let id = &provider.id;
+            let base_url = provider
+                .base_url
+                .as_deref()
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: "provider".into(),
+                    msg: format!("third-party provider '{id}' is missing base_url"),
+                })?;
             let models = provider
                 .extra
                 .get("models")
@@ -105,7 +112,7 @@ impl ToolAdapter for OpenCodeAdapter {
                 json!({
                     "npm": OPENAI_COMPAT,
                     "name": id,
-                    "options": { "baseURL": provider.base_url.as_deref().unwrap() },
+                    "options": { "baseURL": base_url },
                     "models": models,
                 }),
             );

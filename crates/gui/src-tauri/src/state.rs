@@ -1,4 +1,4 @@
-use agent_switch_core::Core;
+use xfade_core::Core;
 
 pub struct AppState {
     pub core: Core,

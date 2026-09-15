@@ -1,6 +1,6 @@
 use crate::dto::ProxyStatus;
-use agent_switch_core::daemon::{self, DaemonConfig};
-use agent_switch_core::proxy::status::StatusDto;
+use xfade_core::daemon::{self, DaemonConfig};
+use xfade_core::proxy::status::StatusDto;
 use reqwest::Client;
 use std::path::Path;
 use tauri::AppHandle;
@@ -16,15 +16,15 @@ fn stopped() -> ProxyStatus {
     }
 }
 
-/// 读 daemon.json 配置；未安装返回 None。
+/// Read the daemon.json config; returns None if not installed.
 pub fn config() -> Option<DaemonConfig> {
     let home = std::env::var("HOME").ok()?;
     daemon::read(&daemon::data_dir(Path::new(&home)))
 }
 
-/// 查询 /__asw/status。连不上或鉴权失败返回 stopped。
+/// Query /__xfade/status. Returns stopped on connection/auth failure.
 pub async fn status(host: &str, port: u16, auth_token: Option<&str>) -> ProxyStatus {
-    let url = format!("http://{host}:{port}/__asw/status");
+    let url = format!("http://{host}:{port}/__xfade/status");
     let client = Client::new();
     let mut req = client.get(&url);
     if let Some(t) = auth_token {
@@ -45,7 +45,7 @@ pub async fn status(host: &str, port: u16, auth_token: Option<&str>) -> ProxySta
     }
 }
 
-/// 按 daemon.json 配置查询状态；未安装返回 stopped。
+/// Query status per the daemon.json config; returns stopped if not installed.
 pub async fn status_from_config() -> ProxyStatus {
     match config() {
         Some(cfg) => status(&cfg.host, cfg.port, cfg.auth_token.as_deref()).await,
@@ -53,7 +53,7 @@ pub async fn status_from_config() -> ProxyStatus {
     }
 }
 
-/// `asw serve install` 的参数（host/port/auth_token）。
+/// Args for `xfade serve install` (host/port/auth_token).
 pub fn install_args(host: &str, port: u16, auth_token: Option<String>) -> Vec<String> {
     let mut v = vec![
         "serve".into(),
@@ -70,14 +70,14 @@ pub fn install_args(host: &str, port: u16, auth_token: Option<String>) -> Vec<St
     v
 }
 
-/// `asw serve uninstall` 的参数。
+/// Args for `xfade serve uninstall`.
 pub fn uninstall_args() -> Vec<String> {
     vec!["serve".into(), "uninstall".into()]
 }
 
-/// 启动 daemon：经 sidecar 执行 `asw serve install`（写 plist + launchctl load）。
-/// install 幂等（cli 内部 unload-then-load），可重复调用。sidecar 的 current_exe
-/// 指向 .app 内的 asw，plist 引用正确。
+/// Start the daemon: run `xfade serve install` via the sidecar (writes the plist + launchctl load).
+/// install is idempotent (unload-then-load inside the CLI), so it can be called repeatedly. The
+/// sidecar's current_exe points at the in-app xfade, so the plist reference is correct.
 pub async fn start(
     app: &AppHandle,
     host: String,
@@ -87,7 +87,7 @@ pub async fn start(
     let args = install_args(&host, port, auth_token);
     let status = app
         .shell()
-        .sidecar("asw")
+        .sidecar("xfade")
         .map_err(|e| e.to_string())?
         .args(&args)
         .status()
@@ -97,18 +97,18 @@ pub async fn start(
         Ok(())
     } else {
         Err(format!(
-            "asw serve install failed (exit {:?})",
+            "xfade serve install failed (exit {:?})",
             status.code()
         ))
     }
 }
 
-/// 停止 daemon：经 sidecar 执行 `asw serve uninstall`。
+/// Stop the daemon: run `xfade serve uninstall` via the sidecar.
 pub async fn stop(app: &AppHandle) -> Result<(), String> {
     let args = uninstall_args();
     let status = app
         .shell()
-        .sidecar("asw")
+        .sidecar("xfade")
         .map_err(|e| e.to_string())?
         .args(&args)
         .status()
@@ -118,7 +118,7 @@ pub async fn stop(app: &AppHandle) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "asw serve uninstall failed (exit {:?})",
+            "xfade serve uninstall failed (exit {:?})",
             status.code()
         ))
     }
@@ -127,9 +127,9 @@ pub async fn stop(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_switch_core::proxy::ProxyService;
-    use agent_switch_core::store::secrets::MockStore;
-    use agent_switch_core::Core;
+    use xfade_core::proxy::ProxyService;
+    use xfade_core::store::secrets::MockStore;
+    use xfade_core::Core;
     use std::sync::Arc;
 
     #[tokio::test]

@@ -21,7 +21,7 @@ export default function ProxyPage() {
     fetchStatus();
   }, [fetchStatus]);
 
-  // 运行中时每 2s 轮询（刷新熔断状态）
+  // poll every 2s while running (refresh circuit status)
   useEffect(() => {
     if (!status?.running) return;
     const t = setInterval(fetchStatus, 2000);
@@ -32,7 +32,7 @@ export default function ProxyPage() {
     try {
       const s = await proxyStart(host, port, authToken.trim() || null);
       setStatus(s);
-      setToast({ message: `代理已启动 :${port}`, kind: "success" });
+      setToast({ message: `Proxy started :${port}`, kind: "success" });
     } catch (e) {
       setToast({ message: String(e), kind: "error" });
     }
@@ -42,7 +42,7 @@ export default function ProxyPage() {
     try {
       const s = await proxyStop();
       setStatus(s);
-      setToast({ message: "代理已停止", kind: "success" });
+      setToast({ message: "Proxy stopped", kind: "success" });
     } catch (e) {
       setToast({ message: String(e), kind: "error" });
     }
@@ -53,7 +53,7 @@ export default function ProxyPage() {
   return (
     <div className="space-y-4">
       <div className="border rounded p-4 bg-white">
-        <h2 className="text-lg font-semibold mb-3">本地代理</h2>
+        <h2 className="text-lg font-semibold mb-3">Local proxy</h2>
         <div className="flex items-center gap-3 flex-wrap">
           <div>
             <label className="block text-xs text-gray-500">Host</label>
@@ -75,14 +75,14 @@ export default function ProxyPage() {
             />
           </div>
           <div className="flex-1 min-w-[180px]">
-            <label className="block text-xs text-gray-500">Auth Token（可选）</label>
+            <label className="block text-xs text-gray-500">Auth Token (optional)</label>
             <input
               className="border rounded px-2 py-1 text-sm w-full"
               type="password"
               value={authToken}
               disabled={running}
               onChange={(e) => setAuthToken(e.target.value)}
-              placeholder="（不设置则不校验）"
+              placeholder="(no auth check if unset)"
             />
           </div>
           <div className="self-end">
@@ -91,14 +91,14 @@ export default function ProxyPage() {
                 className="px-4 py-1.5 text-sm rounded bg-red-600 text-white"
                 onClick={stop}
               >
-                停止
+                Stop
               </button>
             ) : (
               <button
                 className="px-4 py-1.5 text-sm rounded bg-emerald-600 text-white"
                 onClick={start}
               >
-                启动
+                Start
               </button>
             )}
           </div>
@@ -110,19 +110,19 @@ export default function ProxyPage() {
             }`}
           />
           {running
-            ? `运行中 ${status?.host}:${status?.port}${status?.auth_enabled ? " (auth)" : ""}`
-            : "已停止"}
+            ? `Running ${status?.host}:${status?.port}${status?.auth_enabled ? " (auth)" : ""}`
+            : "Stopped"}
         </div>
 
         {running && status && status.circuits.length > 0 && (
           <div className="mt-4">
-            <div className="text-xs text-gray-500 mb-1">熔断状态</div>
+            <div className="text-xs text-gray-500 mb-1">Circuit status</div>
             <table className="text-sm">
               <thead className="text-left text-gray-400">
                 <tr>
                   <th className="pr-4 py-1">provider</th>
                   <th className="pr-4 py-1">fails</th>
-                  <th className="pr-4 py-1">冷却剩余(s)</th>
+                  <th className="pr-4 py-1">Cooldown remaining (s)</th>
                 </tr>
               </thead>
               <tbody>

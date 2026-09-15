@@ -4,6 +4,7 @@ import ProvidersPage from "./pages/ProvidersPage";
 import ProxyPage from "./pages/ProxyPage";
 import StatsPage from "./pages/StatsPage";
 import LogsPage from "./pages/LogsPage";
+import SettingsPage from "./pages/SettingsPage";
 
 export default function App() {
   const [page, setPage] = useState<Page>("providers");
@@ -13,6 +14,7 @@ export default function App() {
       {page === "proxy" && <ProxyPage />}
       {page === "stats" && <StatsPage />}
       {page === "logs" && <LogsPage />}
+      {page === "settings" && <SettingsPage />}
     </Layout>
   );
 }

@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AddProviderInput,
+  ConfigDto,
+  ConfigInput,
   PresetDto,
   Provider,
   ProxyStatus,
@@ -41,6 +43,11 @@ export const listBackups = (tool: ToolKind) =>
 
 export const restoreBackup = (tool: ToolKind, path: string) =>
   invoke<void>("restore_backup", { tool, path });
+
+export const getConfig = () => invoke<ConfigDto>("get_config");
+
+export const setConfig = (input: ConfigInput) =>
+  invoke<ConfigDto>("set_config", { input });
 
 export const proxyStart = (host: string, port: number, authToken: string | null) =>
   invoke<ProxyStatus>("proxy_start", { host, port, authToken });

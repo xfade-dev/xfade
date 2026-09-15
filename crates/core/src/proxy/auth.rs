@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use super::ProxyService;
 
-/// auth_token 校验中间件：设置 token 时要求 `Authorization: Bearer <token>`，
-/// 未设置则放行。作用于 /v1/* 与 /__asw/status；/health 不挂此层。
+/// auth_token check middleware: when a token is set, require `Authorization: Bearer <token>`;
+/// otherwise pass through. Applies to /v1/* and /__xfade/status; /health does not mount this layer.
 pub async fn auth_guard(
     State(svc): State<Arc<ProxyService>>,
     req: Request,

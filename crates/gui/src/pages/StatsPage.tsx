@@ -31,7 +31,7 @@ export default function StatsPage() {
   return (
     <div>
       <div className="flex items-center gap-4 mb-4">
-        <h2 className="text-lg font-semibold">统计</h2>
+        <h2 className="text-lg font-semibold">Stats</h2>
         <div className="flex gap-1">
           {RANGES.map((r) => (
             <button
@@ -61,9 +61,9 @@ export default function StatsPage() {
       </div>
 
       {loading ? (
-        <div className="text-gray-400 text-sm">加载中…</div>
+        <div className="text-gray-400 text-sm">Loading…</div>
       ) : rows.length === 0 ? (
-        <div className="text-gray-400 text-sm">该时间段内无请求</div>
+        <div className="text-gray-400 text-sm">No requests in this period</div>
       ) : (
         <table className="w-full text-sm">
           <thead className="text-left text-gray-400 border-b">

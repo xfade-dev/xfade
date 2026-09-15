@@ -1,8 +1,11 @@
-use crate::dto::{AddProviderInput, PresetDto, ProxyStatus, RoutesDto, UpdateProviderInput};
+use crate::dto::{
+    AddProviderInput, ConfigDto, ConfigInput, PresetDto, ProxyStatus, RoutesDto,
+    UpdateProviderInput,
+};
 use crate::state::AppState;
-use agent_switch_core::models::{Provider, ToolKind};
-use agent_switch_core::presets::presets_for;
-use agent_switch_core::store::db::{RequestLog, StatsGroupBy, StatsRow};
+use xfade_core::models::{Provider, ToolKind};
+use xfade_core::presets::presets_for;
+use xfade_core::store::db::{RequestLog, StatsGroupBy, StatsRow};
 use tauri::State;
 
 type CmdResult<T> = Result<T, String>;
@@ -11,7 +14,12 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-// ----- provider 管理 -----
+/// Mask a secret key for display (`sk-123456…`).
+fn mask_key(k: &str) -> String {
+    format!("{}…", &k[..k.len().min(8)])
+}
+
+// ----- provider management -----
 
 #[tauri::command]
 pub async fn list_providers(
@@ -50,7 +58,7 @@ pub async fn update_provider(
             .into_iter()
             .find(|p| p.id == input.id)
             .ok_or_else(|| {
-                agent_switch_core::CoreError::ProviderNotFound(format!(
+                xfade_core::CoreError::ProviderNotFound(format!(
                     "{}/{}",
                     input.tool, input.id
                 ))
@@ -144,7 +152,57 @@ pub async fn restore_backup(
     .map_err(err)
 }
 
-// ----- 代理 / 路由 / 统计 / 日志 -----
+// ----- global config -----
+
+#[tauri::command]
+pub async fn get_config(state: State<'_, AppState>) -> CmdResult<ConfigDto> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = core.config();
+        let api_key = core.global_api_key();
+        ConfigDto {
+            secrets: cfg.secrets.to_string(),
+            base_url: cfg.base_url,
+            model: cfg.model,
+            api: cfg.api,
+            api_key: api_key.as_ref().map(|k| mask_key(k)),
+        }
+    })
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn set_config(state: State<'_, AppState>, input: ConfigInput) -> CmdResult<ConfigDto> {
+    let core = state.core.clone();
+    let res: Result<ConfigDto, xfade_core::CoreError> = tauri::async_runtime::spawn_blocking(
+        move || -> Result<ConfigDto, xfade_core::CoreError> {
+            core.update_config(
+                input.secrets.as_deref(),
+                input.base_url.as_deref(),
+                input.model.as_deref(),
+                input.api.as_deref(),
+            )?;
+            if let Some(k) = input.api_key.as_deref().filter(|k| !k.is_empty()) {
+                core.set_global_api_key(k)?;
+            }
+            let cfg = core.config();
+            let api_key = core.global_api_key();
+            Ok(ConfigDto {
+                secrets: cfg.secrets.to_string(),
+                base_url: cfg.base_url,
+                model: cfg.model,
+                api: cfg.api,
+                api_key: api_key.as_ref().map(|k| mask_key(k)),
+            })
+        },
+    )
+    .await
+    .map_err(err)?;
+    res.map_err(err)
+}
+
+// ----- proxy / routes / stats / logs -----
 
 #[tauri::command]
 pub async fn proxy_start(
@@ -153,7 +211,7 @@ pub async fn proxy_start(
     port: u16,
     auth_token: Option<String>,
 ) -> CmdResult<ProxyStatus> {
-    // 经 sidecar 执行 `asw serve install`（GUI 自装 daemon，无需 CLI 前置安装）。
+    // Run `xfade serve install` via the sidecar (the GUI self-installs the daemon, no CLI pre-install needed).
     crate::daemon_ctl::start(&app, host, port, auth_token).await?;
     for _ in 0..8 {
         let s = crate::daemon_ctl::status_from_config().await;
@@ -243,7 +301,7 @@ pub async fn recent_logs(state: State<'_, AppState>, limit: usize) -> CmdResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_switch_core::models::ToolKind;
+    use xfade_core::models::ToolKind;
 
     #[test]
     fn list_presets_converts() {

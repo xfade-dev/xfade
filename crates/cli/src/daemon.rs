@@ -1,9 +1,9 @@
-use agent_switch_core::daemon::{self, DaemonConfig};
-use agent_switch_core::{CoreError, Result};
+use xfade_core::daemon::{self, DaemonConfig};
+use xfade_core::{CoreError, Result};
 use std::path::Path;
 
-/// 写 launchd plist（ProgramArguments 指向当前 asw 二进制）+ daemon.json；
-/// `load=true` 时 launchctl load（macOS）。`load=false` 仅供测试。
+/// Install the daemon: macOS writes a plist, Linux writes a systemd unit, both write daemon.json.
+/// `load=true` loads immediately; `load=false` is for tests only.
 pub fn install(
     home: &Path,
     host: &str,
@@ -11,57 +11,45 @@ pub fn install(
     auth_token: Option<String>,
     load: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(daemon::launch_agents_dir(home))?;
     let exe = std::env::current_exe()
         .map_err(|e| CoreError::Proxy(format!("current_exe: {e}")))?
         .display()
         .to_string();
-    let mut plist = format!(
-        "<plist version=\"1.0\"><dict>\
-         <key>Label</key><string>{LABEL}</string>\
-         <key>ProgramArguments</key><array>\
-         <string>{exe}</string><string>serve</string>\
-         <string>--host</string><string>{host}</string>\
-         <string>--port</string><string>{port}</string>",
-        LABEL = daemon::LABEL
-    );
-    if let Some(t) = &auth_token {
-        plist.push_str(&format!(
-            "<string>--auth-token</string><string>{t}</string>"
-        ));
-    }
-    let dd = daemon::data_dir(home);
-    std::fs::create_dir_all(&dd)?;
-    let log = dd.join("serve.log").display().to_string();
-    plist.push_str(&format!(
-        "</array>\
-         <key>RunAtLoad</key><true/>\
-         <key>KeepAlive</key><true/>\
-         <key>StandardOutPath</key><string>{log}</string>\
-         <key>StandardErrorPath</key><string>{log}</string>\
-         </dict></plist>"
-    ));
-    std::fs::write(daemon::plist_path(home), plist)?;
     let cfg = DaemonConfig {
         host: host.to_string(),
         port,
         auth_token,
     };
-    daemon::write(&dd, &cfg)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        daemon::write_plist(&exe, &cfg, home)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        daemon::write_systemd_unit(&exe, &cfg)?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        return Err(CoreError::Proxy(
+            "daemon not supported on this platform; use `xfade serve` (foreground) instead".into(),
+        ));
+    }
+
     if load {
-        // 幂等：先 unload 再 load，避免已加载时 launchctl load 报错（GUI 可重复点启动）
         daemon::unload(home)?;
         daemon::load(home)?;
     }
     Ok(())
 }
 
-/// 卸载：launchctl unload（`unload=true`）+ 删 plist + 删 daemon.json。幂等。
+/// Uninstall: unload + remove the plist/systemd unit + remove daemon.json. Idempotent.
 pub fn uninstall(home: &Path, do_unload: bool) -> Result<()> {
     if do_unload {
         daemon::unload(home)?;
     }
     let _ = std::fs::remove_file(daemon::plist_path(home));
+    let _ = std::fs::remove_file(daemon::systemd_unit_path());
     let _ = std::fs::remove_file(daemon::daemon_json_path(&daemon::data_dir(home)));
     Ok(())
 }
@@ -85,7 +73,7 @@ mod tests {
         assert!(plist.exists());
         assert!(cfg.exists());
         let plist_txt = std::fs::read_to_string(&plist).unwrap();
-        assert!(plist_txt.contains("ai.agent-switch.serve"));
+        assert!(plist_txt.contains("ai.xfade.serve"));
         assert!(plist_txt.contains("serve"));
         assert!(plist_txt.contains("24860"));
         assert!(plist_txt.contains("tok"));

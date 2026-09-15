@@ -2,3 +2,10 @@
 **/*.rs.bk
 .DS_Store
 .codebuddy/
+# internal design specs/plans (not published); see docs/design-decisions.md
+docs/superpowers/
+.aider*
+# local agent memory / scratch dirs
+.workbuddy/
+# GUI sidecar build artifact (built by build-sidecar.sh)
+crates/gui/src-tauri/binaries/

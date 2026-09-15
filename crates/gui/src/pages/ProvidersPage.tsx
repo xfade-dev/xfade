@@ -16,6 +16,9 @@ const TOOLS: { key: ToolKind; label: string }[] = [
   { key: "claude-code", label: "Claude Code" },
   { key: "codex", label: "Codex" },
   { key: "open-code", label: "OpenCode" },
+  { key: "pi", label: "Pi" },
+  { key: "oh-my-pi", label: "Oh My Pi" },
+  { key: "aider", label: "Aider" },
 ];
 
 export default function ProvidersPage() {
@@ -41,7 +44,7 @@ export default function ProvidersPage() {
   const switchTo = async (id: string) => {
     try {
       await useProvider(tool, id);
-      setToast({ message: `已切换到 ${id}`, kind: "success" });
+      setToast({ message: `Switched to ${id}`, kind: "success" });
       refresh();
     } catch (e) {
       setToast({ message: String(e), kind: "error" });
@@ -49,7 +52,7 @@ export default function ProvidersPage() {
   };
 
   const del = async (id: string) => {
-    if (!window.confirm(`删除 ${id}？`)) return;
+    if (!window.confirm(`Delete ${id}?`)) return;
     try {
       await removeProvider(tool, id);
       refresh();
@@ -62,7 +65,7 @@ export default function ProvidersPage() {
     try {
       const p = await importProvider(tool);
       setToast({
-        message: p ? `已导入 ${p.id}` : "无可导入配置",
+        message: p ? `Imported ${p.id}` : "No config to import",
         kind: "success",
       });
       refresh();
@@ -111,7 +114,7 @@ export default function ProvidersPage() {
             className="px-3 py-1.5 text-sm rounded border bg-white"
             onClick={doImport}
           >
-            从工具导入
+            Import from tool
           </button>
           <button
             className="px-3 py-1.5 text-sm rounded bg-gray-900 text-white"
@@ -120,23 +123,23 @@ export default function ProvidersPage() {
               setFormOpen(true);
             }}
           >
-            新增
+            Add
           </button>
         </div>
       </div>
 
       {loading ? (
-        <div className="text-gray-400 text-sm">加载中…</div>
+        <div className="text-gray-400 text-sm">Loading…</div>
       ) : list.length === 0 ? (
-        <div className="text-gray-400 text-sm">暂无 provider</div>
+        <div className="text-gray-400 text-sm">No providers</div>
       ) : (
         <table className="w-full text-sm">
           <thead className="text-left text-gray-400 border-b">
             <tr>
               <th className="py-2 pr-2"></th>
-              <th className="py-2 pr-2">名称</th>
+              <th className="py-2 pr-2">Name</th>
               <th className="py-2 pr-2">Base URL</th>
-              <th className="py-2 pr-2 text-right">操作</th>
+              <th className="py-2 pr-2 text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -153,7 +156,7 @@ export default function ProvidersPage() {
                       className="text-xs px-2 py-0.5 rounded border"
                       onClick={() => switchTo(p.id)}
                     >
-                      切换
+                      Switch
                     </button>
                   )}
                   <button
@@ -163,14 +166,14 @@ export default function ProvidersPage() {
                       setFormOpen(true);
                     }}
                   >
-                    编辑
+                    Edit
                   </button>
                   {!p.is_active && (
                     <button
                       className="text-xs px-2 py-0.5 rounded border text-red-600"
                       onClick={() => del(p.id)}
                     >
-                      删除
+                      Delete
                     </button>
                   )}
                 </td>

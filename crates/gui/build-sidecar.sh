@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# 构建 asw 二进制并放到 Tauri sidecar 目录（按 host triple 命名）。
-# 本地 `cargo tauri dev/build` 前运行；release workflow 也有等价步骤。
+# Build the xfade binary and place it in the Tauri sidecar directory (named by host triple).
+# Run before local `cargo tauri dev/build`; the release workflow has an equivalent step.
 set -euo pipefail
 
 TRIPLE=$(rustc -vV | awk '/^host/ {print $2}')
 echo "host triple: $TRIPLE"
 
-cargo build --release -p asw
+cargo build --release -p xfade
 
 mkdir -p crates/gui/src-tauri/binaries
-BIN=target/release/asw
-[ "$(uname)" = "Darwin" ] || [ "$(uname)" = "Linux" ] || BIN=target/release/asw.exe
-cp "$BIN" "crates/gui/src-tauri/binaries/asw-$TRIPLE"
-echo "sidecar -> crates/gui/src-tauri/binaries/asw-$TRIPLE"
+BIN=target/release/xfade
+[ "$(uname)" = "Darwin" ] || [ "$(uname)" = "Linux" ] || BIN=target/release/xfade.exe
+cp "$BIN" "crates/gui/src-tauri/binaries/xfade-$TRIPLE"
+echo "sidecar -> crates/gui/src-tauri/binaries/xfade-$TRIPLE"

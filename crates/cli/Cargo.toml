@@ -1,20 +1,20 @@
 [package]
-name = "asw"
+name = "xfade"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Switch API providers for Claude Code / Codex / OpenCode, with local proxy"
+description = "Route AI providers for Claude Code / Codex / OpenCode, with local proxy"
 keywords.workspace = true
 categories.workspace = true
 
 [[bin]]
-name = "asw"
+name = "xfade"
 path = "src/main.rs"
 
 [dependencies]
-agent-switch-core = { path = "../core" }
+xfade-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
