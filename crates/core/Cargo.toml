@@ -1,11 +1,11 @@
 [package]
-name = "agent-switch-core"
+name = "xfade-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Core library for agent-switch: switch API providers for AI coding tools"
+description = "Core library for xfade: route API providers for AI coding tools"
 keywords.workspace = true
 categories.workspace = true
 
@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 rusqlite = { workspace = true }
 keyring = { workspace = true }
 toml = { workspace = true }
+serde_yaml = { workspace = true }
 dirs = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 axum = { workspace = true }

@@ -74,10 +74,14 @@ impl ToolAdapter for ClaudeCodeAdapter {
             env.remove(ENV_TOKEN);
             env.remove(ENV_MODEL);
         } else {
-            env.insert(
-                ENV_BASE.into(),
-                json!(provider.base_url.as_deref().unwrap()),
-            );
+            let base_url = provider
+                .base_url
+                .as_deref()
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: "provider".into(),
+                    msg: format!("third-party provider '{}' is missing base_url", provider.id),
+                })?;
+            env.insert(ENV_BASE.into(), json!(base_url));
             env.insert(ENV_TOKEN.into(), json!(api_key.unwrap_or_default()));
             match provider.extra.get("model").and_then(|m| m.as_str()) {
                 Some(model) => {

@@ -28,25 +28,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build
-        run: cargo build --release -p asw
+        run: cargo build --release -p xfade
       - name: package
         shell: bash
         run: |
           set -e
           mkdir -p dist
-          BIN=target/release/asw
-          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/asw.exe; fi
+          BIN=target/release/xfade
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/xfade.exe; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "dist/asw-${{ matrix.target }}.zip" "$BIN"
+            7z a "dist/xfade-${{ matrix.target }}.zip" "$BIN"
           else
-            tar czf "dist/asw-${{ matrix.target }}.tar.gz" -C target/release asw
+            tar czf "dist/xfade-${{ matrix.target }}.tar.gz" -C target/release xfade
           fi
-          cd dist && sha256sum asw-* > ../checksums-${{ matrix.target }}.txt && cd ..
+          cd dist && sha256sum xfade-* > ../checksums-${{ matrix.target }}.txt && cd ..
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.target }}
           path: |
-            dist/asw-*
+            dist/xfade-*
             checksums-*.txt
 
   gui:
@@ -64,9 +64,9 @@ jobs:
       - name: build sidecar
         shell: bash
         run: |
-          cargo build --release -p asw
+          cargo build --release -p xfade
           mkdir -p crates/gui/src-tauri/binaries
-          cp target/release/asw crates/gui/src-tauri/binaries/asw-aarch64-apple-darwin
+          cp target/release/xfade crates/gui/src-tauri/binaries/xfade-aarch64-apple-darwin
       - name: install frontend deps
         working-directory: crates/gui
         run: npm ci
@@ -97,13 +97,13 @@ jobs:
           set -e
           mkdir -p release
           find artifacts -name 'checksums-*.txt' -exec cat {} \; > release/SHA256SUMS
-          find artifacts -name 'asw-*' -exec cp {} release/ \;
+          find artifacts -name 'xfade-*' -exec cp {} release/ \;
           find artifacts -name '*.dmg' -exec cp {} release/ \;
           cd release && sha256sum -c SHA256SUMS || true
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            release/asw-*
+            release/xfade-*
             release/*.dmg
             release/SHA256SUMS

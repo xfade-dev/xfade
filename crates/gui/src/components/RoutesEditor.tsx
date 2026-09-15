@@ -42,21 +42,21 @@ export default function RoutesEditor() {
     setMsg(null);
     try {
       await setRoutesApi(routes, modelOverride.trim() || null, targetProtocol);
-      setMsg("已保存（运行中代理立即生效）");
+      setMsg("Saved (takes effect immediately for the running proxy)");
     } catch (e) {
       setMsg(String(e));
     }
   };
 
   const clear = async () => {
-    if (!window.confirm("清空路由？")) return;
+    if (!window.confirm("Clear routes?")) return;
     setMsg(null);
     try {
       await clearRoutes();
       setRoutes([]);
       setModelOverride("");
       setTargetProtocol("chat");
-      setMsg("已清空");
+      setMsg("Cleared");
     } catch (e) {
       setMsg(String(e));
     }
@@ -68,11 +68,11 @@ export default function RoutesEditor() {
 
   return (
     <div className="border rounded p-4 bg-white">
-      <h3 className="font-semibold mb-3">路由</h3>
+      <h3 className="font-semibold mb-3">Routes</h3>
       <div className="mb-3">
-        <div className="text-xs text-gray-500 mb-1">主 → 备 顺序</div>
+        <div className="text-xs text-gray-500 mb-1">Primary → fallback order</div>
         {routes.length === 0 ? (
-          <div className="text-sm text-gray-400">未设置路由</div>
+          <div className="text-sm text-gray-400">No routes set</div>
         ) : (
           <ol className="space-y-1">
             {routes.map((id, i) => (
@@ -113,9 +113,9 @@ export default function RoutesEditor() {
       </div>
 
       <div className="mb-3">
-        <div className="text-xs text-gray-500 mb-1">添加 provider</div>
+        <div className="text-xs text-gray-500 mb-1">Add provider</div>
         {candidates.length === 0 ? (
-          <span className="text-sm text-gray-400">无可用 provider</span>
+          <span className="text-sm text-gray-400">No available providers</span>
         ) : (
           <select
             className="border rounded px-2 py-1 text-sm"
@@ -125,7 +125,7 @@ export default function RoutesEditor() {
               e.target.value = "";
             }}
           >
-            <option value="">选择 provider…</option>
+            <option value="">Select provider…</option>
             {candidates.map((id) => (
               <option key={id} value={id}>
                 {id}
@@ -142,7 +142,7 @@ export default function RoutesEditor() {
             className="w-full border rounded px-2 py-1 text-sm"
             value={modelOverride}
             onChange={(e) => setModelOverride(e.target.value)}
-            placeholder="（透传）"
+            placeholder="(passthrough)"
           />
         </div>
         <div>
@@ -167,13 +167,13 @@ export default function RoutesEditor() {
           className="px-3 py-1.5 text-sm rounded bg-gray-900 text-white"
           onClick={save}
         >
-          保存
+          Save
         </button>
         <button
           className="px-3 py-1.5 text-sm rounded border"
           onClick={clear}
         >
-          清空
+          Clear
         </button>
       </div>
       {msg && <div className="text-sm text-gray-600 mt-2">{msg}</div>}

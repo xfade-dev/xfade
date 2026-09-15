@@ -14,7 +14,7 @@ fn is_backup_file(p: &Path) -> bool {
             })
 }
 
-/// 备份 path 到 backup_dir/<filename>.<nanos>；源不存在返回 Ok(None)
+/// Back up `path` to `backup_dir/<filename>.<nanos>`; returns Ok(None) if the source is absent.
 pub fn backup_file(path: &Path, backup_dir: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
@@ -36,7 +36,7 @@ pub fn backup_file(path: &Path, backup_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
-/// 按文件名（时间戳后缀）排序，删除最旧的直到剩 keep 份
+/// Sort by filename (timestamp suffix) and delete the oldest until `keep` remain.
 pub fn rotate(dir: &Path, keep: usize) -> Result<()> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -55,7 +55,7 @@ pub fn restore(backup: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 列出备份，新→旧
+/// List backups, newest → oldest.
 pub fn list_backups(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(vec![]);

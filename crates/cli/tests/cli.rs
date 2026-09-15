@@ -2,12 +2,12 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 
-/// 以隔离 HOME 运行 asw
-fn asw(home: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("asw").unwrap();
+/// Run xfade with an isolated HOME
+fn xfade(home: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("xfade").unwrap();
     cmd.env("HOME", home)
-        .env("ASW_DATA_DIR", home.join(".asw-data"))
-        .env("ASW_MOCK_SECRETS", "1");
+        .env("XFADE_DATA_DIR", home.join(".xfade-data"))
+        .env("XFADE_MOCK_SECRETS", "1");
     cmd
 }
 
@@ -15,12 +15,11 @@ fn asw(home: &std::path::Path) -> Command {
 fn add_ls_use_current_flow() {
     let home = tempfile::tempdir().unwrap();
 
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "claude",
-            "--name",
             "kimi",
             "--base-url",
             "https://api.moonshot.cn/anthropic",
@@ -32,13 +31,13 @@ fn add_ls_use_current_flow() {
         .assert()
         .success();
 
-    asw(home.path())
+    xfade(home.path())
         .args(["ls", "--tool", "claude"])
         .assert()
         .success()
         .stdout(predicate::str::contains("kimi"));
 
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "kimi", "--tool", "claude"])
         .assert()
         .success();
@@ -46,7 +45,7 @@ fn add_ls_use_current_flow() {
     let settings = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
     assert!(settings.contains("api.moonshot.cn"));
 
-    asw(home.path())
+    xfade(home.path())
         .args(["current"])
         .assert()
         .success()
@@ -56,12 +55,11 @@ fn add_ls_use_current_flow() {
 #[test]
 fn rm_active_fails() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "codex",
-            "--name",
             "k",
             "--base-url",
             "https://x",
@@ -70,11 +68,11 @@ fn rm_active_fails() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "k", "--tool", "codex"])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["rm", "k", "--tool", "codex"])
         .assert()
         .failure()
@@ -84,7 +82,7 @@ fn rm_active_fails() {
 #[test]
 fn presets_lists_all_tools() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args(["presets"])
         .assert()
         .success()
@@ -101,12 +99,11 @@ fn switch_back_to_imported_snapshot() {
     )
     .unwrap();
 
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "claude",
-            "--name",
             "kimi",
             "--base-url",
             "https://x",
@@ -115,11 +112,11 @@ fn switch_back_to_imported_snapshot() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "kimi", "--tool", "claude"])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "imported", "--tool", "claude"])
         .assert()
         .success();
@@ -132,12 +129,11 @@ fn switch_back_to_imported_snapshot() {
 #[test]
 fn codex_end_to_end() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "codex",
-            "--name",
             "kimi",
             "--base-url",
             "https://api.moonshot.cn/v1",
@@ -146,7 +142,7 @@ fn codex_end_to_end() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "kimi", "--tool", "codex"])
         .assert()
         .success();
@@ -156,11 +152,11 @@ fn codex_end_to_end() {
     let auth = fs::read_to_string(home.path().join(".codex/auth.json")).unwrap();
     assert!(auth.contains("sk-1"));
 
-    asw(home.path())
-        .args(["add", "--tool", "codex", "--name", "official"])
+    xfade(home.path())
+        .args(["add", "official", "--tool", "codex"])
         .assert()
-        .success(); // 无 --base-url => 官方
-    asw(home.path())
+        .success(); // no --base-url => official
+    xfade(home.path())
         .args(["use", "official", "--tool", "codex"])
         .assert()
         .success();
@@ -171,12 +167,11 @@ fn codex_end_to_end() {
 #[test]
 fn edit_updates_base_url_and_extra() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "claude",
-            "--name",
             "kimi",
             "--base-url",
             "https://old",
@@ -185,7 +180,7 @@ fn edit_updates_base_url_and_extra() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "edit",
             "kimi",
@@ -198,7 +193,7 @@ fn edit_updates_base_url_and_extra() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "kimi", "--tool", "claude"])
         .assert()
         .success();
@@ -210,23 +205,22 @@ fn edit_updates_base_url_and_extra() {
 #[test]
 fn import_and_backup_commands() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args(["import", "--tool", "claude"])
         .assert()
         .success()
         .stdout(predicate::str::contains("nothing"));
-    asw(home.path())
+    xfade(home.path())
         .args(["backup", "ls", "--tool", "claude"])
         .assert()
         .success();
     fs::create_dir_all(home.path().join(".claude")).unwrap();
     fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "claude",
-            "--name",
             "k",
             "--base-url",
             "https://x",
@@ -235,11 +229,11 @@ fn import_and_backup_commands() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["use", "k", "--tool", "claude"])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["backup", "ls", "--tool", "claude"])
         .assert()
         .success()
@@ -249,22 +243,21 @@ fn import_and_backup_commands() {
 #[test]
 fn completion_generates() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args(["completion", "zsh"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("#compdef asw"));
+        .stdout(predicate::str::contains("#compdef xfade"));
 }
 
 #[test]
 fn proxy_use_status_clear() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "codex",
-            "--name",
             "yy",
             "--base-url",
             "http://x",
@@ -273,32 +266,31 @@ fn proxy_use_status_clear() {
         ])
         .assert()
         .success();
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "use", "yy"])
         .assert()
         .success()
         .stdout(predicate::str::contains("yy"));
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("yy"));
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "use", "nope"])
         .assert()
         .failure();
-    asw(home.path()).args(["proxy", "clear"]).assert().success();
+    xfade(home.path()).args(["proxy", "clear"]).assert().success();
 }
 
 #[test]
 fn proxy_use_with_model_and_target() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args([
             "add",
             "--tool",
             "codex",
-            "--name",
             "yy",
             "--base-url",
             "http://x",
@@ -308,7 +300,7 @@ fn proxy_use_with_model_and_target() {
         .assert()
         .success();
     // proxy use with --model and --target chat
-    asw(home.path())
+    xfade(home.path())
         .args([
             "proxy",
             "use",
@@ -324,7 +316,7 @@ fn proxy_use_with_model_and_target() {
         .stdout(predicate::str::contains("model: gpt-5.6-luna"))
         .stdout(predicate::str::contains("target: chat"));
     // status reflects model + target
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "status"])
         .assert()
         .success()
@@ -332,20 +324,20 @@ fn proxy_use_with_model_and_target() {
         .stdout(predicate::str::contains("model: gpt-5.6-luna"))
         .stdout(predicate::str::contains("target: chat"));
     // target=messages path
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "use", "yy", "--target", "messages"])
         .assert()
         .success()
         .stdout(predicate::str::contains("model: (passthrough)"))
         .stdout(predicate::str::contains("target: messages"));
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("model: (passthrough)"))
         .stdout(predicate::str::contains("target: messages"));
     // invalid target value rejected by value_parser
-    asw(home.path())
+    xfade(home.path())
         .args(["proxy", "use", "yy", "--target", "bogus"])
         .assert()
         .failure();
@@ -354,13 +346,13 @@ fn proxy_use_with_model_and_target() {
 #[test]
 fn stats_empty_ok() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path()).args(["stats"]).assert().success();
+    xfade(home.path()).args(["stats"]).assert().success();
 }
 
 #[test]
 fn presets_include_local_proxy() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args(["presets"])
         .assert()
         .success()
@@ -370,9 +362,144 @@ fn presets_include_local_proxy() {
 #[test]
 fn serve_help_lists_options() {
     let home = tempfile::tempdir().unwrap();
-    asw(home.path())
+    xfade(home.path())
         .args(["serve", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--port").and(predicate::str::contains("--auth-token")));
+}
+
+#[test]
+fn use_third_party_preset_without_key_errors() {
+    // Regression: `xfade use glm --tool claude` used to auto-create the provider with a
+    // placeholder key, which got written into ANTHROPIC_AUTH_TOKEN and broke Claude Code auth.
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["use", "glm", "--tool", "claude"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs an API key"));
+}
+
+#[test]
+fn config_view_and_set_secrets() {
+    let home = tempfile::tempdir().unwrap();
+
+    // default backend is keyring
+    xfade(home.path())
+        .args(["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secrets: keyring"));
+
+    // set it to file, then view reflects the change
+    xfade(home.path())
+        .args(["config", "set", "secrets", "file"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secrets: file"));
+}
+
+#[test]
+fn config_set_unknown_key_errors() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["config", "set", "bogus", "x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown config key"));
+}
+
+#[test]
+fn add_uses_global_defaults() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Set the shared "general" config once.
+    xfade(home.path())
+        .args(["config", "set", "secrets", "file"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config", "set", "base_url", "https://global.example"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config", "set", "model", "glm-5-2-260617"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config", "set", "api_key", "sk-global"])
+        .assert()
+        .success();
+
+    // add with no --base-url/--key/--set model → inherits global defaults.
+    xfade(home.path())
+        .args(["add", "g", "--tool", "claude"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["use", "g", "--tool", "claude"])
+        .assert()
+        .success();
+
+    let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+    assert!(s.contains("https://global.example"));
+    assert!(s.contains("sk-global"));
+    assert!(s.contains("glm-5-2-260617"));
+}
+
+#[test]
+fn add_official_flag_ignores_global_base_url() {
+    let home = tempfile::tempdir().unwrap();
+
+    xfade(home.path())
+        .args(["config", "set", "base_url", "https://global.example"])
+        .assert()
+        .success();
+
+    // --official forces official login, ignoring the global base_url.
+    xfade(home.path())
+        .args(["add", "official", "--tool", "codex", "--official"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["use", "official", "--tool", "codex"])
+        .assert()
+        .success();
+
+    let cfg = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert!(!cfg.contains("model_provider ="));
+}
+
+#[test]
+fn aider_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args([
+            "add",
+            "kimi",
+            "--tool",
+            "aider",
+            "--base-url",
+            "https://api.moonshot.cn/v1",
+            "--key",
+            "sk-1",
+            "--set",
+            "model=kimi-k2.5",
+        ])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["use", "kimi", "--tool", "aider"])
+        .assert()
+        .success();
+
+    let s = fs::read_to_string(home.path().join(".aider.conf.yml")).unwrap();
+    assert!(s.contains("openai/kimi-k2.5"));
+    assert!(s.contains("sk-1"));
+    assert!(s.contains("api.moonshot.cn"));
 }

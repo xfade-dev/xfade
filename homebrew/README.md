@@ -1,18 +1,18 @@
-# homebrew-agent-switch
+# homebrew-xfade
 
-Homebrew tap for [agent-switch](https://github.com/<user>/agent-switch)。
+Homebrew tap for [xfade](https://github.com/xfade-dev/xfade).
 
-> 此目录（`homebrew/`）的内容应复制到独立仓库 `<user>/homebrew-agent-switch`（Homebrew tap 约定：仓库名 `homebrew-<name>`，formula 放 `Formula/`）。
+> The contents of this directory (`homebrew/`) should be copied into a standalone repo `xfade-dev/homebrew-xfade` (Homebrew tap convention: repo name `homebrew-<name>`, formula under `Formula/`).
 
-## 安装
+## Install
 
 ```bash
-brew tap <user>/homebrew-agent-switch
-brew install agent-switch
+brew tap xfade-dev/homebrew-xfade
+brew install xfade
 ```
 
-## 更新 formula（每次 release 后）
+## Update the formula (after each release)
 
-1. 在主仓库打 tag `git tag vX.Y.0 && git push --tags`，等 release workflow 产出 `asw-*-apple-darwin.tar.gz` + `SHA256SUMS`。
-2. 用 release 中 `SHA256SUMS` 的两个 macOS sha256 替换 `Formula/agent-switch.rb` 的 `REPLACE_WITH_*`，并更新 `version`。
-3. commit + push 到本 tap 仓库；用户 `brew upgrade agent-switch` 即得新版。
+1. Tag the main repo (`git tag vX.Y.0 && git push --tags`) and wait for the release workflow to produce `xfade-*-apple-darwin.tar.gz` + `SHA256SUMS`.
+2. Replace the `REPLACE_WITH_*` placeholders in `Formula/xfade.rb` with the two macOS sha256 values from the release's `SHA256SUMS`, and update `version`.
+3. Commit + push to this tap repo; users get the new version via `brew upgrade xfade`.

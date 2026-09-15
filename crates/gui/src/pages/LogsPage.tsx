@@ -23,23 +23,23 @@ export default function LogsPage() {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold">请求日志（最近 200 条）</h2>
+        <h2 className="text-lg font-semibold">Request logs (last 200)</h2>
         <button
           className="px-3 py-1.5 text-sm rounded border bg-white"
           onClick={refresh}
           disabled={loading}
         >
-          {loading ? "刷新中…" : "刷新"}
+          {loading ? "Refreshing…" : "Refresh"}
         </button>
       </div>
 
       {rows.length === 0 ? (
-        <div className="text-gray-400 text-sm">无日志</div>
+        <div className="text-gray-400 text-sm">No logs</div>
       ) : (
         <table className="w-full text-sm">
           <thead className="text-left text-gray-400 border-b">
             <tr>
-              <th className="py-2 pr-2">时间</th>
+              <th className="py-2 pr-2">Time</th>
               <th className="py-2 pr-2">endpoint</th>
               <th className="py-2 pr-2">model</th>
               <th className="py-2 pr-2">provider</th>

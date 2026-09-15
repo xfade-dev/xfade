@@ -75,3 +75,19 @@ export interface UpdateProviderInput {
 }
 
 export type StatsGroupBy = "Provider" | "Model";
+
+export interface ConfigDto {
+  secrets: string;
+  base_url: string | null;
+  model: string | null;
+  api: string | null;
+  api_key: string | null;
+}
+
+export interface ConfigInput {
+  secrets?: string | null;
+  base_url?: string | null;
+  model?: string | null;
+  api?: string | null;
+  api_key?: string | null;
+}

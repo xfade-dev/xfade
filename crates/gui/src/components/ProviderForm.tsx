@@ -44,7 +44,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
   const submit = async () => {
     setErr(null);
     if (!id.trim()) {
-      setErr("名称必填");
+      setErr("Name is required");
       return;
     }
     let extra: unknown = null;
@@ -52,7 +52,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
       try {
         extra = JSON.parse(extraText);
       } catch {
-        setErr("extra 不是合法 JSON");
+        setErr("extra is not valid JSON");
         return;
       }
     }
@@ -78,11 +78,11 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
     <div className="fixed inset-0 z-40 bg-black/30 flex items-center justify-center">
       <div className="bg-white rounded-lg shadow-xl w-[460px] p-5">
         <h3 className="text-lg font-semibold mb-4">
-          {editing ? `编辑 ${editing.id}` : "新增 Provider"}
+          {editing ? `Edit ${editing.id}` : "Add Provider"}
         </h3>
         <div className="space-y-3">
           <div>
-            <label className="block text-xs text-gray-500 mb-1">预设</label>
+            <label className="block text-xs text-gray-500 mb-1">Preset</label>
             <select
               className="w-full border rounded px-2 py-1.5 text-sm"
               defaultValue=""
@@ -90,17 +90,17 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
                 applyPreset(presets.find((p) => p.id === e.target.value) ?? null)
               }
             >
-              <option value="">（不使用预设）</option>
+              <option value="">(no preset)</option>
               {presets.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.label}
-                  {p.is_official ? " (官方)" : ""}
+                  {p.is_official ? " (official)" : ""}
                 </option>
               ))}
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">名称</label>
+            <label className="block text-xs text-gray-500 mb-1">Name</label>
             <input
               className="w-full border rounded px-2 py-1.5 text-sm"
               value={id}
@@ -109,7 +109,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Base URL（留空=官方）</label>
+            <label className="block text-xs text-gray-500 mb-1">Base URL (empty = official)</label>
             <input
               className="w-full border rounded px-2 py-1.5 text-sm"
               value={baseUrl}
@@ -119,7 +119,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
           </div>
           <div>
             <label className="block text-xs text-gray-500 mb-1">
-              API Key{editing ? "（留空=不修改）" : ""}
+              API Key{editing ? " (empty = unchanged)" : ""}
             </label>
             <input
               className="w-full border rounded px-2 py-1.5 text-sm"
@@ -129,7 +129,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">extra (JSON, 可选)</label>
+            <label className="block text-xs text-gray-500 mb-1">extra (JSON, optional)</label>
             <textarea
               className="w-full border rounded px-2 py-1.5 text-sm font-mono"
               rows={3}
@@ -145,14 +145,14 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
             onClick={onClose}
             disabled={busy}
           >
-            取消
+            Cancel
           </button>
           <button
             className="px-3 py-1.5 text-sm rounded bg-gray-900 text-white disabled:opacity-50"
             onClick={submit}
             disabled={busy}
           >
-            {busy ? "保存中…" : "保存"}
+            {busy ? "Saving…" : "Save"}
           </button>
         </div>
       </div>

@@ -1,34 +1,83 @@
+use crate::daemon_ctl;
+use crate::dto::ProxyStatus;
 use crate::state::AppState;
-use agent_switch_core::models::ToolKind;
-use std::str::FromStr;
-use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{
+    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
+use tauri_plugin_autostart::ManagerExt;
+use xfade_core::models::ToolKind;
+use std::str::FromStr;
 
-/// 构建系统托盘图标 + 菜单。
+const POLL_INTERVAL_SECS: u64 = 5;
+
+/// Build the system tray icon and start the status-refresh loop.
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let menu = build_menu(app)?;
     TrayIconBuilder::with_id("main")
-        .tooltip("Agent Switch")
+        .tooltip("Xfade")
         .icon(app.default_window_icon().unwrap().clone())
-        .menu(&menu)
         .on_menu_event(on_menu_event)
         .build(app)?;
+
+    // Rebuild the menu immediately, then poll every 5s (refresh run state + autostart).
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            refresh_menu(&app).await;
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+    });
     Ok(())
 }
 
-fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
-    let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-    let start = MenuItem::with_id(app, "start", "启动代理", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "停止代理", true, None::<&str>)?;
+/// Query the daemon status and autostart state, then rebuild the tray menu in place.
+async fn refresh_menu(app: &AppHandle) {
+    let status = daemon_ctl::status_from_config().await;
+    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    let Ok(menu) = build_menu(app, &status, autostart) else {
+        return;
+    };
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+fn build_menu(app: &AppHandle, status: &ProxyStatus, autostart: bool) -> tauri::Result<Menu<Wry>> {
+    let status_text = if status.running {
+        match (&status.host, status.port) {
+            (Some(h), Some(p)) => format!(
+                "Running {h}:{p}{}",
+                if status.auth_enabled { " (auth)" } else { "" }
+            ),
+            _ => "Running".to_string(),
+        }
+    } else {
+        "Stopped".to_string()
+    };
+    let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
+    let start = MenuItem::with_id(app, "start", "Start proxy", true, None::<&str>)?;
+    let stop = MenuItem::with_id(app, "stop", "Stop proxy", true, None::<&str>)?;
+    let autostart_item = CheckMenuItem::with_id(
+        app,
+        "autostart",
+        "Launch at login",
+        true,
+        autostart,
+        None::<&str>,
+    )?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 GUI", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit GUI", true, None::<&str>)?;
     let claude = provider_submenu(app, "Claude Code", ToolKind::ClaudeCode)?;
     let codex = provider_submenu(app, "Codex", ToolKind::Codex)?;
     let opencode = provider_submenu(app, "OpenCode", ToolKind::OpenCode)?;
+    let pi = provider_submenu(app, "Pi", ToolKind::Pi)?;
+    let omp = provider_submenu(app, "Oh My Pi", ToolKind::OhMyPi)?;
     let items: Vec<&dyn IsMenuItem<Wry>> = vec![
-        &show, &start, &stop, &sep1, &claude, &codex, &opencode, &sep2, &quit,
+        &status_item, &start, &stop, &autostart_item, &sep1, &claude, &codex, &opencode, &pi,
+        &omp, &sep2, &show, &quit,
     ];
     Menu::with_items(app, &items)
 }
@@ -59,7 +108,7 @@ fn provider_submenu(app: &AppHandle, label: &str, tool: ToolKind) -> tauri::Resu
         let empty = MenuItem::with_id(
             app,
             format!("empty:{}", tool.as_str()),
-            "(无 provider)",
+            "(no providers)",
             false,
             None::<&str>,
         )?;
@@ -83,19 +132,31 @@ fn on_menu_event(app: &AppHandle, e: MenuEvent) {
         "start" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let cfg = crate::daemon_ctl::config();
+                let cfg = daemon_ctl::config();
                 let (h, p, t) = cfg.map(|c| (c.host, c.port, c.auth_token)).unwrap_or((
                     "127.0.0.1".into(),
                     24860,
                     None,
                 ));
-                let _ = crate::daemon_ctl::start(&app, h, p, t).await;
+                let _ = daemon_ctl::start(&app, h, p, t).await;
             });
         }
         "stop" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::daemon_ctl::stop(&app).await;
+                let _ = daemon_ctl::stop(&app).await;
+            });
+        }
+        "autostart" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let autolaunch = app.autolaunch();
+                let enabled = autolaunch.is_enabled().unwrap_or(false);
+                let _ = if enabled {
+                    autolaunch.disable()
+                } else {
+                    autolaunch.enable()
+                };
             });
         }
         "quit" => {

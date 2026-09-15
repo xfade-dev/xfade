@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type Page = "providers" | "proxy" | "stats" | "logs";
+export type Page = "providers" | "proxy" | "stats" | "logs" | "settings";
 
 interface LayoutProps {
   active: Page;
@@ -13,6 +13,7 @@ const NAV: { key: Page; label: string }[] = [
   { key: "proxy", label: "Proxy" },
   { key: "stats", label: "Stats" },
   { key: "logs", label: "Logs" },
+  { key: "settings", label: "Settings" },
 ];
 
 export default function Layout({ active, onNavigate, children }: LayoutProps) {
@@ -20,7 +21,7 @@ export default function Layout({ active, onNavigate, children }: LayoutProps) {
     <div className="flex h-screen w-screen bg-gray-50 text-gray-900">
       <nav className="w-44 shrink-0 border-r border-gray-200 bg-white p-3 flex flex-col gap-1">
         <div className="px-2 py-3 text-xs uppercase tracking-wide text-gray-400">
-          Agent Switch
+          Xfade
         </div>
         {NAV.map((n) => (
           <button

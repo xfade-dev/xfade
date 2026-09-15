@@ -22,7 +22,7 @@ export default function BackupsPanel({ tool }: BackupsPanelProps) {
   }, [open, tool]);
 
   const restore = async (path: string) => {
-    if (!window.confirm(`恢复 ${path}？当前工具配置将被覆盖。`)) return;
+    if (!window.confirm(`Restore ${path}? The current tool config will be overwritten.`)) return;
     setErr(null);
     try {
       await restoreBackup(tool, path);
@@ -38,13 +38,13 @@ export default function BackupsPanel({ tool }: BackupsPanelProps) {
         className="text-sm text-gray-600 hover:text-gray-900"
         onClick={() => setOpen((o) => !o)}
       >
-        {open ? "▼" : "▶"} 备份（{tool}）
+        {open ? "▼" : "▶"} Backups ({tool})
       </button>
       {open && (
         <div className="mt-2">
           {err && <div className="text-sm text-red-600 mb-2">{err}</div>}
           {backups.length === 0 ? (
-            <div className="text-sm text-gray-400">无备份（切换 provider 时会自动创建）</div>
+            <div className="text-sm text-gray-400">No backups (auto-created on provider switch)</div>
           ) : (
             <ul className="space-y-1">
               {backups.map((b) => (
@@ -57,7 +57,7 @@ export default function BackupsPanel({ tool }: BackupsPanelProps) {
                     className="text-xs px-2 py-0.5 rounded border hover:bg-gray-100"
                     onClick={() => restore(b)}
                   >
-                    恢复
+                    Restore
                   </button>
                 </li>
               ))}

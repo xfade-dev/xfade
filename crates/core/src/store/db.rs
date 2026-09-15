@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// 单条请求日志（数值均为 i64）
+/// A single request log row (all numeric fields are i64).
 #[derive(Debug, serde::Serialize)]
 pub struct RequestLog {
     pub ts: String,
@@ -20,14 +20,14 @@ pub struct RequestLog {
     pub error: Option<String>,
 }
 
-/// 统计聚合维度
+/// Stats aggregation dimension.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum StatsGroupBy {
     Provider,
     Model,
 }
 
-/// 一行聚合统计
+/// A single aggregated stats row.
 #[derive(Debug, serde::Serialize)]
 pub struct StatsRow {
     pub group: String,
@@ -38,21 +38,38 @@ pub struct StatsRow {
     pub avg_duration_ms: i64,
 }
 
+/// Max request log rows to retain (older rows are evicted on each insert once exceeded).
+pub const MAX_REQUEST_LOG_ROWS: usize = 10_000;
+
 #[derive(Clone)]
 pub struct Database {
     conn: std::sync::Arc<Mutex<Connection>>,
 }
 
-/// 代理路由配置：主→备路由列表、模型覆盖、目标协议。
+/// Proxy route config: primary→fallback route list, model override, target protocol.
 pub type RoutesConfig = (Vec<String>, Option<String>, String);
 
 impl Database {
+    /// Get the lock-protected connection, handling poison errors (recover and log a warning on poison).
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| {
+            // Mutex poison: some thread holding the lock panicked. Recover the lock
+            // and keep using it — the connection may still be consistent (SQLite has
+            // built-in ACID protection).
+            eprintln!("[xfade] WARNING: database mutex was poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let conn = Connection::open(path)?;
+        // WAL mode: enables concurrent reads and reduces lock contention.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let db = Self {
-            conn: std::sync::Arc::new(Mutex::new(Connection::open(path)?)),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         };
         db.migrate()?;
         Ok(db)
@@ -67,7 +84,7 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS providers (
                 tool TEXT NOT NULL,
@@ -93,7 +110,12 @@ impl Database {
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL, error TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);",
+            CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);
+            CREATE TABLE IF NOT EXISTS circuit_state (
+                provider_id TEXT PRIMARY KEY,
+                fails INTEGER NOT NULL DEFAULT 0,
+                cooldown_until_secs INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -119,9 +141,9 @@ impl Database {
         Ok(())
     }
 
-    /// 插入或更新（不触碰 is_active）
+    /// Insert or update (does not touch is_active).
     pub fn upsert(&self, p: &Provider) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO providers (tool, id, base_url, key_ref, extra, is_active)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (tool, id) DO UPDATE SET
@@ -141,7 +163,7 @@ impl Database {
     }
 
     pub fn get(&self, tool: ToolKind, id: &str) -> Result<Option<Provider>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT tool, id, base_url, key_ref, extra, is_active FROM providers
              WHERE tool = ?1 AND id = ?2",
@@ -166,7 +188,7 @@ impl Database {
                 None,
             ),
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(sql)?;
         let mut rows = match param {
             Some(p) => stmt.query(params![p])?,
@@ -179,9 +201,9 @@ impl Database {
         Ok(out)
     }
 
-    /// 同一工具内排他设置 active
+    /// Set active exclusively within a tool.
     pub fn set_active(&self, tool: ToolKind, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE providers SET is_active = 0 WHERE tool = ?1",
@@ -199,14 +221,26 @@ impl Database {
     }
 
     pub fn delete(&self, tool: ToolKind, id: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "DELETE FROM providers WHERE tool = ?1 AND id = ?2",
             params![tool.as_str(), id],
         )?;
         Ok(())
     }
 
-    /// 设置代理路由（主→备 顺序）+ 模型覆盖 + 目标协议
+    /// Update a provider's key_ref (used by keyring migration: agent-switch/ prefix → xfade/).
+    pub fn update_key_ref(&self, tool: ToolKind, id: &str, new_key_ref: &str) -> Result<()> {
+        let n = self.conn().execute(
+            "UPDATE providers SET key_ref = ?1 WHERE tool = ?2 AND id = ?3",
+            params![new_key_ref, tool.as_str(), id],
+        )?;
+        if n == 0 {
+            return Err(CoreError::ProviderNotFound(format!("{tool}/{id}")));
+        }
+        Ok(())
+    }
+
+    /// Set proxy routes (primary→fallback order) + model override + target protocol.
     pub fn set_routes(
         &self,
         routes: &[String],
@@ -220,7 +254,7 @@ impl Database {
                     path: "time".into(),
                     msg: e.to_string(),
                 })?;
-        self.conn.lock().unwrap().execute(
+        self.conn().execute(
             "INSERT INTO proxy_state (id, routes, model_override, target_protocol, updated_at)
              VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT (id) DO UPDATE SET
@@ -238,10 +272,10 @@ impl Database {
         Ok(())
     }
 
-    /// 读取代理路由及关联配置；未设置返回 None。
-    /// 返回 (routes, model_override, target_protocol)
+    /// Read proxy routes and associated config; returns None if not set.
+    /// Returns (routes, model_override, target_protocol).
     pub fn get_routes(&self) -> Result<Option<RoutesConfig>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT routes, model_override, target_protocol FROM proxy_state WHERE id = 1",
         )?;
@@ -259,15 +293,13 @@ impl Database {
     }
 
     pub fn clear_routes(&self) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM proxy_state WHERE id = 1", [])?;
+        self.conn().execute("DELETE FROM proxy_state WHERE id = 1", [])?;
         Ok(())
     }
 
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO request_logs (ts, endpoint, model, provider_id, status, prompt_tokens, completion_tokens, duration_ms, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -282,10 +314,25 @@ impl Database {
                 log.error,
             ],
         )?;
+        // Eviction: retain the most recent MAX_REQUEST_LOG_ROWS rows, deleting the oldest once exceeded.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM request_logs",
+            [],
+            |row| row.get(0),
+        )?;
+        if count > MAX_REQUEST_LOG_ROWS as i64 {
+            let excess = count - MAX_REQUEST_LOG_ROWS as i64;
+            conn.execute(
+                "DELETE FROM request_logs WHERE id IN (
+                    SELECT id FROM request_logs ORDER BY id ASC LIMIT ?1
+                )",
+                params![excess],
+            )?;
+        }
         Ok(())
     }
 
-    /// 聚合 since_ts（RFC3339）之后的请求统计
+    /// Aggregate request stats since `since_ts` (RFC3339).
     pub fn stats_since(&self, since_ts: &str, by: StatsGroupBy) -> Result<Vec<StatsRow>> {
         let group_expr = match by {
             StatsGroupBy::Provider => "provider_id",
@@ -300,7 +347,7 @@ impl Database {
              FROM request_logs WHERE ts >= ?1
              GROUP BY {group_expr} ORDER BY 2 DESC"
         );
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![since_ts])?;
         let mut out = Vec::new();
@@ -317,9 +364,9 @@ impl Database {
         Ok(out)
     }
 
-    /// 读取最近 `limit` 条请求日志（按插入顺序倒序）。用于测试断言。
+    /// Read the most recent `limit` request logs (reverse insertion order). Used for test assertions.
     pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT ts, endpoint, model, provider_id, status, prompt_tokens, completion_tokens, duration_ms, error
              FROM request_logs ORDER BY id DESC LIMIT ?1",
@@ -341,6 +388,48 @@ impl Database {
         }
         Ok(out)
     }
+
+    // ── Circuit breaker persistence ───────────────────────────────────────
+
+    /// Save (upsert) a circuit breaker state for a provider.
+    pub fn save_circuit(&self, provider_id: &str, circuit: &crate::proxy::Circuit) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO circuit_state (provider_id, fails, cooldown_until_secs)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (provider_id) DO UPDATE SET
+                fails = excluded.fails,
+                cooldown_until_secs = excluded.cooldown_until_secs",
+            params![provider_id, circuit.fails, circuit.cooldown_until_secs],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a circuit breaker state (provider recovered).
+    pub fn delete_circuit(&self, provider_id: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM circuit_state WHERE provider_id = ?1", params![provider_id])?;
+        Ok(())
+    }
+
+    /// Load all persisted circuit states on startup.
+    pub fn load_circuits(&self) -> Result<std::collections::HashMap<String, crate::proxy::Circuit>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, fails, cooldown_until_secs FROM circuit_state",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut map = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            map.insert(
+                row.get(0)?,
+                crate::proxy::Circuit {
+                    fails: row.get(1)?,
+                    cooldown_until_secs: row.get(2)?,
+                },
+            );
+        }
+        Ok(map)
+    }
 }
 
 fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
@@ -360,7 +449,10 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
         id: row.get(1)?,
         base_url: row.get(2)?,
         key_ref: row.get(3)?,
-        extra: serde_json::from_str(&extra_str).unwrap_or(serde_json::Value::Null),
+        extra: serde_json::from_str(&extra_str).unwrap_or_else(|e| {
+            eprintln!("[xfade] WARNING: invalid JSON in provider extra field for id={}: {e}", row.get::<_, String>(1).unwrap_or_default());
+            serde_json::Value::Null
+        }),
         is_active: row.get::<_, i64>(5)? != 0,
     })
 }
@@ -548,7 +640,7 @@ mod tests {
             error: Some("rate limited".into()),
         })
         .unwrap();
-        // F5: status=0（上游连接失败）应计入 errors
+        // F5: status=0 (upstream connection failure) should count as errors
         db.insert_request_log(&RequestLog {
             ts: "2026-07-26T12:00:00Z".into(),
             endpoint: "chat".into(),
@@ -599,7 +691,7 @@ mod tests {
             let back: StatsGroupBy = serde_json::from_str(&s).unwrap();
             let _ = back;
         }
-        // 也校验字段命名（默认 PascalCase 即变体名）
+        // Also verify field naming (default PascalCase == variant name)
         assert_eq!(
             serde_json::to_string(&StatsGroupBy::Provider).unwrap(),
             "\"Provider\""

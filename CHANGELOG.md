@@ -1,51 +1,68 @@
 # Changelog
 
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+This project follows [Semantic Versioning](https://semver.org/).
+
+## v0.7.0 — 2026-09-14
+
+### New tools
+- **feat(core)**: Pi / Oh My Pi (`pi`, `omp`) + Aider (`aider`) adapters (6 tools total).
+- **feat(core)**: shared "general" config (`config.json`): secrets backend, global `base_url`/`model`/`api`, and a global API key; CLI `xfade config [set]`.
+- **feat(core)**: `Core::update_config` (persist global config; empty value clears the field).
+
+### GUI
+- **feat(gui)**: Settings page (secrets backend + shared base_url/model/api + global API key).
+- **feat(gui)**: Providers page now lists all 6 tools (was 3); `ToolKind` type covers pi/oh-my-pi/aider.
+
+### Packaging
+- **feat**: `scripts/install.sh` one-line installer (`curl -fsSL https://xfade.sh | sh`, macOS/Linux).
+
+### Docs
+- **docs**: `docs/cursor.md` (Cursor takeover); `getting-started.md` / `api.md` updated for the new tools + global config.
 
 ## v0.6.0 — 2026-07-29
 
-### 技术债
-- **fix(core)**: codex apply 移除官方 OAuth `tokens` + 设 `preferred_auth_method=apikey`，防 Authorization 被劫持。
-- **fix(core)**: stats errors 计入 `status=0`（上游连接失败）。
-- **feat(core)**: codex apply 后扫描全文件废弃 `wire_api="chat"` 并警告。
+### Tech debt
+- **fix(core)**: codex apply removes official OAuth `tokens` + sets `preferred_auth_method=apikey`, preventing Authorization hijacking.
+- **fix(core)**: stats errors now count `status=0` (upstream connection failures).
+- **feat(core)**: codex apply scans the whole file for deprecated `wire_api="chat"` and warns.
 
-### 打包发布
-- **chore**: workspace `[workspace.package]` metadata（v0.6.0，license MIT OR Apache-2.0）。
-- **ci**: CI workflow（fmt/clippy/test + 前端 tsc/vitest）；release workflow（tag 触发多平台 CLI 二进制 + macOS GUI .dmg + checksums + GitHub Release）。
-- **feat(gui)**: `asw` 作为 Tauri sidecar 打入 .app，GUI 经 `tauri-plugin-shell` 自装 daemon（解决 Finder PATH 问题）。
-- **feat**: Homebrew formula（独立 tap `homebrew-agent-switch`）。
-- `core::daemon::install` 幂等（unload-then-load）。
-- `RELEASE.md` 打包/发布流程文档。
+### Packaging & release
+- **chore**: workspace `[workspace.package]` metadata (v0.6.0, license MIT OR Apache-2.0).
+- **ci**: CI workflow (fmt/clippy/test + frontend tsc/vitest); release workflow (tag-triggered multi-platform CLI binaries + macOS GUI .dmg + checksums + GitHub Release).
+- **feat(gui)**: `xfade` bundled into the .app as a Tauri sidecar; the GUI self-installs the daemon via `tauri-plugin-shell` (solves the Finder PATH issue).
+- **feat**: Homebrew formula (standalone tap `homebrew-xfade`).
+- `core::daemon::install` is idempotent (unload-then-load).
+- `RELEASE.md` packaging/release guide.
 
-### 文档
-- README 重构；新增 `docs/architecture.md`、`docs/getting-started.md`、`docs/api.md`、`CHANGELOG.md`。
+### Docs
+- README restructure; added `docs/architecture.md`, `docs/getting-started.md`, `docs/api.md`, `CHANGELOG.md`.
 
 ## v0.5.0 — 2026-07-28
 
-- **feat(core)**: `ProxyService` 增 `host/port` 字段 + `with_host_port` builder。
-- **refactor(core)**: 提取 `auth_guard` 共享 middleware（`/health` 免鉴权，`/v1/*` 与 `/__asw/status` 统一校验）。
-- **feat(core)**: `GET /__asw/status` 管理端点 + `CircuitDto` 下沉；`core::daemon`（DaemonConfig + daemon.json + launchctl load/unload）。
-- **feat(cli)**: `asw serve install/uninstall/status/stop`（launchd 常驻 + RunAtLoad + KeepAlive）。
-- **feat(gui)**: `daemon_ctl` 取代内嵌 `proxy_ctl`（HTTP 状态查询 + launchctl 控制）；系统托盘（关窗到托盘 + 每工具快速切换 + 启停代理）+ `tauri-plugin-autostart` 开机自启。
+- **feat(core)**: `ProxyService` gains `host/port` fields + `with_host_port` builder.
+- **refactor(core)**: extracted a shared `auth_guard` middleware (`/health` is auth-free, `/v1/*` and `/__xfade/status` share the check).
+- **feat(core)**: `GET /__xfade/status` admin endpoint + `CircuitDto` moved down; `core::daemon` (DaemonConfig + daemon.json + launchctl load/unload).
+- **feat(cli)**: `xfade serve install/uninstall/status/stop` (launchd-resident + RunAtLoad + KeepAlive).
+- **feat(gui)**: `daemon_ctl` replaces the embedded `proxy_ctl` (HTTP status query + launchctl control); system tray (close-to-tray + per-tool quick switch + start/stop proxy) + `tauri-plugin-autostart` boot autostart.
 
 ## v0.4.0 — 2026-07-28
 
-- **feat(core)**: `Core: Clone`（`Arc<dyn SecretStore>`）；`serve_with_shutdown` 优雅关停；`RequestLog/StatsRow/StatsGroupBy/Preset` serde derive。
-- **feat(gui)**: Tauri v2 桌面 GUI（React + TS + Vite + Tailwind），四页 Providers/Proxy/Stats/Logs；18 个 Tauri command 直调 Core；代理内嵌同进程。
+- **feat(core)**: `Core: Clone` (`Arc<dyn SecretStore>`); `serve_with_shutdown` graceful shutdown; serde derive for `RequestLog/StatsRow/StatsGroupBy/Preset`.
+- **feat(gui)**: Tauri v2 desktop GUI (React + TS + Vite + Tailwind), four pages Providers/Proxy/Stats/Logs; 18 Tauri commands calling Core directly; the proxy is embedded in-process.
 
 ## v0.3.0 — 2026-07-27
 
-- **feat(core)**: Anthropic→OpenAI 协议互转（tool_calls 聚合-再分片为 `input_json_delta`）。
-- `proxy_state` 增 `model_override`、`target_protocol`（chat/messages）。
+- **feat(core)**: Anthropic→OpenAI protocol conversion (tool_calls aggregated and re-chunked as `input_json_delta`).
+- `proxy_state` gains `model_override`, `target_protocol` (chat/messages).
 
 ## v0.2.0 — 2026-07-26
 
-- **feat**: 本地代理 `asw serve`（axum + reqwest + SSE 流式透传）。
-- 路由 failover + 熔断（FAIL_THRESHOLD=3，COOLDOWN=60s）。
-- `asw proxy use/status/clear` + `asw stats`；`request_logs` + `proxy_state` 表。
+- **feat**: local proxy `xfade serve` (axum + reqwest + SSE streaming passthrough).
+- Route failover + circuit breaking (FAIL_THRESHOLD=3, COOLDOWN=60s).
+- `xfade proxy use/status/clear` + `xfade stats`; `request_logs` + `proxy_state` tables.
 
 ## v0.1.0 — 2026-07-24
 
-- **feat**: provider 切换 CLI（add/ls/use/current/edit/rm/presets/import/backup/completion）。
-- 三 adapter（claude_code/codex/opencode）+ keyring 系统钥匙串 + 切换前备份轮转。
-- core 库 `agent-switch-core`（rusqlite Mutex/Send+Sync）。
+- **feat**: provider-switching CLI (add/ls/use/current/edit/rm/presets/import/backup/completion).
+- Three adapters (claude_code/codex/opencode) + system-keyring key storage + backup rotation before switching.
+- `xfade-core` library (rusqlite Mutex/Send+Sync).

@@ -16,15 +16,21 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 pub const FAIL_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 60;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Circuit {
     pub fails: u32,
-    pub cooldown_until: Option<Instant>,
+    /// Unix timestamp (seconds) when the cooldown period ends. 0 means no cooldown.
+    pub cooldown_until_secs: i64,
+}
+
+impl Circuit {
+    pub fn is_open(&self, now_secs: i64) -> bool {
+        self.cooldown_until_secs > 0 && now_secs < self.cooldown_until_secs
+    }
 }
 
 pub struct ProxyService {
@@ -38,14 +44,29 @@ pub struct ProxyService {
 
 impl ProxyService {
     pub fn new(core: Core) -> Self {
+        // Restore persisted circuit state from database on startup.
+        let circuits = core.db().load_circuits().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("reqwest Client::builder should not fail");
         Self {
             core,
-            client: reqwest::Client::new(),
-            circuits: Arc::new(Mutex::new(HashMap::new())),
+            client,
+            circuits: Arc::new(Mutex::new(circuits)),
             auth_token: None,
             host: "127.0.0.1".to_string(),
             port: 0,
         }
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
 
     pub fn with_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
@@ -66,11 +87,7 @@ impl ProxyService {
     pub fn circuit_open(&self, provider_id: &str) -> bool {
         let circuits = self.circuits.lock().unwrap();
         if let Some(c) = circuits.get(provider_id) {
-            if let Some(until) = c.cooldown_until {
-                if until > Instant::now() {
-                    return true;
-                }
-            }
+            return c.is_open(Self::now_secs());
         }
         false
     }
@@ -78,25 +95,30 @@ impl ProxyService {
     pub fn record_success(&self, provider_id: &str) {
         let mut circuits = self.circuits.lock().unwrap();
         circuits.remove(provider_id);
+        // Persist: remove from DB.
+        let _ = self.core.db().delete_circuit(provider_id);
     }
 
     pub fn record_failure(&self, provider_id: &str) {
         let mut circuits = self.circuits.lock().unwrap();
+        let now = Self::now_secs();
         let c = circuits.entry(provider_id.to_string()).or_insert(Circuit {
             fails: 0,
-            cooldown_until: None,
+            cooldown_until_secs: 0,
         });
         c.fails += 1;
         if c.fails >= FAIL_THRESHOLD {
-            c.cooldown_until = Some(Instant::now() + std::time::Duration::from_secs(COOLDOWN_SECS));
+            c.cooldown_until_secs = now + COOLDOWN_SECS as i64;
         }
+        // Persist updated circuit state.
+        let _ = self.core.db().save_circuit(provider_id, c);
     }
 
     pub fn circuit_status(&self, provider_id: &str) -> Option<Circuit> {
         self.circuits.lock().unwrap().get(provider_id).cloned()
     }
 
-    /// 启动代理；`shutdown` future 完成时优雅关停。host/port 取自自身字段。
+    /// Start the proxy; shut down gracefully when the `shutdown` future completes. host/port come from self fields.
     pub async fn serve_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -113,7 +135,7 @@ impl ProxyService {
         Ok(())
     }
 
-    /// CLI 用：阻塞运行直到中断（永不触发优雅关停信号）。
+    /// For the CLI: block until interrupted (never triggers a graceful shutdown signal).
     pub async fn serve(self) -> Result<()> {
         self.serve_with_shutdown(std::future::pending::<()>()).await
     }
@@ -125,7 +147,7 @@ impl ProxyService {
             .route("/v1/responses", post(forward::handle))
             .route("/v1/messages", post(forward::handle))
             .route("/v1/models", get(forward::handle_get))
-            .route("/__asw/status", get(status::handle))
+            .route("/__xfade/status", get(status::handle))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth::auth_guard,
@@ -356,7 +378,7 @@ mod tests {
     async fn serve_with_shutdown_stops_and_releases_port() {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir, &[]);
-        // 取一个空闲端口
+        // grab a free port
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
@@ -371,7 +393,7 @@ mod tests {
                 })
                 .await
         });
-        // 等监听就绪
+        // wait for the listener to be ready
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/health"))
             .await
@@ -381,7 +403,7 @@ mod tests {
         tx.send(()).unwrap();
         handle.await.unwrap().unwrap();
 
-        // 端口已释放：可重新绑定
+        // port released: can rebind
         let rebind = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await;
         assert!(
             rebind.is_ok(),
@@ -410,7 +432,7 @@ mod tests {
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let v: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/__asw/status"))
+        let v: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/__xfade/status"))
             .await
             .unwrap()
             .json()
@@ -444,13 +466,13 @@ mod tests {
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let s = reqwest::get(format!("http://127.0.0.1:{port}/__asw/status"))
+        let s = reqwest::get(format!("http://127.0.0.1:{port}/__xfade/status"))
             .await
             .unwrap()
             .status();
         assert_eq!(s, 401);
         let s2 = reqwest::Client::new()
-            .get(format!("http://127.0.0.1:{port}/__asw/status"))
+            .get(format!("http://127.0.0.1:{port}/__xfade/status"))
             .header("Authorization", "Bearer t1")
             .send()
             .await
