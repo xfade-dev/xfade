@@ -41,7 +41,13 @@ jobs:
           else
             tar czf "dist/xfade-${{ matrix.target }}.tar.gz" -C target/release xfade
           fi
-          cd dist && sha256sum xfade-* > ../checksums-${{ matrix.target }}.txt && cd ..
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum xfade-* > "../checksums-${{ matrix.target }}.txt"
+          else
+            shasum -a 256 xfade-* > "../checksums-${{ matrix.target }}.txt"
+          fi
+          cd ..
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.target }}
