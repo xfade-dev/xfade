@@ -62,6 +62,7 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_writes_plist_and_daemon_json() {
         let dir = setup_home();
