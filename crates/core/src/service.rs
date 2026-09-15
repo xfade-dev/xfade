@@ -128,8 +128,7 @@ impl Core {
     ///   3. `<data_dir>/config.json` `secrets` field (see `xfade config`),
     ///   4. default: system keyring.
     pub fn from_env() -> Result<Self> {
-        let home = std::env::var("HOME")
-            .map_err(|_| CoreError::Keyring("HOME not set".into()))?;
+        let home = std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
         let home = Path::new(&home);
         let data = std::env::var_os("XFADE_DATA_DIR")
             .map(PathBuf::from)
@@ -190,13 +189,25 @@ impl Core {
             })?;
         }
         if let Some(u) = base_url {
-            cfg.base_url = if u.is_empty() { None } else { Some(u.to_string()) };
+            cfg.base_url = if u.is_empty() {
+                None
+            } else {
+                Some(u.to_string())
+            };
         }
         if let Some(m) = model {
-            cfg.model = if m.is_empty() { None } else { Some(m.to_string()) };
+            cfg.model = if m.is_empty() {
+                None
+            } else {
+                Some(m.to_string())
+            };
         }
         if let Some(a) = api {
-            cfg.api = if a.is_empty() { None } else { Some(a.to_string()) };
+            cfg.api = if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            };
         }
         cfg.save(&self.data_dir)?;
         Ok(cfg)
@@ -597,7 +608,8 @@ mod tests {
 
         // After switching to official: defaultProvider should restore to anthropic
         assert_eq!(
-            read_settings_pi(&dir)["defaultProvider"], "anthropic",
+            read_settings_pi(&dir)["defaultProvider"],
+            "anthropic",
             "switching to official must restore the original defaultProvider"
         );
     }
@@ -653,8 +665,7 @@ mod tests {
         core.add_provider(p, Some("sk-test")).unwrap();
         core.use_provider(ToolKind::OhMyPi, "kimi").unwrap();
 
-        let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json"))
-            .unwrap();
+        let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["defaultProvider"], "xfade");
 
@@ -662,8 +673,7 @@ mod tests {
             .unwrap();
         core.use_provider(ToolKind::OhMyPi, "official").unwrap();
 
-        let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json"))
-            .unwrap();
+        let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["defaultProvider"], "anthropic");
     }
@@ -734,10 +744,7 @@ mod tests {
         assert_eq!(stored.key_ref, "xfade/codex/kimi");
 
         // secret moved to the new key, old key removed
-        assert_eq!(
-            core.secrets().get("xfade/codex/kimi").unwrap(),
-            "sk-legacy"
-        );
+        assert_eq!(core.secrets().get("xfade/codex/kimi").unwrap(), "sk-legacy");
         assert!(core.secrets().get("agent-switch/codex/kimi").is_err());
 
         // the provider without a secret also got its key_ref format unified

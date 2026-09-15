@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use xfade_core::models::ToolKind;
 use xfade_core::presets::Preset;
-use serde::{Deserialize, Serialize};
 
 // CircuitDto is moved down into core; the GUI reuses it directly (avoiding duplication).
 pub use xfade_core::proxy::status::CircuitDto;

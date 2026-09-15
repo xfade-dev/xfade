@@ -293,7 +293,8 @@ impl Database {
     }
 
     pub fn clear_routes(&self) -> Result<()> {
-        self.conn().execute("DELETE FROM proxy_state WHERE id = 1", [])?;
+        self.conn()
+            .execute("DELETE FROM proxy_state WHERE id = 1", [])?;
         Ok(())
     }
 
@@ -315,11 +316,8 @@ impl Database {
             ],
         )?;
         // Eviction: retain the most recent MAX_REQUEST_LOG_ROWS rows, deleting the oldest once exceeded.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM request_logs",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM request_logs", [], |row| row.get(0))?;
         if count > MAX_REQUEST_LOG_ROWS as i64 {
             let excess = count - MAX_REQUEST_LOG_ROWS as i64;
             conn.execute(
@@ -406,17 +404,20 @@ impl Database {
 
     /// Remove a circuit breaker state (provider recovered).
     pub fn delete_circuit(&self, provider_id: &str) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM circuit_state WHERE provider_id = ?1", params![provider_id])?;
+        self.conn().execute(
+            "DELETE FROM circuit_state WHERE provider_id = ?1",
+            params![provider_id],
+        )?;
         Ok(())
     }
 
     /// Load all persisted circuit states on startup.
-    pub fn load_circuits(&self) -> Result<std::collections::HashMap<String, crate::proxy::Circuit>> {
+    pub fn load_circuits(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::proxy::Circuit>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT provider_id, fails, cooldown_until_secs FROM circuit_state",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT provider_id, fails, cooldown_until_secs FROM circuit_state")?;
         let mut rows = stmt.query([])?;
         let mut map = std::collections::HashMap::new();
         while let Some(row) = rows.next()? {
@@ -450,7 +451,10 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
         base_url: row.get(2)?,
         key_ref: row.get(3)?,
         extra: serde_json::from_str(&extra_str).unwrap_or_else(|e| {
-            eprintln!("[xfade] WARNING: invalid JSON in provider extra field for id={}: {e}", row.get::<_, String>(1).unwrap_or_default());
+            eprintln!(
+                "[xfade] WARNING: invalid JSON in provider extra field for id={}: {e}",
+                row.get::<_, String>(1).unwrap_or_default()
+            );
             serde_json::Value::Null
         }),
         is_active: row.get::<_, i64>(5)? != 0,

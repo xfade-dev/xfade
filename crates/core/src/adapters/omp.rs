@@ -53,12 +53,11 @@ impl OmpAdapter {
             }
             Err(e) => return Err(e.into()),
         };
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| {
-            CoreError::ConfigParse {
+        let yaml_val: serde_yaml::Value =
+            serde_yaml::from_str(&text).map_err(|e| CoreError::ConfigParse {
                 path: self.models_path().display().to_string(),
                 msg: format!("YAML parse error: {e}"),
-            }
-        })?;
+            })?;
         // Convert serde_yaml::Value → serde_json::Value
         let json_str = serde_json::to_string(&yaml_val).map_err(|e| CoreError::ConfigParse {
             path: self.models_path().display().to_string(),
@@ -128,14 +127,17 @@ impl ToolAdapter for OmpAdapter {
 
             // Add/update xfade provider in models.yml.
             let models_obj = models.as_object_mut().unwrap();
-            let providers = models_obj
-                .entry("providers")
-                .or_insert_with(|| json!({}));
-            let providers = providers.as_object_mut().ok_or_else(|| CoreError::ConfigParse {
-                path: self.models_path().display().to_string(),
-                msg: "models.yml 'providers' must be an object".into(),
-            })?;
-            let base_url = provider.base_url.as_deref().unwrap_or("http://127.0.0.1:9413");
+            let providers = models_obj.entry("providers").or_insert_with(|| json!({}));
+            let providers = providers
+                .as_object_mut()
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: self.models_path().display().to_string(),
+                    msg: "models.yml 'providers' must be an object".into(),
+                })?;
+            let base_url = provider
+                .base_url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:9413");
             let model_id = provider
                 .extra
                 .get("model")
@@ -169,9 +171,7 @@ impl ToolAdapter for OmpAdapter {
 
     fn read_current(&self) -> Result<Option<(Provider, Option<String>)>> {
         let models = self.load_models_yml()?;
-        let providers = models
-            .get("providers")
-            .and_then(|v| v.as_object());
+        let providers = models.get("providers").and_then(|v| v.as_object());
         let Some(providers) = providers else {
             return Ok(None);
         };
@@ -233,8 +233,7 @@ mod tests {
         ad.apply(&p, Some("sk-test")).unwrap();
 
         // Verify models.yml was created.
-        let models_raw =
-            std::fs::read_to_string(dir.path().join(".omp/agent/models.yml")).unwrap();
+        let models_raw = std::fs::read_to_string(dir.path().join(".omp/agent/models.yml")).unwrap();
         assert!(models_raw.contains("xfade"));
         assert!(models_raw.contains("http://x"));
         assert!(models_raw.contains("openai-completions"));

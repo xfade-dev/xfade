@@ -183,7 +183,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut p = Provider::new("kimi", ToolKind::Aider, Some("https://api.moonshot.cn/v1".into()));
+        let mut p = Provider::new(
+            "kimi",
+            ToolKind::Aider,
+            Some("https://api.moonshot.cn/v1".into()),
+        );
         p.extra = json!({"model": "kimi-k2.5"});
         ad.apply(&p, Some("sk-test")).unwrap();
 

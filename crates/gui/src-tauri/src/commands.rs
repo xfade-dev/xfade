@@ -3,10 +3,10 @@ use crate::dto::{
     UpdateProviderInput,
 };
 use crate::state::AppState;
+use tauri::State;
 use xfade_core::models::{Provider, ToolKind};
 use xfade_core::presets::presets_for;
 use xfade_core::store::db::{RequestLog, StatsGroupBy, StatsRow};
-use tauri::State;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -58,10 +58,7 @@ pub async fn update_provider(
             .into_iter()
             .find(|p| p.id == input.id)
             .ok_or_else(|| {
-                xfade_core::CoreError::ProviderNotFound(format!(
-                    "{}/{}",
-                    input.tool, input.id
-                ))
+                xfade_core::CoreError::ProviderNotFound(format!("{}/{}", input.tool, input.id))
             })?;
         if let Some(u) = input.base_url {
             p.base_url = Some(u);

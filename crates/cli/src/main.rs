@@ -1,9 +1,9 @@
-use xfade_core::proxy::ProxyService;
-use xfade_core::store::db::StatsGroupBy;
-use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use xfade_core::proxy::ProxyService;
+use xfade_core::store::db::StatsGroupBy;
+use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
 
 mod daemon;
 
@@ -115,10 +115,7 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ConfigCmd {
     /// Set a config value, e.g. `xfade config set secrets file`
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
 }
 
 #[derive(Subcommand)]
@@ -292,64 +289,67 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
-        Cmd::Config { cmd } => match cmd {
-            None => {
-                let dir = data_dir()?;
-                let cfg = Config::load(&dir);
-                println!("secrets: {}", cfg.secrets);
-                println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
-                println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
-                println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
-                let api_key = build_core()?.global_api_key();
-                match api_key {
-                    Some(k) => println!("api_key: {}...", &k[..k.len().min(8)]),
-                    None => println!("api_key: (unset)"),
+        Cmd::Config { cmd } => {
+            match cmd {
+                None => {
+                    let dir = data_dir()?;
+                    let cfg = Config::load(&dir);
+                    println!("secrets: {}", cfg.secrets);
+                    println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
+                    println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
+                    println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
+                    let api_key = build_core()?.global_api_key();
+                    match api_key {
+                        Some(k) => println!("api_key: {}...", &k[..k.len().min(8)]),
+                        None => println!("api_key: (unset)"),
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            Some(ConfigCmd::Set { key, value }) => {
-                match key.as_str() {
-                    "secrets" => {
-                        let dir = data_dir()?;
-                        let mut cfg = Config::load(&dir);
-                        cfg.secrets = value.parse().map_err(|e: String| CoreError::ConfigParse {
-                            path: key.clone(),
-                            msg: e,
-                        })?;
-                        cfg.save(&dir)?;
-                    }
-                    "base_url" => {
-                        let dir = data_dir()?;
-                        let mut cfg = Config::load(&dir);
-                        cfg.base_url = Some(value.clone());
-                        cfg.save(&dir)?;
-                    }
-                    "model" => {
-                        let dir = data_dir()?;
-                        let mut cfg = Config::load(&dir);
-                        cfg.model = Some(value.clone());
-                        cfg.save(&dir)?;
-                    }
-                    "api" => {
-                        let dir = data_dir()?;
-                        let mut cfg = Config::load(&dir);
-                        cfg.api = Some(value.clone());
-                        cfg.save(&dir)?;
-                    }
-                    "api_key" => {
-                        build_core()?.set_global_api_key(&value)?;
-                    }
-                    other => {
-                        return Err(CoreError::ConfigParse {
+                Some(ConfigCmd::Set { key, value }) => {
+                    match key.as_str() {
+                        "secrets" => {
+                            let dir = data_dir()?;
+                            let mut cfg = Config::load(&dir);
+                            cfg.secrets =
+                                value.parse().map_err(|e: String| CoreError::ConfigParse {
+                                    path: key.clone(),
+                                    msg: e,
+                                })?;
+                            cfg.save(&dir)?;
+                        }
+                        "base_url" => {
+                            let dir = data_dir()?;
+                            let mut cfg = Config::load(&dir);
+                            cfg.base_url = Some(value.clone());
+                            cfg.save(&dir)?;
+                        }
+                        "model" => {
+                            let dir = data_dir()?;
+                            let mut cfg = Config::load(&dir);
+                            cfg.model = Some(value.clone());
+                            cfg.save(&dir)?;
+                        }
+                        "api" => {
+                            let dir = data_dir()?;
+                            let mut cfg = Config::load(&dir);
+                            cfg.api = Some(value.clone());
+                            cfg.save(&dir)?;
+                        }
+                        "api_key" => {
+                            build_core()?.set_global_api_key(&value)?;
+                        }
+                        other => {
+                            return Err(CoreError::ConfigParse {
                             path: other.to_string(),
                             msg: "unknown config key (expected: secrets|base_url|model|api|api_key)".into(),
                         });
+                        }
                     }
+                    println!("set {key} = {value}");
+                    Ok(())
                 }
-                println!("set {key} = {value}");
-                Ok(())
             }
-        },
+        }
         Cmd::Edit {
             name,
             tool,
@@ -665,11 +665,7 @@ fn cmd_add(
                 (n, Some(u), serde_json::Value::Null)
             } else {
                 let p = &presets[idx];
-                (
-                    p.id.to_string(),
-                    p.base_url.clone(),
-                    p.extra.clone(),
-                )
+                (p.id.to_string(), p.base_url.clone(), p.extra.clone())
             }
         }
     };

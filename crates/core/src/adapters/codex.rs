@@ -70,10 +70,13 @@ impl ToolAdapter for CodexAdapter {
             root.remove("model_provider");
         } else {
             let id = &provider.id;
-            let url = provider.base_url.as_deref().ok_or_else(|| CoreError::ConfigParse {
-                path: "provider".into(),
-                msg: format!("third-party provider '{id}' is missing base_url"),
-            })?;
+            let url = provider
+                .base_url
+                .as_deref()
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: "provider".into(),
+                    msg: format!("third-party provider '{id}' is missing base_url"),
+                })?;
             let wire_api = provider
                 .extra
                 .get("wire_api")

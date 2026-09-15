@@ -20,9 +20,13 @@ pub fn platform_supported() -> bool {
 
 /// Return the platform name for user-facing messages.
 pub fn platform_name() -> &'static str {
-    if cfg!(target_os = "macos") { "launchd (macOS)" }
-    else if cfg!(target_os = "linux") { "systemd (Linux)" }
-    else { "unsupported" }
+    if cfg!(target_os = "macos") {
+        "launchd (macOS)"
+    } else if cfg!(target_os = "linux") {
+        "systemd (Linux)"
+    } else {
+        "unsupported"
+    }
 }
 
 pub fn daemon_json_path(data_dir: &Path) -> PathBuf {
@@ -55,7 +59,9 @@ pub fn plist_path(home: &Path) -> PathBuf {
 pub fn systemd_unit_path() -> PathBuf {
     let dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
     dir.join("systemd/user").join(format!("{LABEL}.service"))
 }
 
@@ -65,11 +71,7 @@ pub fn data_dir(home: &Path) -> PathBuf {
 
 /// Write the macOS launchd plist (ProgramArguments points at exe) + daemon.json.
 /// Returns the written plist path for use by load/unload.
-pub fn write_plist(
-    exe: &str,
-    cfg: &DaemonConfig,
-    home: &Path,
-) -> Result<PathBuf> {
+pub fn write_plist(exe: &str, cfg: &DaemonConfig, home: &Path) -> Result<PathBuf> {
     let dd = data_dir(home);
     std::fs::create_dir_all(launch_agents_dir(home))?;
     std::fs::create_dir_all(&dd)?;
@@ -81,7 +83,8 @@ pub fn write_plist(
          <string>{exe}</string><string>serve</string>\
          <string>--host</string><string>{h}</string>\
          <string>--port</string><string>{p}</string>",
-        h = cfg.host, p = cfg.port
+        h = cfg.host,
+        p = cfg.port
     );
     if let Some(t) = &cfg.auth_token {
         plist.push_str(&format!(
@@ -103,10 +106,7 @@ pub fn write_plist(
 }
 
 /// Write the Linux systemd user unit + daemon.json.
-pub fn write_systemd_unit(
-    exe: &str,
-    cfg: &DaemonConfig,
-) -> Result<PathBuf> {
+pub fn write_systemd_unit(exe: &str, cfg: &DaemonConfig) -> Result<PathBuf> {
     let dd = data_dir(
         &dirs::home_dir().ok_or_else(|| CoreError::Keyring("cannot locate home dir".into()))?,
     );
@@ -170,7 +170,9 @@ pub fn load(home: &Path) -> Result<()> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        return Err(CoreError::Proxy("daemon not supported on this platform".into()));
+        return Err(CoreError::Proxy(
+            "daemon not supported on this platform".into(),
+        ));
     }
     Ok(())
 }

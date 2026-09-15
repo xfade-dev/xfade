@@ -1,6 +1,7 @@
 use crate::daemon_ctl;
 use crate::dto::ProxyStatus;
 use crate::state::AppState;
+use std::str::FromStr;
 use tauri::menu::{
     CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
@@ -8,7 +9,6 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt;
 use xfade_core::models::ToolKind;
-use std::str::FromStr;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 
@@ -76,8 +76,19 @@ fn build_menu(app: &AppHandle, status: &ProxyStatus, autostart: bool) -> tauri::
     let pi = provider_submenu(app, "Pi", ToolKind::Pi)?;
     let omp = provider_submenu(app, "Oh My Pi", ToolKind::OhMyPi)?;
     let items: Vec<&dyn IsMenuItem<Wry>> = vec![
-        &status_item, &start, &stop, &autostart_item, &sep1, &claude, &codex, &opencode, &pi,
-        &omp, &sep2, &show, &quit,
+        &status_item,
+        &start,
+        &stop,
+        &autostart_item,
+        &sep1,
+        &claude,
+        &codex,
+        &opencode,
+        &pi,
+        &omp,
+        &sep2,
+        &show,
+        &quit,
     ];
     Menu::with_items(app, &items)
 }

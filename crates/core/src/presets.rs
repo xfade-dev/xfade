@@ -29,47 +29,132 @@ fn p(id: &str, label: &str, base_url: Option<&str>, extra: serde_json::Value) ->
 pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
     let mut v = vec![
         p("official", "Official", None, serde_json::Value::Null),
-        p("local-proxy", "Local proxy (xfade serve)", Some(local_proxy_base_url(tool)), serde_json::Value::Null),
+        p(
+            "local-proxy",
+            "Local proxy (xfade serve)",
+            Some(local_proxy_base_url(tool)),
+            serde_json::Value::Null,
+        ),
     ];
     match tool {
         ToolKind::ClaudeCode => {
             v.extend([
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/anthropic"), serde_json::Value::Null),
-                p("glm", "GLM (Zhipu)", Some("https://open.bigmodel.cn/api/anthropic"), serde_json::Value::Null),
-                p("deepseek", "DeepSeek", Some("https://api.deepseek.com/anthropic"), serde_json::Value::Null),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/anthropic"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "glm",
+                    "GLM (Zhipu)",
+                    Some("https://open.bigmodel.cn/api/anthropic"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com/anthropic"),
+                    serde_json::Value::Null,
+                ),
             ]);
         }
         ToolKind::Codex => {
             v.extend([
-                p("openrouter", "OpenRouter", Some("https://openrouter.ai/api/v1"), serde_json::json!({"wire_api": "responses"})),
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/v1"), serde_json::json!({"wire_api": "responses"})),
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::json!({"wire_api": "responses"}),
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::json!({"wire_api": "responses"}),
+                ),
             ]);
         }
         ToolKind::OpenCode => {
             v.extend([
-                p("openrouter", "OpenRouter", Some("https://openrouter.ai/api/v1"), serde_json::Value::Null),
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/v1"), serde_json::Value::Null),
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::Value::Null,
+                ),
             ]);
         }
         ToolKind::Pi => {
             v.extend([
-                p("openrouter", "OpenRouter", Some("https://openrouter.ai/api/v1"), serde_json::Value::Null),
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/v1"), serde_json::Value::Null),
-                p("deepseek", "DeepSeek", Some("https://api.deepseek.com"), serde_json::Value::Null),
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com"),
+                    serde_json::Value::Null,
+                ),
             ]);
         }
         ToolKind::OhMyPi => {
             v.extend([
-                p("openrouter", "OpenRouter", Some("https://openrouter.ai/api/v1"), serde_json::Value::Null),
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/v1"), serde_json::Value::Null),
-                p("deepseek", "DeepSeek", Some("https://api.deepseek.com"), serde_json::Value::Null),
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com"),
+                    serde_json::Value::Null,
+                ),
             ]);
         }
         ToolKind::Aider => {
             v.extend([
-                p("openrouter", "OpenRouter", Some("https://openrouter.ai/api/v1"), serde_json::Value::Null),
-                p("kimi", "Kimi (Moonshot)", Some("https://api.moonshot.cn/v1"), serde_json::Value::Null),
-                p("deepseek", "DeepSeek", Some("https://api.deepseek.com"), serde_json::Value::Null),
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::Value::Null,
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com"),
+                    serde_json::Value::Null,
+                ),
             ]);
         }
     }
@@ -98,9 +183,20 @@ fn load_custom_presets() -> Option<Vec<Preset>> {
     for item in raw {
         let id = item.get("id")?.as_str()?.to_string();
         let label = item.get("label")?.as_str()?.to_string();
-        let base_url = item.get("base_url").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let extra = item.get("extra").cloned().unwrap_or(serde_json::Value::Null);
-        out.push(Preset { id, label, base_url, extra });
+        let base_url = item
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let extra = item
+            .get("extra")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        out.push(Preset {
+            id,
+            label,
+            base_url,
+            extra,
+        });
     }
     Some(out)
 }
@@ -110,10 +206,11 @@ fn load_custom_presets() -> Option<Vec<Preset>> {
 fn local_proxy_base_url(tool: ToolKind) -> &'static str {
     match tool {
         ToolKind::ClaudeCode => "http://127.0.0.1:24860",
-        ToolKind::Codex | ToolKind::OpenCode | ToolKind::Pi | ToolKind::OhMyPi
-        | ToolKind::Aider => {
-            "http://127.0.0.1:24860/v1"
-        }
+        ToolKind::Codex
+        | ToolKind::OpenCode
+        | ToolKind::Pi
+        | ToolKind::OhMyPi
+        | ToolKind::Aider => "http://127.0.0.1:24860/v1",
     }
 }
 

@@ -4,9 +4,9 @@ mod dto;
 mod state;
 mod tray;
 
-use xfade_core::Core;
 use state::AppState;
 use tauri_plugin_autostart::MacosLauncher;
+use xfade_core::Core;
 
 fn build_core() -> Result<Core, String> {
     Core::from_env().map_err(|e| e.to_string())
