@@ -20,9 +20,11 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        # --exclude xfade-gui: the Tauri GUI needs GTK/WebKit system libs only present
+        # in its macOS build job (release.yml), not on a bare ubuntu runner.
+        run: cargo clippy --all-targets --workspace --exclude xfade-gui -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude xfade-gui
 
   frontend:
     runs-on: ubuntu-22.04
