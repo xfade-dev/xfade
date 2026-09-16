@@ -6,6 +6,7 @@ use xfade_core::store::db::StatsGroupBy;
 use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
 
 mod daemon;
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -112,6 +113,11 @@ enum Cmd {
     },
     /// Update xfade to the latest GitHub release
     SelfUpdate,
+    /// Interactive TUI for switching providers
+    Tui {
+        #[arg(long)]
+        tool: Option<ToolKind>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -588,7 +594,25 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             Ok(())
         }
         Cmd::SelfUpdate => self_update(),
+        Cmd::Tui { tool } => {
+            let core = build_core()?;
+            let tool = match tool {
+                Some(t) => t,
+                None => resolve_tui_tool(&core)?,
+            };
+            tui::run_tui(&core, tool)
+        }
     }
+}
+
+/// Choose a default tool for the TUI: the first tool that has providers, else claude.
+fn resolve_tui_tool(core: &Core) -> Result<ToolKind, CoreError> {
+    for t in ToolKind::ALL {
+        if !core.list(Some(t))?.is_empty() {
+            return Ok(t);
+        }
+    }
+    Ok(ToolKind::ClaudeCode)
 }
 
 /// Build the host target triple matching the release asset names.
