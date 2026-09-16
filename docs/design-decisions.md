@@ -6,7 +6,7 @@ This file records the key architecture decisions and their rationale, extracted 
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Conversion direction | Anthropic→OpenAI one-way | Reverse (OpenAI→Anthropic) deferred to a later version |
+| Conversion direction | Bidirectional (Anthropic↔OpenAI) | Request-side Anthropic→OpenAI + response-side OpenAI→Anthropic (streaming + non-stream) |
 | Upstream OpenAI protocol | `chat/completions` | Most universal among OpenAI-compatible providers |
 | tool_use streaming | Aggregate-then-rechunk | Aggregate split `arguments` fragments by index, then emit the full JSON as one `input_json_delta`; reliable, and Anthropic SDKs accept a full JSON string |
 | thinking/reasoning blocks | Dropped | Not converted |
@@ -42,7 +42,6 @@ This file records the key architecture decisions and their rationale, extracted 
 
 ## Explicit non-goals (deferred / boundaries)
 
-- OpenAI→Anthropic reverse conversion (future version).
 - True incremental tool_use streaming (aggregate-then-rechunk is sufficient for agentic use).
 - thinking/reasoning block conversion (dropped).
 - Multimodal image optimization (data URI passthrough only).
