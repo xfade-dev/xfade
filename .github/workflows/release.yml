@@ -17,6 +17,8 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
@@ -24,23 +26,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux dependencies (dbus for keyring)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: build
-        run: cargo build --release -p xfade
+        run: cargo build --release -p xfade --target ${{ matrix.target }}
       - name: package
         shell: bash
         run: |
           set -e
           mkdir -p dist
-          BIN=target/release/xfade
-          if [ "$RUNNER_OS" = "Windows" ]; then BIN=target/release/xfade.exe; fi
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          BIN="$RELEASE_DIR/xfade"
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="$RELEASE_DIR/xfade.exe"; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "dist/xfade-${{ matrix.target }}.zip" "$BIN"
           else
-            tar czf "dist/xfade-${{ matrix.target }}.tar.gz" -C target/release xfade
+            tar czf "dist/xfade-${{ matrix.target }}.tar.gz" -C "$RELEASE_DIR" xfade
           fi
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then

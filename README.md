@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Switch API providers between AI coding tools like Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, with a local proxy (OpenAI/Anthropic-compatible endpoints, failover, protocol conversion) and a macOS resident daemon.
+Switch API providers between AI coding tools like Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, with a local proxy (OpenAI/Anthropic-compatible endpoints, failover, protocol conversion) and a macOS/Linux resident daemon.
 
 CLI (`xfade`) + Tauri GUI, implemented in Rust.
 
@@ -11,7 +11,7 @@ CLI (`xfade`) + Tauri GUI, implemented in Rust.
 - **Provider switching**: add/remove/edit providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, one-command switch writes each tool's config (settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml), stores keys in the system keyring, auto-backs-up before switching.
 - **Local proxy**: `xfade serve` exposes OpenAI/Anthropic-compatible endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`) with route failover, circuit breaking, token stats, and request logs.
 - **Protocol conversion**: bidirectional Anthropic↔OpenAI conversion (`target_protocol`), decoupling clients from the upstream protocol.
-- **daemon (macOS)**: launchd-resident + boot autostart + crash restart; `/__xfade/status` admin endpoint.
+- **daemon (macOS + Linux)**: launchd/systemd-resident + boot autostart + crash restart; `/__xfade/status` admin endpoint.
 - **GUI**: Tauri desktop app, five pages (Providers / Proxy / Stats / Logs / Settings) + system tray (close-to-tray, quick switch, start/stop proxy); `xfade` self-installs the daemon as a sidecar.
 
 ## Installation
@@ -75,7 +75,7 @@ xfade proxy clear
 xfade stats                  # aggregate by provider/model
 ```
 
-### daemon (macOS)
+### daemon (macOS + Linux)
 
 ```bash
 xfade serve install [--port --host --auth-token]   # install as launchd-resident + boot autostart

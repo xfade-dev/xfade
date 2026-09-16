@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-在 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 等 AI 编码工具之间切换 API provider，并提供本地代理（OpenAI/Anthropic 兼容端点、failover、协议互转）与 macOS 常驻 daemon。
+在 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 等 AI 编码工具之间切换 API provider，并提供本地代理（OpenAI/Anthropic 兼容端点、failover、协议互转）与 macOS/Linux 常驻 daemon。
 
 CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 
@@ -11,7 +11,7 @@ CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 - **Provider 切换**：为 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 增删改查 provider，一键切换写各自配置（settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml），系统钥匙串存 key，切换前自动备份。
 - **本地代理**：`xfade serve` 起 OpenAI/Anthropic 兼容端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/models`），支持路由 failover、熔断、token 统计、请求日志。
 - **协议互转**：Anthropic↔OpenAI 双向转换（`target_protocol`），让客户端与上游协议解耦。
-- **daemon（macOS）**：launchd 常驻 + 开机自启 + 崩溃重启；`/__xfade/status` 管理端点。
+- **daemon（macOS + Linux）**：launchd/systemd 常驻 + 开机自启 + 崩溃重启；`/__xfade/status` 管理端点。
 - **GUI**：Tauri 桌面 app，五页（Providers / Proxy / Stats / Logs / Settings）+ 系统托盘（关窗到托盘、快速切换、启停代理），`xfade` 作为 sidecar 自装 daemon。
 
 ## 安装
@@ -75,7 +75,7 @@ xfade proxy clear
 xfade stats                  # 按 provider/model 聚合
 ```
 
-### daemon（macOS）
+### daemon（macOS + Linux）
 
 ```bash
 xfade serve install [--port --host --auth-token]   # 安装 launchd 常驻 + 开机自启
