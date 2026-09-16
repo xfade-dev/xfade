@@ -52,8 +52,14 @@ curl -fsSL "$url" -o "$tmpdir/xfade.tar.gz"
 tar xzf "$tmpdir/xfade.tar.gz" -C "$tmpdir"
 
 # --- install ---------------------------------------------------------------
-mkdir -p "$INSTALL_DIR"
-install -m 0755 "$tmpdir/$BIN" "$INSTALL_DIR/$BIN"
+# Prefer $INSTALL_DIR; if it isn't writable, fall back to /usr/local/bin (sudo).
+if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
+  install -m 0755 "$tmpdir/$BIN" "$INSTALL_DIR/$BIN"
+else
+  echo "xfade: $INSTALL_DIR is not writable; falling back to /usr/local/bin (may prompt for sudo)"
+  sudo install -m 0755 "$tmpdir/$BIN" "/usr/local/bin/$BIN"
+  INSTALL_DIR="/usr/local/bin"
+fi
 
 echo "xfade: installed -> $INSTALL_DIR/$BIN"
 
