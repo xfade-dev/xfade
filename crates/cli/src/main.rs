@@ -110,6 +110,8 @@ enum Cmd {
         #[arg(long, value_parser = ["provider", "model"])]
         by: Option<String>,
     },
+    /// Update xfade to the latest GitHub release
+    SelfUpdate,
 }
 
 #[derive(Subcommand)]
@@ -585,7 +587,103 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
+        Cmd::SelfUpdate => self_update(),
     }
+}
+
+/// Build the host target triple matching the release asset names.
+fn host_target() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{}-{os}", std::env::consts::ARCH)
+}
+
+/// Update xfade to the latest GitHub release: query the latest tag, download the
+/// matching platform asset, extract it with system `tar`, and swap the running binary.
+fn self_update() -> Result<(), CoreError> {
+    let target = host_target();
+    let asset = format!("xfade-{target}.tar.gz");
+    let current = env!("CARGO_PKG_VERSION");
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .get("https://api.github.com/repos/xfade-dev/xfade/releases/latest")
+            .header("User-Agent", "xfade-self-update")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| CoreError::Proxy(format!("query latest release: {e}")))?
+            .json()
+            .await
+            .map_err(|e| CoreError::Proxy(format!("parse release: {e}")))?;
+
+        if let Some(msg) = resp.get("message").and_then(|m| m.as_str()) {
+            return Err(CoreError::Proxy(format!("GitHub API: {msg}")));
+        }
+        let tag = resp
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim_start_matches('v');
+        if tag == current {
+            println!("xfade {current} is already the latest version");
+            return Ok(());
+        }
+
+        let url = resp
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(asset.as_str()))
+            })
+            .and_then(|a| a.get("browser_download_url").and_then(|u| u.as_str()))
+            .ok_or_else(|| CoreError::Proxy(format!("no asset '{asset}' in release {tag}")))?
+            .to_string();
+
+        println!("xfade: updating {current} -> {tag} ({asset})");
+        let bytes = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CoreError::Proxy(format!("download: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| CoreError::Proxy(format!("download: {e}")))?;
+
+        let tmp = std::env::temp_dir().join(format!("xfade-update-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp)?;
+        let tarball = tmp.join("xfade.tar.gz");
+        std::fs::write(&tarball, &bytes)?;
+        let out = std::process::Command::new("tar")
+            .args([
+                "-xzf",
+                tarball.to_str().unwrap_or(""),
+                "-C",
+                tmp.to_str().unwrap_or(""),
+            ])
+            .status()
+            .map_err(|e| CoreError::Proxy(format!("run tar: {e}")))?;
+        if !out.success() {
+            return Err(CoreError::Proxy("tar extraction failed".into()));
+        }
+
+        let new_bin = tmp.join("xfade");
+        let current_exe =
+            std::env::current_exe().map_err(|e| CoreError::Proxy(format!("current_exe: {e}")))?;
+        std::fs::copy(&new_bin, &current_exe).map_err(|e| {
+            CoreError::Proxy(format!("replace binary ({}): {e}", current_exe.display()))
+        })?;
+        println!("xfade: updated to {tag}");
+        Ok(())
+    })
 }
 
 /// Parse `<N>d` into an RFC3339 timestamp prefix (now - N days).
