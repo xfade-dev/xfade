@@ -142,6 +142,8 @@ pub fn write_systemd_unit(exe: &str, cfg: &DaemonConfig) -> Result<PathBuf> {
 
 /// macOS: `launchctl load` the existing plist. Errors if the plist is missing (hinting to run `xfade serve install` first).
 pub fn load(home: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
     #[cfg(target_os = "macos")]
     {
         let p = plist_path(home);
@@ -179,6 +181,8 @@ pub fn load(home: &Path) -> Result<()> {
 
 /// Unload the daemon.
 pub fn unload(home: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
     #[cfg(target_os = "macos")]
     {
         let p = plist_path(home);
