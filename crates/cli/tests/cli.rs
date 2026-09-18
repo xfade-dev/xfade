@@ -7,7 +7,7 @@ fn xfade(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("xfade").unwrap();
     cmd.env("HOME", home)
         .env("XFADE_DATA_DIR", home.join(".xfade-data"))
-        .env("XFADE_MOCK_SECRETS", "1");
+        .env("XFADE_SECRETS", "file");
     cmd
 }
 

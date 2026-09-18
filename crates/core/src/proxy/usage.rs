@@ -46,11 +46,9 @@ impl Usage {
     /// take the last seen value — which `take_last` semantics provide by
     /// always overwriting when a value is present.
     ///
-    /// The `endpoint` argument is accepted for future per-endpoint shaping but
-    /// the parsing rules above cover both OpenAI (`chat`/`responses`) and
-    /// Anthropic (`messages`) streams.
-    pub fn from_sse_tail(endpoint: &str, tail: &[u8]) -> Self {
-        let _ = endpoint;
+    /// The rules above cover OpenAI (`chat`/`responses`) and Anthropic
+    /// (`messages`) streams.
+    pub fn from_sse_tail(tail: &[u8]) -> Self {
         let text = String::from_utf8_lossy(tail);
         let mut prompt: Option<i64> = None;
         let mut completion: Option<i64> = None;
@@ -77,6 +75,7 @@ impl Usage {
                 .get("usage")
                 .cloned()
                 .or_else(|| v.get("message").and_then(|m| m.get("usage")).cloned())
+                .or_else(|| v.get("response").and_then(|m| m.get("usage")).cloned())
                 .unwrap_or(Value::Null);
             if usage.is_null() {
                 continue;
@@ -114,7 +113,7 @@ mod tests {
         let tail = b"data: {\"choices\":[{\"delta\":{\"content\":\"o\"}}]}\n\n\
 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1}}\n\n\
 data: [DONE]\n\n";
-        let u = Usage::from_sse_tail("chat", tail);
+        let u = Usage::from_sse_tail(tail);
         assert_eq!(u.prompt_tokens, 7);
         assert_eq!(u.completion_tokens, 1);
     }
@@ -125,7 +124,7 @@ data: [DONE]\n\n";
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
-        let u = Usage::from_sse_tail("messages", tail);
+        let u = Usage::from_sse_tail(tail);
         assert_eq!(u.prompt_tokens, 12);
         // last seen cumulative output_tokens wins
         assert_eq!(u.completion_tokens, 5);
@@ -134,7 +133,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     #[test]
     fn from_sse_tail_no_usage_returns_zero() {
         let tail = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
-        let u = Usage::from_sse_tail("chat", tail);
+        let u = Usage::from_sse_tail(tail);
         assert_eq!(u.prompt_tokens, 0);
         assert_eq!(u.completion_tokens, 0);
     }

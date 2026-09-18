@@ -14,12 +14,9 @@ pub struct CircuitDto {
 /// `Circuit` → `CircuitDto`: convert `cooldown_until_secs` into remaining cooldown seconds.
 /// Shared by core and GUI to avoid duplicating the logic.
 pub fn circuit_to_dto(provider_id: &str, c: &Circuit) -> CircuitDto {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let cooldown_remaining_secs = if c.cooldown_until_secs > 0 && now_secs < c.cooldown_until_secs {
-        Some((c.cooldown_until_secs - now_secs) as u64)
+    let now = super::now_secs();
+    let cooldown_remaining_secs = if c.is_open(now) {
+        Some((c.cooldown_until_secs - now) as u64)
     } else {
         None
     };
