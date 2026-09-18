@@ -10,4 +10,3 @@ docs/superpowers/
 # GUI sidecar build artifact (built by build-sidecar.sh)
 crates/gui/src-tauri/binaries/
 
-test.md
