@@ -1,4 +1,4 @@
-use super::{atomic_write, ToolAdapter};
+use super::{atomic_write, client_base_url, ToolAdapter};
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
 use serde_json::{json, Value};
@@ -107,6 +107,9 @@ impl ToolAdapter for OpenCodeAdapter {
                 .get("models")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // The openai-compatible SDK appends /chat/completions to baseURL,
+            // so a bare host must carry the /v1 suffix.
+            let base_url = client_base_url(base_url, "openai-completions");
             providers.insert(
                 id.clone(),
                 json!({
@@ -247,7 +250,7 @@ mod tests {
         let p = Provider::new("kimi", ToolKind::OpenCode, Some("https://x".into()));
         ad.apply(&p, Some("sk-9")).unwrap();
         let (got, key) = ad.read_current().unwrap().unwrap();
-        assert_eq!(got.base_url.as_deref(), Some("https://x"));
+        assert_eq!(got.base_url.as_deref(), Some("https://x/v1"));
         assert_eq!(key.as_deref(), Some("sk-9"));
     }
 }

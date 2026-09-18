@@ -1,4 +1,6 @@
-use super::{capture_default_provider, load_json_or_empty, save_json_pretty, ToolAdapter};
+use super::{
+    capture_default_provider, client_base_url, load_json_or_empty, save_json_pretty, ToolAdapter,
+};
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
 use serde_json::json;
@@ -90,12 +92,13 @@ impl ToolAdapter for PiAdapter {
             let base_url = provider
                 .base_url
                 .as_deref()
-                .unwrap_or("http://127.0.0.1:9413");
+                .unwrap_or("http://127.0.0.1:24860");
             let api_type = provider
                 .extra
                 .get("api")
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai-completions");
+            let base_url = client_base_url(base_url, api_type);
             providers.insert(
                 "xfade".to_string(),
                 json!({
@@ -224,6 +227,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_anthropic_messages_strips_v1_suffix() {
+        // Pi's Anthropic SDK appends /v1/messages itself, so the written
+        // baseUrl must not end with /v1 (would request /v1/v1/messages → 404).
+        let (dir, ad) = setup();
+        write_initial(&dir);
+        let mut p = Provider::new(
+            "xfade",
+            ToolKind::Pi,
+            Some("http://127.0.0.1:24860/v1".into()),
+        );
+        p.extra = json!({"model": "m", "api": "anthropic-messages"});
+        ad.apply(&p, Some("k")).unwrap();
+
+        let models = read_models(&dir);
+        assert_eq!(
+            models["providers"]["xfade"]["baseUrl"],
+            "http://127.0.0.1:24860"
+        );
+        assert_eq!(models["providers"]["xfade"]["api"], "anthropic-messages");
+    }
+
+    #[test]
     fn read_current_returns_xfade_entry() {
         let (_dir, ad) = setup();
         let mut p = Provider::new("xfade", ToolKind::Pi, Some("http://x".into()));
@@ -231,7 +256,7 @@ mod tests {
         ad.apply(&p, Some("sk-9")).unwrap();
 
         let (got, key) = ad.read_current().unwrap().unwrap();
-        assert_eq!(got.base_url.as_deref(), Some("http://x"));
+        assert_eq!(got.base_url.as_deref(), Some("http://x/v1"));
         assert_eq!(key.as_deref(), Some("sk-9"));
     }
 

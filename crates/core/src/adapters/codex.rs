@@ -1,7 +1,7 @@
-use super::{atomic_write, ToolAdapter};
+use super::{atomic_write, client_base_url, ToolAdapter};
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 pub struct CodexAdapter {
@@ -68,6 +68,31 @@ impl ToolAdapter for CodexAdapter {
 
         if provider.is_official() {
             root.remove("model_provider");
+            // Restore the original top-level `model`/`model_context_window` if
+            // xfade captured them on the first third-party switch; otherwise
+            // drop the keys xfade wrote (Codex would send the third-party
+            // model / window to the official API).
+            if let Some(original) = provider
+                .extra
+                .get("_original_model")
+                .and_then(|v| v.as_str())
+            {
+                root.insert("model".into(), toml::Value::String(original.to_string()));
+            } else {
+                root.remove("model");
+            }
+            if let Some(original) = provider
+                .extra
+                .get("_original_context_window")
+                .and_then(|v| v.as_i64())
+            {
+                root.insert(
+                    "model_context_window".into(),
+                    toml::Value::Integer(original),
+                );
+            } else {
+                root.remove("model_context_window");
+            }
         } else {
             let id = &provider.id;
             let url = provider
@@ -77,11 +102,29 @@ impl ToolAdapter for CodexAdapter {
                     path: "provider".into(),
                     msg: format!("third-party provider '{id}' is missing base_url"),
                 })?;
+            // Codex appends /responses (or /chat/completions) to base_url;
+            // a bare host must carry the /v1 suffix.
             let wire_api = provider
                 .extra
                 .get("wire_api")
                 .and_then(|v| v.as_str())
                 .unwrap_or("responses"); // newer Codex has deprecated wire_api = "chat"
+            let url = client_base_url(url, "openai-completions");
+
+            // Default model: without a top-level `model`, Codex uses its own
+            // default (gpt-6-astra) instead of the provider's model.
+            if let Some(model) = provider.extra.get("model").and_then(|m| m.as_str()) {
+                root.insert("model".into(), toml::Value::String(model.to_string()));
+            }
+            // Optional real context window; Codex otherwise assumes its
+            // 272k fallback for unknown models, mistiming auto-compact.
+            if let Some(cw) = provider
+                .extra
+                .get("context_window")
+                .and_then(|v| v.as_i64())
+            {
+                root.insert("model_context_window".into(), toml::Value::Integer(cw));
+            }
 
             // Note: don't write env_key. Codex forces a provider with env_key to read the key
             // from that env var (ignoring auth.json entirely); omitting env_key falls back to
@@ -154,12 +197,46 @@ impl ToolAdapter for CodexAdapter {
             let w = if w == "chat" { "responses" } else { w };
             p.extra = json!({ "wire_api": w });
         }
+        if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) {
+            match p.extra.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("model".into(), json!(m));
+                }
+                None => p.extra = json!({ "model": m }),
+            }
+        }
+        if let Some(cw) = cfg.get("model_context_window").and_then(|v| v.as_integer()) {
+            match p.extra.as_object_mut() {
+                Some(obj) => {
+                    obj.insert("context_window".into(), json!(cw));
+                }
+                None => p.extra = json!({ "context_window": cw }),
+            }
+        }
         let auth = self.load_auth()?;
         let key = auth
             .get("OPENAI_API_KEY")
             .and_then(|v| v.as_str())
             .map(String::from);
         Ok(Some((p, key)))
+    }
+
+    /// Capture the original top-level `model`/`model_context_window` (if any)
+    /// as the restore target when switching back to official.
+    fn capture_original_state(&self) -> Result<Option<serde_json::Value>> {
+        let cfg = self.load_toml()?;
+        let mut out = Map::new();
+        if let Some(m) = cfg.get("model").and_then(|v| v.as_str()) {
+            out.insert("_original_model".to_string(), json!(m));
+        }
+        if let Some(cw) = cfg.get("model_context_window").and_then(|v| v.as_integer()) {
+            out.insert("_original_context_window".to_string(), json!(cw));
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Value::Object(out)))
+        }
     }
 }
 
@@ -295,6 +372,73 @@ mod tests {
     }
 
     #[test]
+    fn apply_writes_top_level_model() {
+        // Regression: without a top-level `model`, interactive Codex falls
+        // back to its default model (e.g. gpt-6-astra) and third-party
+        // gateways reject the request.
+        let (dir, ad) = setup();
+        let mut p = Provider::new("yy", ToolKind::Codex, Some("https://x".into()));
+        p.extra = json!({"model": "glm-5-2-260617"});
+        ad.apply(&p, Some("k")).unwrap();
+        let cfg = read_config(&dir);
+        assert_eq!(cfg["model"].as_str().unwrap(), "glm-5-2-260617");
+    }
+
+    #[test]
+    fn official_restores_or_removes_model() {
+        let (dir, ad) = setup();
+        let mut p = Provider::new("yy", ToolKind::Codex, Some("https://x".into()));
+        p.extra = json!({"model": "glm-5-2-260617"});
+        ad.apply(&p, Some("k")).unwrap();
+
+        // No captured original → model key is dropped on official switch.
+        let official = Provider::new("official", ToolKind::Codex, None);
+        ad.apply(&official, None).unwrap();
+        let cfg = read_config(&dir);
+        assert!(cfg.get("model").is_none());
+
+        // Captured original → restored (service::patch_original_capture puts
+        // the captured state on the official provider's extra).
+        let mut p2 = Provider::new("yy", ToolKind::Codex, Some("https://x".into()));
+        p2.extra = json!({"model": "glm-5-2-260617"});
+        ad.apply(&p2, Some("k")).unwrap();
+        let mut official2 = Provider::new("official", ToolKind::Codex, None);
+        official2.extra = json!({"_original_model": "gpt-5-codex"});
+        ad.apply(&official2, None).unwrap();
+        let cfg = read_config(&dir);
+        assert_eq!(cfg["model"].as_str().unwrap(), "gpt-5-codex");
+    }
+
+    #[test]
+    fn capture_original_state_reads_model() {
+        let (dir, ad) = setup();
+        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/config.toml"),
+            "model = \"gpt-5-codex\"\n",
+        )
+        .unwrap();
+        let captured = ad.capture_original_state().unwrap().unwrap();
+        assert_eq!(captured["_original_model"], "gpt-5-codex");
+    }
+
+    #[test]
+    fn apply_writes_context_window_when_provided() {
+        let (dir, ad) = setup();
+        let mut p = Provider::new("yy", ToolKind::Codex, Some("https://x".into()));
+        p.extra = json!({"model": "m1", "context_window": 131072});
+        ad.apply(&p, Some("k")).unwrap();
+        let cfg = read_config(&dir);
+        assert_eq!(cfg["model_context_window"].as_integer().unwrap(), 131072);
+
+        // official switch drops it (no captured original)
+        ad.apply(&Provider::new("official", ToolKind::Codex, None), None)
+            .unwrap();
+        let cfg = read_config(&dir);
+        assert!(cfg.get("model_context_window").is_none());
+    }
+
+    #[test]
     fn wire_api_from_extra() {
         let (dir, ad) = setup();
         let mut p = Provider::new("oa", ToolKind::Codex, Some("https://x".into()));
@@ -320,7 +464,7 @@ mod tests {
         ad.apply(&p, Some("sk-9")).unwrap();
         let (got, key) = ad.read_current().unwrap().unwrap();
         assert_eq!(got.id, "imported");
-        assert_eq!(got.base_url.as_deref(), Some("https://x"));
+        assert_eq!(got.base_url.as_deref(), Some("https://x/v1"));
         assert_eq!(key.as_deref(), Some("sk-9"));
     }
 

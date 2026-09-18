@@ -1,5 +1,6 @@
 use super::{
-    atomic_write, capture_default_provider, load_json_or_empty, save_json_pretty, ToolAdapter,
+    atomic_write, capture_default_provider, client_base_url, load_json_or_empty, save_json_pretty,
+    ToolAdapter,
 };
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
@@ -59,11 +60,7 @@ impl OmpAdapter {
                 msg: format!("YAML parse error: {e}"),
             })?;
         // Convert serde_yaml::Value → serde_json::Value
-        let json_str = serde_json::to_string(&yaml_val).map_err(|e| CoreError::ConfigParse {
-            path: self.models_path().display().to_string(),
-            msg: e.to_string(),
-        })?;
-        let v: Value = serde_json::from_str(&json_str).map_err(|e| CoreError::ConfigParse {
+        let v: Value = serde_json::to_value(&yaml_val).map_err(|e| CoreError::ConfigParse {
             path: self.models_path().display().to_string(),
             msg: e.to_string(),
         })?;
@@ -137,7 +134,7 @@ impl ToolAdapter for OmpAdapter {
             let base_url = provider
                 .base_url
                 .as_deref()
-                .unwrap_or("http://127.0.0.1:9413");
+                .unwrap_or("http://127.0.0.1:24860");
             let model_id = provider
                 .extra
                 .get("model")
@@ -148,6 +145,7 @@ impl ToolAdapter for OmpAdapter {
                 .get("api")
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai-completions");
+            let base_url = client_base_url(base_url, api_type);
             providers.insert(
                 "xfade".to_string(),
                 json!({
@@ -274,7 +272,7 @@ mod tests {
         ad.apply(&p, Some("sk-9")).unwrap();
 
         let (got, key) = ad.read_current().unwrap().unwrap();
-        assert_eq!(got.base_url.as_deref(), Some("http://x"));
+        assert_eq!(got.base_url.as_deref(), Some("http://x/v1"));
         assert_eq!(key.as_deref(), Some("sk-9"));
     }
 

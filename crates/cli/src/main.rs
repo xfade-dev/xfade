@@ -314,37 +314,22 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     Ok(())
                 }
                 Some(ConfigCmd::Set { key, value }) => {
+                    let core = build_core()?;
                     match key.as_str() {
                         "secrets" => {
-                            let dir = data_dir()?;
-                            let mut cfg = Config::load(&dir);
-                            cfg.secrets =
-                                value.parse().map_err(|e: String| CoreError::ConfigParse {
-                                    path: key.clone(),
-                                    msg: e,
-                                })?;
-                            cfg.save(&dir)?;
+                            core.update_config(Some(&value), None, None, None)?;
                         }
                         "base_url" => {
-                            let dir = data_dir()?;
-                            let mut cfg = Config::load(&dir);
-                            cfg.base_url = Some(value.clone());
-                            cfg.save(&dir)?;
+                            core.update_config(None, Some(&value), None, None)?;
                         }
                         "model" => {
-                            let dir = data_dir()?;
-                            let mut cfg = Config::load(&dir);
-                            cfg.model = Some(value.clone());
-                            cfg.save(&dir)?;
+                            core.update_config(None, None, Some(&value), None)?;
                         }
                         "api" => {
-                            let dir = data_dir()?;
-                            let mut cfg = Config::load(&dir);
-                            cfg.api = Some(value.clone());
-                            cfg.save(&dir)?;
+                            core.update_config(None, None, None, Some(&value))?;
                         }
                         "api_key" => {
-                            build_core()?.set_global_api_key(&value)?;
+                            core.set_global_api_key(&value)?;
                         }
                         other => {
                             return Err(CoreError::ConfigParse {

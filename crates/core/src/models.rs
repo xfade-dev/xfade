@@ -11,16 +11,18 @@ pub enum ToolKind {
     Pi,
     OhMyPi,
     Aider,
+    Cline,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 6] = [
+    pub const ALL: [ToolKind; 7] = [
         ToolKind::ClaudeCode,
         ToolKind::Codex,
         ToolKind::OpenCode,
         ToolKind::Pi,
         ToolKind::OhMyPi,
         ToolKind::Aider,
+        ToolKind::Cline,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -31,6 +33,7 @@ impl ToolKind {
             ToolKind::Pi => "pi",
             ToolKind::OhMyPi => "omp",
             ToolKind::Aider => "aider",
+            ToolKind::Cline => "cline",
         }
     }
 }
@@ -51,8 +54,9 @@ impl FromStr for ToolKind {
             "pi" => Ok(ToolKind::Pi),
             "omp" | "oh-my-pi" | "ohmy" => Ok(ToolKind::OhMyPi),
             "aider" => Ok(ToolKind::Aider),
+            "cline" => Ok(ToolKind::Cline),
             _ => Err(format!(
-                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider)"
+                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider|cline)"
             )),
         }
     }

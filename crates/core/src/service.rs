@@ -8,17 +8,14 @@ use crate::store::secrets::{FileStore, KeyringStore, SecretStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Resolve the secrets backend: env vars override the global config file, which
-/// overrides the default (keyring).
+/// Resolve the secrets backend: the env var overrides the global config file,
+/// which overrides the default (keyring).
 fn resolve_secrets_backend(data_dir: &Path) -> Result<SecretsBackend> {
     if let Ok(v) = std::env::var("XFADE_SECRETS") {
         return v.parse().map_err(|e: String| CoreError::ConfigParse {
             path: "XFADE_SECRETS".into(),
             msg: e,
         });
-    }
-    if std::env::var("XFADE_MOCK_SECRETS").ok().as_deref() == Some("1") {
-        return Ok(SecretsBackend::File);
     }
     Ok(Config::load(data_dir).secrets)
 }
@@ -124,9 +121,8 @@ impl Core {
     /// - `XFADE_DATA_DIR`: self data dir, defaults to `$HOME/.config/xfade`.
     /// - Secret backend resolution (highest to lowest priority):
     ///   1. `XFADE_SECRETS` env (`file` | `keyring`),
-    ///   2. `XFADE_MOCK_SECRETS=1` (alias for `file`, tests/back-compat),
-    ///   3. `<data_dir>/config.json` `secrets` field (see `xfade config`),
-    ///   4. default: system keyring.
+    ///   2. `<data_dir>/config.json` `secrets` field (see `xfade config`),
+    ///   3. default: system keyring.
     pub fn from_env() -> Result<Self> {
         let home = std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
         let home = Path::new(&home);
@@ -286,56 +282,56 @@ impl Core {
         Ok(p)
     }
 
-    /// Populate the `_original_default_provider` field before `apply`, so OMP/Pi can
-    /// restore the original `defaultProvider` value in `settings.json` when switching
-    /// back to official.
+    /// Populate the `_original_*` fields before `apply`, so adapters can restore
+    /// the original config when switching back to official (OMP/Pi:
+    /// `_original_default_provider`; Codex: `_original_model` /
+    /// `_original_context_window`; Cline: `_original_last_used_provider`).
     ///
     /// Flow:
-    /// - **Switch to third-party**: if `p.extra` has no `_original_default_provider`,
-    ///   inherit from the current active third-party provider first (so a rapid A→B
-    ///   switch doesn't lose the earliest original value); if none is inherited, call
-    ///   `adapter.capture_original_state()` to read `settings.json` now. Once obtained,
-    ///   write it into `p.extra` and `upsert` to persist it, so a later switch to
-    ///   official can read it.
-    /// - **Switch to official**: if `p.extra` has no `_original_default_provider`, read
-    ///   it from the current active third-party provider (not persisted; used immediately).
+    /// - **Switch to third-party**: for every `_original_*` key missing from
+    ///   `p.extra`, inherit it from the current active third-party provider first
+    ///   (so a rapid A→B switch doesn't lose the earliest original value); if
+    ///   still missing, call `adapter.capture_original_state()` to read the live
+    ///   config now. Once obtained, write into `p.extra` and `upsert` to persist,
+    ///   so a later switch to official can read it.
+    /// - **Switch to official**: inherit every `_original_*` key from the current
+    ///   active third-party provider (not persisted; used immediately).
     ///
-    /// For claude_code/codex/opencode: `capture_original_state` returns `None` by default
-    /// and the active provider never carries this field, so both branches are no-ops.
+    /// For claude_code/opencode: `capture_original_state` returns `None` by
+    /// default and the active provider never carries these fields, so both
+    /// branches are no-ops.
     fn patch_original_capture(&self, tool: ToolKind, mut p: Provider) -> Result<Provider> {
-        const KEY: &str = "_original_default_provider";
-        if p.extra.get(KEY).is_some() {
-            return Ok(p); // already has the original value, don't overwrite
-        }
-
         if !p.is_official() {
-            // Switch to third-party: prefer inheriting the value saved on the
-            // current active third-party provider.
-            let from_active = self
+            // Switch to third-party: inherit from the current active
+            // third-party provider first, then from the live config.
+            let mut captured = self
                 .current(tool)?
                 .filter(|c| !c.is_official())
-                .and_then(|c| c.extra.get(KEY).cloned());
-            let captured = match from_active {
-                Some(v) => Some(v),
-                None => self
+                .and_then(|c| original_state_keys(&c.extra))
+                .unwrap_or_default();
+            if captured.is_empty() {
+                captured = self
                     .adapter(tool)
                     .capture_original_state()?
-                    .and_then(|v| v.get(KEY).cloned()),
-            };
-            if let Some(orig) = captured {
+                    .and_then(|v| original_state_keys(&v))
+                    .unwrap_or_default();
+            }
+            if !captured.is_empty() {
                 let mut extra = p.extra.as_object().cloned().unwrap_or_default();
-                extra.insert(KEY.to_string(), orig);
+                let changed = merge_missing(&mut extra, &captured);
                 p.extra = serde_json::Value::Object(extra);
-                self.db.upsert(&p)?; // persist so a later switch to official can read it
+                if changed {
+                    self.db.upsert(&p)?; // persist so a later switch to official can read it
+                }
             }
         } else {
-            // Switch to official: read the original value from the current active
-            // third-party provider (not persisted; used immediately).
+            // Switch to official: read the original values from the current
+            // active third-party provider (not persisted; used immediately).
             if let Some(cur) = self.current(tool)? {
                 if !cur.is_official() {
-                    if let Some(orig) = cur.extra.get(KEY).cloned() {
+                    if let Some(orig) = original_state_keys(&cur.extra) {
                         let mut extra = p.extra.as_object().cloned().unwrap_or_default();
-                        extra.insert(KEY.to_string(), orig);
+                        merge_missing(&mut extra, &orig);
                         p.extra = serde_json::Value::Object(extra);
                     }
                 }
@@ -409,6 +405,40 @@ impl Core {
             })?;
         restore(backup, &target)
     }
+}
+
+/// Extract every `_original_*` key from a provider's `extra` (or a
+/// `capture_original_state` payload). Returns None when there are none.
+fn original_state_keys(
+    extra: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let obj = extra.as_object()?;
+    let out: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(k, _)| k.starts_with("_original_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Merge `src` entries into `dst` for keys `dst` doesn't already have.
+/// Returns whether anything was added.
+fn merge_missing(
+    dst: &mut serde_json::Map<String, serde_json::Value>,
+    src: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut changed = false;
+    for (k, v) in src {
+        if !dst.contains_key(k) {
+            dst.insert(k.clone(), v.clone());
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -700,6 +730,74 @@ mod tests {
             "claude_code must not get _original_default_provider written"
         );
         let _ = dir;
+    }
+
+    #[test]
+    fn codex_original_model_restored_through_service_layer() {
+        // Regression: patch_original_capture used to only recognize
+        // _original_default_provider, so Codex's _original_model capture was
+        // silently dropped and switching back to official deleted the user's
+        // top-level `model` instead of restoring it.
+        let (dir, core) = setup();
+        let codex_dir = dir.path().join("home/.codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(codex_dir.join("config.toml"), "model = \"gpt-5-codex\"\n").unwrap();
+
+        let mut p = Provider::new("glm", ToolKind::Codex, Some("https://x/v1".into()));
+        p.extra = json!({"model": "glm-5-2-260617"});
+        core.add_provider(p, Some("k")).unwrap();
+        core.use_provider(ToolKind::Codex, "glm").unwrap();
+
+        // The capture must have been persisted on the third-party provider.
+        let stored = core
+            .list(Some(ToolKind::Codex))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == "glm")
+            .unwrap();
+        assert_eq!(stored.extra["_original_model"], "gpt-5-codex");
+
+        core.add_provider(Provider::new("official", ToolKind::Codex, None), None)
+            .unwrap();
+        core.use_provider(ToolKind::Codex, "official").unwrap();
+
+        let cfg = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            cfg.contains("model = \"gpt-5-codex\""),
+            "original model must be restored, got: {cfg}"
+        );
+    }
+
+    #[test]
+    fn cline_original_last_used_restored_through_service_layer() {
+        let (dir, core) = setup();
+        let settings_dir = dir.path().join("home/.cline/data/settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("providers.json"),
+            json!({"version":1, "lastUsedProvider":"openrouter", "modes":{}, "providers":{}})
+                .to_string(),
+        )
+        .unwrap();
+
+        let mut p = Provider::new(
+            "glm",
+            ToolKind::Cline,
+            Some("http://127.0.0.1:24860".into()),
+        );
+        p.extra = json!({"model": "glm-5-2-260617"});
+        core.add_provider(p, Some("k")).unwrap();
+        core.use_provider(ToolKind::Cline, "glm").unwrap();
+
+        core.add_provider(Provider::new("official", ToolKind::Cline, None), None)
+            .unwrap();
+        core.use_provider(ToolKind::Cline, "official").unwrap();
+
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(settings_dir.join("providers.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["lastUsedProvider"], "openrouter");
     }
 
     // ----- keyring migration: agent-switch/ prefix → xfade/ -----

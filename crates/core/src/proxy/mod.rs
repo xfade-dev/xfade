@@ -20,6 +20,13 @@ use std::sync::{Arc, Mutex};
 pub const FAIL_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 60;
 
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Circuit {
     pub fails: u32,
@@ -62,13 +69,6 @@ impl ProxyService {
         }
     }
 
-    fn now_secs() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-    }
-
     pub fn with_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
         self.host = host.into();
         self.port = port;
@@ -80,14 +80,10 @@ impl ProxyService {
         self
     }
 
-    pub fn core(&self) -> &Core {
-        &self.core
-    }
-
     pub fn circuit_open(&self, provider_id: &str) -> bool {
         let circuits = self.circuits.lock().unwrap();
         if let Some(c) = circuits.get(provider_id) {
-            return c.is_open(Self::now_secs());
+            return c.is_open(now_secs());
         }
         false
     }
@@ -101,7 +97,7 @@ impl ProxyService {
 
     pub fn record_failure(&self, provider_id: &str) {
         let mut circuits = self.circuits.lock().unwrap();
-        let now = Self::now_secs();
+        let now = now_secs();
         let c = circuits.entry(provider_id.to_string()).or_insert(Circuit {
             fails: 0,
             cooldown_until_secs: 0,
@@ -112,10 +108,6 @@ impl ProxyService {
         }
         // Persist updated circuit state.
         let _ = self.core.db().save_circuit(provider_id, c);
-    }
-
-    pub fn circuit_status(&self, provider_id: &str) -> Option<Circuit> {
-        self.circuits.lock().unwrap().get(provider_id).cloned()
     }
 
     /// Start the proxy; shut down gracefully when the `shutdown` future completes. host/port come from self fields.
@@ -275,12 +267,55 @@ mod tests {
         up.respond_with(200, "{}");
         let (s1, _) = http_post_json(&url, "/v1/responses", "{}", "Bearer x").await;
         assert_eq!(s1, 200);
-        assert_eq!(up.last_request().await.path, "/responses");
+        assert_eq!(up.last_request().await.path, "/v1/responses");
 
         up.respond_with(200, "{}");
         let (s2, _) = http_post_json(&url, "/v1/messages", "{}", "Bearer x").await;
         assert_eq!(s2, 200);
-        assert_eq!(up.last_request().await.path, "/messages");
+        assert_eq!(up.last_request().await.path, "/v1/messages");
+    }
+
+    #[tokio::test]
+    async fn html_200_from_upstream_returns_actionable_502() {
+        // Regression: a wrong base_url (missing /v1) makes gateways answer
+        // 200 HTML (their web UI); relaying that broke Pi with a cryptic
+        // "Stream ended without finish_reason".
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(200, "<!doctype html><html><body>web ui</body></html>");
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[],"stream":true}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 502);
+        assert!(body.contains("base_url"), "body: {body}");
+        assert!(body.contains("yy"), "body should name the provider: {body}");
+    }
+
+    #[tokio::test]
+    async fn empty_200_body_returns_502() {
+        // Locks the guard's behavior for degenerate upstreams: a 200 with an
+        // empty body is treated as a broken upstream, not relayed as success.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(200, "");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 502);
     }
 
     #[tokio::test]
@@ -513,6 +548,44 @@ mod tests {
     // ----- C4: anthropic→openai conversion end-to-end tests -----
 
     #[tokio::test]
+    async fn e2e_responses_to_chat_streaming() {
+        // Codex-shaped /v1/responses request converted to chat upstream.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], Some("glm-5-2-260617"), "chat")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sse(vec![
+            r#"data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
+            "data: [DONE]",
+        ]);
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/responses",
+            r#"{"model":"glm-5-2-260617","stream":true,"instructions":"be brief","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("response.created"), "body: {body}");
+        assert!(body.contains(r#""delta":"hi""#));
+        assert!(body.contains("response.output_item.done"));
+        assert!(body.contains("response.completed"));
+        assert!(body.contains(r#""input_tokens":2"#));
+        // upstream received a chat request with instructions as system message
+        let seen = up.last_request().await;
+        assert_eq!(seen.path, "/v1/chat/completions");
+        let seen_v: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+        assert_eq!(seen_v["model"], "glm-5-2-260617");
+        assert_eq!(seen_v["messages"][0]["role"], "system");
+        assert_eq!(seen_v["messages"][0]["content"], "be brief");
+        assert_eq!(seen_v["messages"][1]["content"], "hello");
+    }
+
+    #[tokio::test]
     async fn e2e_anthropic_to_openai_text() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
@@ -541,7 +614,7 @@ mod tests {
         assert_eq!(v["stop_reason"], "end_turn");
         // upstream received OpenAI-format + model_override
         let seen = up.last_request().await;
-        assert_eq!(seen.path, "/chat/completions");
+        assert_eq!(seen.path, "/v1/chat/completions");
         let seen_v: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
         assert_eq!(seen_v["model"], "gpt-5.6-luna");
         assert!(seen_v["messages"].is_array());
@@ -605,7 +678,7 @@ mod tests {
         assert!(body.contains(r#""type":"text","text":"ok""#));
         // upstream received the original Anthropic request (unconverted)
         let seen = up.last_request().await;
-        assert_eq!(seen.path, "/messages");
+        assert_eq!(seen.path, "/v1/messages");
         assert!(seen.body.contains(r#""role":"user""#));
     }
 

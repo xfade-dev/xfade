@@ -1,10 +1,14 @@
-//! Protocol conversion: Anthropic messages → OpenAI chat/completions.
+//! Protocol conversion: Anthropic messages → OpenAI chat/completions, and
+//! OpenAI responses → OpenAI chat/completions.
 //!
 //! This module contains:
 //! - Request-side conversion (Anthropic → OpenAI), see `request_anthropic_to_openai`.
 //! - Response-side conversion (OpenAI → Anthropic), non-stream + streaming
 //!   state machine, see `response_openai_to_anthropic` and
 //!   `stream_openai_to_anthropic`. See spec §3 response side.
+//! - Responses↔Chat conversion for `/v1/responses` clients (Codex) against
+//!   chat-completions-only upstreams, see `request_responses_to_chat`,
+//!   `response_chat_to_responses` and `stream_chat_to_responses`.
 
 use crate::error::{CoreError, Result};
 use axum::body::Bytes;
@@ -506,14 +510,30 @@ pub fn response_openai_to_anthropic(body: &[u8], req_model: &str) -> Result<Byte
 
 /// Streaming state for the OpenAI→Anthropic SSE conversion state machine.
 #[derive(Debug)]
-enum StreamState {
+struct StreamState {
+    phase: Phase,
+    /// Next Anthropic content-block index. Text and tool_use blocks share one
+    /// sequential counter — the Anthropic protocol requires unique, increasing
+    /// indexes across the whole message (the OpenAI tool-call index is only a
+    /// matching key and collides with the text block's index 0).
+    next_block: usize,
+}
+
+#[derive(Debug)]
+enum Phase {
     /// No `message_start` emitted yet.
     Initial,
-    /// A text content block (index 0) is currently open.
-    InTextBlock,
-    /// A tool_use content block at `index` is currently open; `buffer` holds
-    /// the aggregated arguments JSON string fragments.
-    InToolBlock { index: usize, buffer: String },
+    /// A text content block is currently open at Anthropic index `block`.
+    InTextBlock { block: usize },
+    /// A tool_use content block is currently open; `index` is the OpenAI
+    /// tool-call index (matching key for argument fragments), `block` the
+    /// Anthropic content-block index, `buffer` holds the aggregated
+    /// arguments JSON string fragments.
+    InToolBlock {
+        index: usize,
+        block: usize,
+        buffer: String,
+    },
     /// Terminal: `message_stop` emitted.
     Done,
 }
@@ -523,6 +543,14 @@ fn sse_event(event_type: &str, data: &Value) -> Bytes {
     let data_str = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
     let frame = format!("event: {event_type}\ndata: {data_str}\n\n");
     Bytes::from(frame)
+}
+
+/// A spec-compliant `content_block_stop` frame (requires `type` + `index`).
+fn block_stop_event(block: usize) -> Bytes {
+    sse_event(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": block}),
+    )
 }
 
 /// Convert a stream of OpenAI chat completion SSE chunks (each `Bytes` is one
@@ -538,11 +566,15 @@ fn sse_event(event_type: &str, data: &Value) -> Bytes {
 /// - `finish_reason` → close any open block; `message_delta(stop_reason, usage)`;
 ///   `message_stop`
 ///
+/// An upstream error (mid-stream transport failure) is surfaced as an
+/// Anthropic `error` event instead of a graceful `message_stop`, so strict
+/// clients fail the turn instead of accepting a truncated message.
+///
 /// Uses `futures::stream::unfold` for true streaming semantics. The upstream
 /// stream is carried in the unfold state so it persists across poll cycles.
 pub fn stream_openai_to_anthropic<S>(upstream: S, req_model: String) -> impl Stream<Item = Bytes>
 where
-    S: Stream<Item = Bytes> + Send + 'static,
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
     /// unfold state: (upstream stream, conversion state, pending output queue).
     /// The pending queue holds frames already produced but not yet emitted
@@ -550,7 +582,7 @@ where
     /// multiple unfold steps without re-polling upstream). The upstream stream
     /// is boxed+pin so it is `Unpin` and can be polled inside the async block.
     struct UnfoldState {
-        upstream: std::pin::Pin<Box<dyn Stream<Item = Bytes> + Send>>,
+        upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
         conv: StreamState,
         pending: std::collections::VecDeque<Bytes>,
         finished: bool,
@@ -558,7 +590,10 @@ where
 
     let init = UnfoldState {
         upstream: Box::pin(upstream),
-        conv: StreamState::Initial,
+        conv: StreamState {
+            phase: Phase::Initial,
+            next_block: 0,
+        },
         pending: std::collections::VecDeque::new(),
         finished: false,
     };
@@ -579,14 +614,13 @@ where
                 match st.upstream.as_mut().next().await {
                     None => {
                         // Upstream ended: close out gracefully.
-                        match &st.conv {
-                            StreamState::Done => {
+                        match &st.conv.phase {
+                            Phase::Done => {
                                 st.finished = true;
                                 continue;
                             }
-                            StreamState::InTextBlock | StreamState::InToolBlock { .. } => {
-                                st.pending
-                                    .push_back(sse_event("content_block_stop", &json!({})));
+                            Phase::InTextBlock { block } | Phase::InToolBlock { block, .. } => {
+                                st.pending.push_back(block_stop_event(*block));
                             }
                             _ => {}
                         }
@@ -598,11 +632,26 @@ where
                             }),
                         ));
                         st.pending.push_back(sse_event("message_stop", &json!({})));
-                        st.conv = StreamState::Done;
+                        st.conv.phase = Phase::Done;
                         st.finished = true;
                         continue;
                     }
-                    Some(chunk) => {
+                    Some(Err(e)) => {
+                        // Upstream failed mid-stream: surface an error event so
+                        // clients fail the turn instead of accepting a
+                        // truncated message.
+                        st.pending.push_back(sse_event(
+                            "error",
+                            &json!({
+                                "type": "error",
+                                "error": {"type": "api_error", "message": format!("upstream stream interrupted: {e}")}
+                            }),
+                        ));
+                        st.conv.phase = Phase::Done;
+                        st.finished = true;
+                        continue;
+                    }
+                    Some(Ok(chunk)) => {
                         let text = String::from_utf8_lossy(&chunk);
                         let parsed = parse_openai_sse_frames(&text);
                         let (new_conv, out_frames) = process_frames(st.conv, &parsed, &req_model);
@@ -651,6 +700,11 @@ fn process_frames(
     let mut output_tokens: Option<u64> = None;
 
     for frame in frames {
+        // Ignore anything after the terminal event (some gateways send
+        // trailing frames past finish_reason).
+        if matches!(state.phase, Phase::Done) {
+            break;
+        }
         // Capture id at top level for message_start.
         if message_id.is_none() {
             if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
@@ -675,9 +729,10 @@ fn process_frames(
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
         let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
 
-        // First chunk with role → message_start + open text block (lazily).
-        let has_role = delta.get("role").and_then(|v| v.as_str()).is_some();
-        if matches!(state, StreamState::Initial) {
+        // First chunk → message_start. Text and tool blocks are opened lazily
+        // (on first non-empty content / first tool_call), so an empty text
+        // block is never emitted ahead of a tool_use block.
+        if matches!(state.phase, Phase::Initial) {
             let id = message_id.clone().unwrap_or_default();
             out.push(sse_event(
                 "message_start",
@@ -695,52 +750,31 @@ fn process_frames(
                     }
                 }),
             ));
-            // Decide initial block: if a tool_call is present, open tool block;
-            // else open text block (index 0). We handle tool_calls below, so
-            // only open text block here if no tool_calls and has content or role.
-            let tool_calls_present = delta
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            if !tool_calls_present {
-                out.push(sse_event(
-                    "content_block_start",
-                    &json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                ));
-                state = StreamState::InTextBlock;
-            } else {
-                // Will be handled in the tool_calls branch below.
-                state = StreamState::Initial; // remain, tool branch will transition
-            }
-            let _ = has_role;
         }
 
         // delta.content text → text_delta.
         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
             if !text.is_empty() {
-                if matches!(state, StreamState::Initial) {
+                if matches!(state.phase, Phase::Initial) {
                     // Open a text block now.
+                    let block = state.next_block;
+                    state.next_block += 1;
+                    state.phase = Phase::InTextBlock { block };
                     out.push(sse_event(
                         "content_block_start",
                         &json!({
                             "type": "content_block_start",
-                            "index": 0,
+                            "index": block,
                             "content_block": {"type": "text", "text": ""}
                         }),
                     ));
-                    state = StreamState::InTextBlock;
                 }
-                if matches!(state, StreamState::InTextBlock) {
+                if let Phase::InTextBlock { block } = &state.phase {
                     out.push(sse_event(
                         "content_block_delta",
                         &json!({
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": block,
                             "delta": {"type": "text_delta", "text": text}
                         }),
                     ));
@@ -769,38 +803,45 @@ fn process_frames(
                     .unwrap_or("");
 
                 // If a text block is open, close it.
-                if matches!(state, StreamState::InTextBlock) {
-                    out.push(sse_event("content_block_stop", &json!({})));
+                if let Phase::InTextBlock { block } = &state.phase {
+                    out.push(block_stop_event(*block));
                 }
                 // If a different tool block is open, finalize it.
-                if let StreamState::InToolBlock { index: cur, buffer } = &state {
+                if let Phase::InToolBlock {
+                    index: cur,
+                    block: cur_block,
+                    buffer,
+                } = &state.phase
+                {
                     if *cur != index {
                         // Finalize previous tool block: emit aggregated JSON.
                         out.push(sse_event(
                             "content_block_delta",
                             &json!({
                                 "type": "content_block_delta",
-                                "index": cur,
+                                "index": cur_block,
                                 "delta": {"type": "input_json_delta", "partial_json": buffer}
                             }),
                         ));
-                        out.push(sse_event("content_block_stop", &json!({})));
+                        out.push(block_stop_event(*cur_block));
                     }
                 }
 
                 // If this is a new tool block (not continuing), open it.
-                let is_new_block = match &state {
-                    StreamState::InToolBlock { index: cur, buffer } => {
-                        *cur != index || (!id.is_empty() && buffer.is_empty())
-                    }
+                let is_new_block = match &state.phase {
+                    Phase::InToolBlock {
+                        index: cur, buffer, ..
+                    } => *cur != index || (!id.is_empty() && buffer.is_empty()),
                     _ => true,
                 };
                 if is_new_block {
+                    let block = state.next_block;
+                    state.next_block += 1;
                     out.push(sse_event(
                         "content_block_start",
                         &json!({
                             "type": "content_block_start",
-                            "index": index,
+                            "index": block,
                             "content_block": {
                                 "type": "tool_use",
                                 "id": id,
@@ -809,14 +850,15 @@ fn process_frames(
                             }
                         }),
                     ));
-                    state = StreamState::InToolBlock {
+                    state.phase = Phase::InToolBlock {
                         index,
+                        block,
                         buffer: String::new(),
                     };
                 }
 
                 // Append arguments fragment to the buffer.
-                if let StreamState::InToolBlock { index: _, buffer } = &mut state {
+                if let Phase::InToolBlock { buffer, .. } = &mut state.phase {
                     buffer.push_str(arguments_frag);
                 }
             }
@@ -831,21 +873,21 @@ fn process_frames(
                 other => other,
             };
             // Finalize the currently-open block.
-            match &state {
-                StreamState::InTextBlock => {
-                    out.push(sse_event("content_block_stop", &json!({})));
+            match &state.phase {
+                Phase::InTextBlock { block } => {
+                    out.push(block_stop_event(*block));
                 }
-                StreamState::InToolBlock { index, buffer } => {
+                Phase::InToolBlock { block, buffer, .. } => {
                     // Emit the aggregated JSON as a single input_json_delta.
                     out.push(sse_event(
                         "content_block_delta",
                         &json!({
                             "type": "content_block_delta",
-                            "index": index,
+                            "index": block,
                             "delta": {"type": "input_json_delta", "partial_json": buffer}
                         }),
                     ));
-                    out.push(sse_event("content_block_stop", &json!({})));
+                    out.push(block_stop_event(*block));
                 }
                 _ => {}
             }
@@ -859,11 +901,522 @@ fn process_frames(
                 }),
             ));
             out.push(sse_event("message_stop", &json!({"type": "message_stop"})));
-            state = StreamState::Done;
+            state.phase = Phase::Done;
         }
     }
 
     (state, out)
+}
+
+// ── OpenAI Responses ↔ Chat Completions conversion ─────────────────────────
+//
+// Codex speaks the Responses API (`POST /v1/responses`) exclusively (its
+// `wire_api = "chat"` mode was removed in 0.155). These functions let a
+// Responses client talk to a chat-completions-only upstream through xfade:
+//   - `request_responses_to_chat`: Responses request → Chat request.
+//   - `response_chat_to_responses` / `stream_chat_to_responses`: Chat
+//     response (JSON or SSE) → Responses response (JSON or SSE events).
+//
+// The event contract matches what Codex consumes
+// (codex-api/src/sse/responses.rs): `response.created`,
+// `response.output_text.delta`, `response.output_item.done` (message /
+// function_call items) and `response.completed` (with `response.usage`).
+
+/// Convert an OpenAI `/v1/responses` request body into a
+/// `/v1/chat/completions` request body.
+pub fn request_responses_to_chat(body: &[u8], model_override: Option<&str>) -> Result<Bytes> {
+    let input: Value = serde_json::from_slice(body)?;
+    let obj = input
+        .as_object()
+        .ok_or_else(|| CoreError::Proxy("responses request body is not a JSON object".into()))?;
+    let mut out = Map::new();
+
+    let model = model_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            obj.get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    if let Some(m) = model {
+        out.insert("model".into(), Value::String(m));
+    }
+
+    for key in ["stream", "temperature", "top_p", "parallel_tool_calls"] {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(v) = obj.get("max_output_tokens") {
+        out.insert("max_tokens".into(), v.clone());
+    }
+    if let Some(v) = obj.get("tool_choice") {
+        if v.is_string() || v.is_object() {
+            out.insert("tool_choice".into(), v.clone());
+        }
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instructions) = obj.get("instructions").and_then(|v| v.as_str()) {
+        if !instructions.is_empty() {
+            messages.push(json!({"role": "system", "content": instructions}));
+        }
+    }
+
+    match obj.get("input").cloned().unwrap_or(Value::Null) {
+        Value::String(s) => messages.push(json!({"role": "user", "content": s})),
+        Value::Array(items) => {
+            for item in &items {
+                responses_item_to_chat(item, &mut messages);
+            }
+        }
+        Value::Null => {}
+        _ => {
+            return Err(CoreError::Proxy(
+                "responses request 'input' must be a string or array".into(),
+            ))
+        }
+    }
+    out.insert("messages".into(), Value::Array(messages));
+
+    if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
+        let chat_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                let name = t.get("name")?.as_str()?;
+                let mut f = Map::new();
+                f.insert("name".into(), json!(name));
+                if let Some(d) = t.get("description") {
+                    f.insert("description".into(), d.clone());
+                }
+                if let Some(p) = t.get("parameters") {
+                    f.insert("parameters".into(), p.clone());
+                }
+                Some(json!({"type": "function", "function": Value::Object(f)}))
+            })
+            .collect();
+        if !chat_tools.is_empty() {
+            out.insert("tools".into(), Value::Array(chat_tools));
+        }
+    }
+
+    Ok(Bytes::from(serde_json::to_vec(&Value::Object(out))?))
+}
+
+/// Map one Responses `input` item into chat messages.
+/// `reasoning` items (and unknown types) are dropped — they have no
+/// chat-completions equivalent.
+fn responses_item_to_chat(item: &Value, messages: &mut Vec<Value>) {
+    let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ty {
+        "message" => {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let role = match role {
+                "developer" | "system" => "system",
+                r => r,
+            };
+            let text: String = item
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            messages.push(json!({"role": role, "content": text}));
+        }
+        "function_call" => {
+            let call = json!({
+                "id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "arguments": item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}"),
+                }
+            });
+            // Consecutive function_call items merge into one assistant message.
+            match messages.last_mut() {
+                Some(Value::Object(m))
+                    if m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                        && m.get("tool_calls").is_some() =>
+                {
+                    if let Some(a) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                        a.push(call);
+                    }
+                }
+                _ => messages
+                    .push(json!({"role": "assistant", "content": null, "tool_calls": [call]})),
+            }
+        }
+        "function_call_output" => {
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "content": function_call_output_text(item.get("output")),
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Responses `function_call_output.output` is either a plain string or an
+/// array of `{type:"output_text"|"input_text", text}` content items.
+fn function_call_output_text(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(Value::Object(o)) => o
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Build a Responses `response.completed`-style usage block from a chat
+/// usage block (prompt/completion → input/output).
+fn responses_usage(usage: &Value) -> Value {
+    json!({
+        "input_tokens": usage.get("prompt_tokens").and_then(|t| t.as_i64()).unwrap_or(0),
+        "output_tokens": usage.get("completion_tokens").and_then(|t| t.as_i64()).unwrap_or(0),
+        "total_tokens": usage.get("total_tokens").and_then(|t| t.as_i64()).unwrap_or(0),
+    })
+}
+
+/// Convert a Chat Completions JSON response body into a Responses API
+/// response object.
+pub fn response_chat_to_responses(body: &[u8], req_model: &str) -> Result<Bytes> {
+    let v: Value = serde_json::from_slice(body)?;
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("resp-xfade")
+        .to_string();
+    let output = chat_message_to_response_items(&v);
+    let resp = json!({
+        "id": id,
+        "object": "response",
+        "status": "completed",
+        "model": req_model,
+        "output": output,
+        "usage": responses_usage(v.get("usage").unwrap_or(&Value::Null)),
+    });
+    Ok(Bytes::from(serde_json::to_vec(&resp)?))
+}
+
+/// Extract the Responses output items (message / function_call) from a chat
+/// completion response object (`choices[0].message`).
+fn chat_message_to_response_items(v: &Value) -> Vec<Value> {
+    let mut output: Vec<Value> = Vec::new();
+    let Some(choice) = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    else {
+        return output;
+    };
+    let msg = choice.get("message").cloned().unwrap_or(Value::Null);
+    if let Some(t) = msg.get("content").and_then(|c| c.as_str()) {
+        if !t.is_empty() {
+            output.push(json!({
+                "type": "message",
+                "id": "msg-xfade-0",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": t}],
+            }));
+        }
+    }
+    if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+        for (i, tc) in tcs.iter().enumerate() {
+            output.push(json!({
+                "type": "function_call",
+                "id": format!("fc-xfade-{i}"),
+                "call_id": tc.get("id").and_then(|x| x.as_str()).unwrap_or_default(),
+                "name": tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or_default(),
+                "arguments": tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}"),
+            }));
+        }
+    }
+    output
+}
+
+/// Streaming state for the Chat → Responses SSE conversion state machine.
+#[derive(Debug, Default)]
+struct ResponsesStreamState {
+    created: bool,
+    /// Whether `response.output_item.added` for the assistant message was
+    /// emitted (Codex requires it before consuming `output_text.delta`).
+    msg_added: bool,
+    resp_id: String,
+    model: String,
+    text: String,
+    /// Aggregated tool calls keyed by the OpenAI tool-call index:
+    /// (call_id, name, arguments buffer).
+    tools: Vec<(usize, String, String, String)>,
+    usage: Option<Value>,
+    finished: bool,
+}
+
+/// Convert a stream of OpenAI chat completion SSE chunks into a stream of
+/// Responses API SSE events, mirroring `stream_openai_to_anthropic`.
+///
+/// An upstream error (mid-stream transport failure) is surfaced as a
+/// `response.failed` event so Responses clients (Codex) treat the turn as
+/// failed and retry, instead of accepting a truncated message.
+pub fn stream_chat_to_responses<S>(upstream: S, req_model: String) -> impl Stream<Item = Bytes>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    struct UnfoldState {
+        upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+        st: ResponsesStreamState,
+        pending: std::collections::VecDeque<Bytes>,
+    }
+
+    let init = UnfoldState {
+        upstream: Box::pin(upstream),
+        st: ResponsesStreamState {
+            model: req_model,
+            ..Default::default()
+        },
+        pending: std::collections::VecDeque::new(),
+    };
+
+    futures::stream::unfold(init, move |mut st| async move {
+        loop {
+            if let Some(frame) = st.pending.pop_front() {
+                return Some((frame, st));
+            }
+            use futures::StreamExt;
+            match st.upstream.as_mut().next().await {
+                None => {
+                    if st.st.finished {
+                        return None;
+                    }
+                    for f in chat_to_responses_finish(&mut st.st) {
+                        st.pending.push_back(f);
+                    }
+                    st.st.finished = true;
+                    continue;
+                }
+                Some(Err(e)) => {
+                    if !st.st.created {
+                        st.st.created = true;
+                        st.pending.push_back(sse_event(
+                            "response.created",
+                            &json!({"type": "response.created", "response": {"id": st.st.resp_id}}),
+                        ));
+                    }
+                    st.pending.push_back(sse_event(
+                            "response.failed",
+                            &json!({
+                                "type": "response.failed",
+                                "response": {
+                                    "id": st.st.resp_id,
+                                    "error": {"code": "upstream_error", "message": format!("upstream stream interrupted: {e}")}
+                                }
+                            }),
+                        ));
+                    st.st.finished = true;
+                    continue;
+                }
+                Some(Ok(chunk)) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    let frames = parse_openai_sse_frames(&text);
+                    let out = process_chat_chunk_responses(&mut st.st, &frames);
+                    for f in out {
+                        st.pending.push_back(f);
+                    }
+                    continue;
+                }
+            }
+        }
+    })
+}
+
+/// Process one batch of parsed chat chunk JSON values, returning SSE frames.
+fn process_chat_chunk_responses(st: &mut ResponsesStreamState, frames: &[Value]) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    for frame in frames {
+        // Ignore anything after the terminal chunk (some gateways send
+        // trailing frames past finish_reason).
+        if st.finished {
+            break;
+        }
+        if st.resp_id.is_empty() {
+            if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
+                st.resp_id = id.to_string();
+            }
+        }
+        if let Some(usage) = frame.get("usage") {
+            if usage.is_object() && !usage.as_object().unwrap().is_empty() {
+                st.usage = Some(usage.clone());
+            }
+        }
+        let Some(choice) = frame
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+        else {
+            continue;
+        };
+        let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+
+        if !st.created {
+            st.created = true;
+            out.push(sse_event(
+                "response.created",
+                &json!({"type": "response.created", "response": {"id": st.resp_id}}),
+            ));
+        }
+
+        // Text deltas.
+        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                if !st.msg_added {
+                    st.msg_added = true;
+                    out.push(sse_event(
+                        "response.output_item.added",
+                        &json!({
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {"type": "message", "id": "msg-xfade-0", "role": "assistant", "content": [{"type": "output_text", "text": ""}]}
+                        }),
+                    ));
+                }
+                st.text.push_str(text);
+                out.push(sse_event(
+                    "response.output_text.delta",
+                    &json!({"type": "response.output_text.delta", "item_id": "msg-xfade-0", "output_index": 0, "content_index": 0, "delta": text}),
+                ));
+            }
+        }
+
+        // Tool call argument fragments (keyed by the OpenAI tool index).
+        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let entry = match st.tools.iter_mut().find(|(i, _, _, _)| *i == index) {
+                    Some(e) => e,
+                    None => {
+                        st.tools
+                            .push((index, String::new(), String::new(), String::new()));
+                        st.tools.last_mut().unwrap()
+                    }
+                };
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        entry.1 = id.to_string();
+                    }
+                }
+                if let Some(name) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    if !name.is_empty() {
+                        entry.2 = name.to_string();
+                    }
+                }
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                {
+                    entry.3.push_str(args);
+                }
+            }
+        }
+
+        // Terminal chunk.
+        if choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            out.extend(chat_to_responses_finish(st));
+            st.finished = true;
+        }
+    }
+    out
+}
+
+/// Emit the terminal Responses events (message/function_call items +
+/// `response.completed`). Returns the frames; safe to call once.
+fn chat_to_responses_finish(st: &mut ResponsesStreamState) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    if !st.created {
+        st.created = true;
+        out.push(sse_event(
+            "response.created",
+            &json!({"type": "response.created", "response": {"id": st.resp_id}}),
+        ));
+    }
+    if st.finished {
+        return out;
+    }
+
+    let mut items: Vec<Value> = Vec::new();
+    if !st.text.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "id": "msg-xfade-0",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": st.text}],
+        }));
+    }
+    for (_, call_id, name, args) in &st.tools {
+        items.push(json!({
+            "type": "function_call",
+            "id": format!("fc-xfade-{}", items.len()),
+            "call_id": call_id,
+            "name": name,
+            "arguments": if args.is_empty() { "{}".to_string() } else { args.clone() },
+        }));
+    }
+    if items.is_empty() {
+        // Keep at least one assistant message item so the turn is not empty.
+        items.push(json!({
+            "type": "message",
+            "id": "msg-xfade-0",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ""}],
+        }));
+    }
+    for (output_index, item) in items.iter().enumerate() {
+        out.push(sse_event(
+            "response.output_item.done",
+            &json!({"type": "response.output_item.done", "output_index": output_index, "item": item}),
+        ));
+    }
+    let usage = st
+        .usage
+        .as_ref()
+        .map(responses_usage)
+        .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}));
+    out.push(sse_event(
+        "response.completed",
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": st.resp_id,
+                "model": st.model,
+                "status": "completed",
+                "output": items,
+                "usage": usage,
+            }
+        }),
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -971,7 +1524,7 @@ mod tests {
             ok_chunk(br#"{"choices":[{"delta":{"content":"i"}}]}"#),
             ok_chunk(br#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#),
         ];
-        let stream = futures::stream::iter(chunks);
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok));
         let out_bytes = collect_stream(stream_openai_to_anthropic(stream, "m".into())).await;
         let s = String::from_utf8(out_bytes).unwrap();
         assert!(s.contains("message_start"));
@@ -992,7 +1545,7 @@ mod tests {
             ok_chunk(br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"/\"}"}}]}}]}"#),
             ok_chunk(br#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":3}}"#),
         ];
-        let stream = futures::stream::iter(chunks);
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok));
         let out_bytes = collect_stream(stream_openai_to_anthropic(stream, "m".into())).await;
         let s = String::from_utf8(out_bytes).unwrap();
         // should have a content_block_start tool_use
@@ -1004,6 +1557,200 @@ mod tests {
         assert!(s.contains(r#""partial_json":"{\"path\":\"/\"}""#));
         assert!(s.contains("content_block_stop"));
         assert!(s.contains(r#""stop_reason":"tool_use""#));
+    }
+
+    #[tokio::test]
+    async fn stream_text_then_tool_assigns_sequential_indexes_and_spec_stop_frames() {
+        // Regression: the OpenAI tool index (0) used to collide with the text
+        // block's index 0, and content_block_stop carried an empty payload.
+        let chunks = vec![
+            ok_chunk(br#"{"choices":[{"delta":{"role":"assistant","content":"hi"}}]}"#),
+            ok_chunk(br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"ls","arguments":"{\"path\":\"/\"}"}}]}}]}"#),
+            ok_chunk(br#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+        let out_bytes = collect_stream(stream_openai_to_anthropic(
+            futures::stream::iter(chunks.into_iter().map(Ok)),
+            "m".into(),
+        ))
+        .await;
+        let s = String::from_utf8(out_bytes).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+
+        // text block opens at index 0, tool_use block at index 1 — no collision
+        assert!(lines
+            .iter()
+            .any(|l| l.contains(r#""type":"content_block_start""#)
+                && l.contains(r#""type":"text""#)
+                && l.contains(r#""index":0"#)));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains(r#""type":"content_block_start""#)
+                && l.contains(r#""type":"tool_use""#)
+                && l.contains(r#""index":1"#)));
+
+        // every content_block_stop carries type + index (Anthropic spec),
+        // one stop for each of the two blocks
+        let stops: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains(r#""type":"content_block_stop""#))
+            .copied()
+            .collect();
+        assert_eq!(stops.len(), 2, "expected stops for text + tool blocks");
+        assert_eq!(
+            stops.iter().filter(|l| l.contains(r#""index":0"#)).count(),
+            1
+        );
+        assert_eq!(
+            stops.iter().filter(|l| l.contains(r#""index":1"#)).count(),
+            1
+        );
+
+        // the aggregated tool arguments stay attached to the tool block
+        assert!(lines
+            .iter()
+            .any(|l| l.contains(r#""input_json_delta""#) && l.contains(r#""index":1"#)));
+    }
+
+    #[test]
+    fn responses_request_basic() {
+        let inp = br#"{"model":"gpt-x","instructions":"be brief","stream":true,
+"max_output_tokens":100,
+"input":[
+  {"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]},
+  {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+  {"type":"function_call","name":"ls","arguments":"{\"path\":\"/\"}","call_id":"c1"},
+  {"type":"function_call_output","call_id":"c1","output":"file1"},
+  {"type":"reasoning","summary":[]}
+],
+"tools":[{"type":"function","name":"ls","description":"list","parameters":{"type":"object"},"strict":true}],
+"tool_choice":"auto","parallel_tool_calls":false,
+"reasoning":{"effort":"low"},"store":false}"#;
+        let out = request_responses_to_chat(inp, Some("glm-5-2")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "glm-5-2");
+        assert_eq!(v["max_tokens"], 100);
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["parallel_tool_calls"], false);
+        assert!(v.get("reasoning").is_none());
+        assert!(v.get("store").is_none());
+        // instructions → system; developer → system
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert_eq!(v["messages"][0]["content"], "be brief");
+        assert_eq!(v["messages"][1]["role"], "system");
+        assert_eq!(v["messages"][1]["content"], "rules");
+        assert_eq!(v["messages"][2]["content"], "hi");
+        // function_call → assistant tool_calls
+        assert_eq!(v["messages"][3]["tool_calls"][0]["id"], "c1");
+        assert_eq!(v["messages"][3]["tool_calls"][0]["function"]["name"], "ls");
+        // function_call_output → tool message
+        assert_eq!(v["messages"][4]["role"], "tool");
+        assert_eq!(v["messages"][4]["tool_call_id"], "c1");
+        assert_eq!(v["messages"][4]["content"], "file1");
+        // tools mapped to chat shape
+        assert_eq!(v["tools"][0]["function"]["name"], "ls");
+        assert!(v["tools"][0].get("strict").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_to_responses_text_and_tool() {
+        let chunks = vec![
+            ok_chunk(br#"{"id":"chatcmpl-1","choices":[{"delta":{"role":"assistant","content":"He"}}]}"#),
+            ok_chunk(br#"{"id":"chatcmpl-1","choices":[{"delta":{"content":"llo"}}]}"#),
+            ok_chunk(br#"{"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"ls","arguments":"{\"pa"}}]}}]}"#),
+            ok_chunk(br#"{"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"/\"}"}}]}}]}"#),
+            ok_chunk(br#"{"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#),
+        ];
+        let out_bytes = collect_stream(stream_chat_to_responses(
+            futures::stream::iter(chunks.into_iter().map(Ok)),
+            "m".into(),
+        ))
+        .await;
+        let s = String::from_utf8(out_bytes).unwrap();
+
+        // event sequence: created → text deltas → message item → function_call item → completed
+        let created = s.find("response.created").unwrap();
+        let delta = s.find("response.output_text.delta").unwrap();
+        let msg_done = s.find("response.output_item.done").unwrap();
+        let completed = s.find("response.completed").unwrap();
+        assert!(created < delta && delta < msg_done && msg_done < completed);
+
+        assert!(s.contains(r#""delta":"He""#));
+        assert!(s.contains(r#""delta":"llo""#));
+        // message item carries the full text
+        assert!(
+            s.contains(r#""content":[{"type":"output_text","text":"Hello"}]}"#) || {
+                // key order may differ under BTreeMap; check both parts on one item line
+                s.lines()
+                    .any(|l| l.contains(r#""type":"message""#) && l.contains(r#""text":"Hello""#))
+            }
+        );
+        // function_call item carries call_id, name and the full aggregated arguments
+        assert!(s.lines().any(|l| l.contains(r#""type":"function_call""#)
+            && l.contains(r#""call_id":"c1""#)
+            && l.contains(r#""name":"ls""#)
+            && l.contains(r#""arguments":"{\"path\":\"/\"}""#)));
+        // completed carries the usage block and the real model
+        assert!(s.lines().any(|l| l.contains("response.completed")
+            && l.contains(r#""input_tokens":3"#)
+            && l.contains(r#""output_tokens":5"#)));
+        assert!(s
+            .lines()
+            .any(|l| l.contains("response.completed") && l.contains(r#""model":"m""#)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_to_responses_upstream_error_emits_failed() {
+        // A mid-stream transport failure must surface as response.failed, not
+        // a graceful response.completed (Codex retries the former).
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(ok_chunk(
+                br#"{"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#,
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let out_bytes = collect_stream(stream_chat_to_responses(
+            futures::stream::iter(chunks),
+            "m".into(),
+        ))
+        .await;
+        let s = String::from_utf8(out_bytes).unwrap();
+        assert!(s.contains("response.failed"), "body: {s}");
+        assert!(s.contains("connection reset"), "body: {s}");
+        assert!(!s.contains("response.completed"), "body: {s}");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_to_responses_ignores_frames_after_finish() {
+        // Some gateways send trailing frames past finish_reason.
+        let chunks = vec![
+            ok_chunk(br#"{"id":"c1","choices":[{"delta":{"content":"a"}}]}"#),
+            ok_chunk(br#"{"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            ok_chunk(br#"{"id":"c1","choices":[{"delta":{"content":"LATE"}}]}"#),
+        ];
+        let out_bytes = collect_stream(stream_chat_to_responses(
+            futures::stream::iter(chunks.into_iter().map(Ok)),
+            "m".into(),
+        ))
+        .await;
+        let s = String::from_utf8(out_bytes).unwrap();
+        let completed = s.find("response.completed").unwrap();
+        assert!(!s[completed..].contains("LATE"), "body: {s}");
+    }
+
+    #[tokio::test]
+    async fn stream_anthropic_upstream_error_emits_error_event() {
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(ok_chunk(br#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let out_bytes = collect_stream(stream_openai_to_anthropic(
+            futures::stream::iter(chunks),
+            "m".into(),
+        ))
+        .await;
+        let s = String::from_utf8(out_bytes).unwrap();
+        assert!(s.contains(r#""type":"error""#), "body: {s}");
+        assert!(!s.contains("message_stop"), "body: {s}");
     }
 
     /// Build a `data: <bytes>\n\n` SSE frame as `Bytes` for testing.

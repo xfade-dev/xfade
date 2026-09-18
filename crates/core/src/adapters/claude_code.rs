@@ -1,4 +1,4 @@
-use super::{atomic_write, ToolAdapter};
+use super::{atomic_write, client_base_url, ToolAdapter};
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
 use serde_json::{json, Value};
@@ -81,6 +81,9 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     path: "provider".into(),
                     msg: format!("third-party provider '{}' is missing base_url", provider.id),
                 })?;
+            // Claude Code's SDK appends /v1/messages to ANTHROPIC_BASE_URL,
+            // so a trailing /v1 must not be written (would double to /v1/v1).
+            let base_url = client_base_url(base_url, "anthropic-messages");
             env.insert(ENV_BASE.into(), json!(base_url));
             env.insert(ENV_TOKEN.into(), json!(api_key.unwrap_or_default()));
             match provider.extra.get("model").and_then(|m| m.as_str()) {

@@ -1,5 +1,6 @@
 pub mod aider;
 pub mod claude_code;
+pub mod cline;
 pub mod codex;
 pub mod omp;
 pub mod opencode;
@@ -42,6 +43,7 @@ pub fn adapter_for(tool: ToolKind, home: &Path) -> Box<dyn ToolAdapter> {
         ToolKind::Pi => Box::new(pi::PiAdapter::new(home)),
         ToolKind::OhMyPi => Box::new(omp::OmpAdapter::new(home)),
         ToolKind::Aider => Box::new(aider::AiderAdapter::new(home)),
+        ToolKind::Cline => Box::new(cline::ClineAdapter::new(home)),
     }
 }
 
@@ -94,6 +96,34 @@ pub(crate) fn capture_default_provider(settings_path: &Path) -> Result<Option<Va
         return Ok(Some(json!({ "_original_default_provider": dp })));
     }
     Ok(None)
+}
+
+/// If `base_url` is a bare host (no path, e.g. `http://host:3000`), append the
+/// standard `/v1` prefix — OpenAI- and Anthropic-compatible APIs live under
+/// `/v1`, and a bare-host URL otherwise hits the gateway's web UI, which
+/// returns 200 HTML and breaks streaming clients with cryptic errors.
+// ponytail: heuristic; gateways with a non-/v1 API path (e.g. /v1beta/openai)
+// must spell out the full path in their provider base_url.
+pub(crate) fn with_v1_if_bare_host(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let host = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    if host.contains('/') {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
+/// Adjust a provider base_url for the wire protocol a Pi-style client (`api`
+/// field in models.json) will use. OpenAI SDKs append `/chat/completions` or
+/// `/responses` to the base, so a bare host needs a `/v1` suffix; the Anthropic
+/// SDK appends `/v1/messages` itself, so a `/v1` suffix must be stripped.
+pub(crate) fn client_base_url(base: &str, api: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if api == "anthropic-messages" {
+        return base.strip_suffix("/v1").unwrap_or(base).to_string();
+    }
+    with_v1_if_bare_host(base)
 }
 
 #[cfg(test)]

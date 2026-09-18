@@ -1,10 +1,12 @@
 use crate::models::ToolKind;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Preset {
     pub id: String,
     pub label: String,
+    #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
     pub extra: serde_json::Value,
 }
 
@@ -21,6 +23,30 @@ fn p(id: &str, label: &str, base_url: Option<&str>, extra: serde_json::Value) ->
         base_url: base_url.map(|s| s.to_string()),
         extra,
     }
+}
+
+/// OpenAI-protocol presets shared by Pi/OMP/Aider/Cline (OpenRouter/Kimi/DeepSeek).
+fn openai_presets() -> Vec<Preset> {
+    vec![
+        p(
+            "openrouter",
+            "OpenRouter",
+            Some("https://openrouter.ai/api/v1"),
+            serde_json::Value::Null,
+        ),
+        p(
+            "kimi",
+            "Kimi (Moonshot)",
+            Some("https://api.moonshot.cn/v1"),
+            serde_json::Value::Null,
+        ),
+        p(
+            "deepseek",
+            "DeepSeek",
+            Some("https://api.deepseek.com"),
+            serde_json::Value::Null,
+        ),
+    ]
 }
 
 /// Built-in presets per tool + user custom presets.
@@ -91,71 +117,8 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
                 ),
             ]);
         }
-        ToolKind::Pi => {
-            v.extend([
-                p(
-                    "openrouter",
-                    "OpenRouter",
-                    Some("https://openrouter.ai/api/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "kimi",
-                    "Kimi (Moonshot)",
-                    Some("https://api.moonshot.cn/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "deepseek",
-                    "DeepSeek",
-                    Some("https://api.deepseek.com"),
-                    serde_json::Value::Null,
-                ),
-            ]);
-        }
-        ToolKind::OhMyPi => {
-            v.extend([
-                p(
-                    "openrouter",
-                    "OpenRouter",
-                    Some("https://openrouter.ai/api/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "kimi",
-                    "Kimi (Moonshot)",
-                    Some("https://api.moonshot.cn/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "deepseek",
-                    "DeepSeek",
-                    Some("https://api.deepseek.com"),
-                    serde_json::Value::Null,
-                ),
-            ]);
-        }
-        ToolKind::Aider => {
-            v.extend([
-                p(
-                    "openrouter",
-                    "OpenRouter",
-                    Some("https://openrouter.ai/api/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "kimi",
-                    "Kimi (Moonshot)",
-                    Some("https://api.moonshot.cn/v1"),
-                    serde_json::Value::Null,
-                ),
-                p(
-                    "deepseek",
-                    "DeepSeek",
-                    Some("https://api.deepseek.com"),
-                    serde_json::Value::Null,
-                ),
-            ]);
+        ToolKind::Pi | ToolKind::OhMyPi | ToolKind::Aider | ToolKind::Cline => {
+            v.extend(openai_presets());
         }
     }
     // Load user custom presets
@@ -173,32 +136,17 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
 
 /// Load user custom presets from `~/.config/xfade/presets.json`.
 /// Format: `[{"id":"...","label":"...","base_url":"...","extra":{...}},...]`.
-/// Silently skip if the file is missing or unparsable (does not affect built-in presets).
+/// Silently skips the file (missing/unparsable) and individual malformed entries.
 fn load_custom_presets() -> Option<Vec<Preset>> {
     let home = dirs::home_dir()?;
     let path = home.join(".config").join("xfade").join("presets.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let raw: Vec<serde_json::Value> = serde_json::from_str(&data).ok()?;
-    let mut out = Vec::new();
-    for item in raw {
-        let id = item.get("id")?.as_str()?.to_string();
-        let label = item.get("label")?.as_str()?.to_string();
-        let base_url = item
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let extra = item
-            .get("extra")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        out.push(Preset {
-            id,
-            label,
-            base_url,
-            extra,
-        });
-    }
-    Some(out)
+    Some(
+        raw.into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect(),
+    )
 }
 
 /// Base URL of each tool's local-proxy preset.
@@ -210,7 +158,8 @@ fn local_proxy_base_url(tool: ToolKind) -> &'static str {
         | ToolKind::OpenCode
         | ToolKind::Pi
         | ToolKind::OhMyPi
-        | ToolKind::Aider => "http://127.0.0.1:24860/v1",
+        | ToolKind::Aider
+        | ToolKind::Cline => "http://127.0.0.1:24860/v1",
     }
 }
 
@@ -234,13 +183,5 @@ mod tests {
             ids.dedup();
             assert_eq!(ids.len(), list.len());
         }
-    }
-
-    #[test]
-    fn preset_serializes() {
-        let p = presets_for(crate::models::ToolKind::Codex)[0].clone();
-        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
-        assert!(v["id"].is_string());
-        assert!(v["label"].is_string());
     }
 }

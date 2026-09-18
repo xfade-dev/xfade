@@ -102,7 +102,7 @@ fn build_upstream_request(
     body: &[u8],
     auth_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let base = base_url.trim_end_matches('/');
+    let base = crate::adapters::with_v1_if_bare_host(base_url);
     let url = format!("{}{}", base, endpoint_path(endpoint));
 
     let mut req = match method {
@@ -232,11 +232,16 @@ fn prepare_bodies(
     body: &[u8],
     model_override: Option<&str>,
 ) -> Result<PreparedBodies, Box<Response>> {
-    let convert_path = endpoint == "messages" && target_protocol == "chat";
+    let convert_path =
+        (endpoint == "messages" || endpoint == "responses") && target_protocol == "chat";
 
-    // Build converted request body (Anthropic→OpenAI).
+    // Build converted request body (Anthropic/Responses → OpenAI chat).
     let converted_body: Option<Vec<u8>> = if convert_path {
-        match super::convert::request_anthropic_to_openai(body, model_override) {
+        let converted = match endpoint {
+            "responses" => super::convert::request_responses_to_chat(body, model_override),
+            _ => super::convert::request_anthropic_to_openai(body, model_override),
+        };
+        match converted {
             Ok(b) => {
                 // Inject stream_options if needed.
                 let injected = maybe_inject_stream_options("chat", &b);
@@ -266,6 +271,7 @@ fn prepare_bodies(
 }
 
 /// Handle a successful upstream response. Returns the response to send to the client.
+/// Callers (the failover loop) guarantee a success/redirection status.
 async fn handle_success(
     svc: &ProxyService,
     route_id: &str,
@@ -276,14 +282,7 @@ async fn handle_success(
     convert_path: bool,
     req_model: String,
 ) -> Response {
-    let status = resp.status();
     let streaming = is_stream_response(&resp);
-
-    if !status.is_success() && !status.is_redirection() {
-        // Delegate to error handler (should not normally be called with non-success,
-        // but the caller already checked status).
-        return handle_upstream_error(svc, route_id, resp, endpoint, &model, start).await;
-    }
 
     svc.record_success(route_id);
 
@@ -341,8 +340,22 @@ fn handle_success_streaming(
     let db = svc.core.db().clone();
 
     let body = if convert_path {
-        let upstream = resp.bytes_stream().filter_map(|r| async move { r.ok() });
-        let converted = super::convert::stream_openai_to_anthropic(upstream, req_model);
+        // Pass upstream errors through: the converters surface them as
+        // protocol-level error events (Anthropic `error` / `response.failed`)
+        // instead of masking a truncated stream as success.
+        let upstream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+        let converted: std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send>> =
+            if endpoint == "responses" {
+                Box::pin(super::convert::stream_chat_to_responses(
+                    upstream, req_model,
+                ))
+            } else {
+                Box::pin(super::convert::stream_openai_to_anthropic(
+                    upstream, req_model,
+                ))
+            };
         make_converted_tapped_streaming_body(
             converted,
             db,
@@ -374,6 +387,14 @@ fn handle_success_streaming(
     resp_builder.body(body).unwrap()
 }
 
+/// Whether the body plausibly is JSON (first non-whitespace byte is `{` or `[`).
+fn body_looks_like_json(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{' || *b == b'[')
+}
+
 /// Handle successful non-streaming response.
 async fn handle_success_non_streaming(
     svc: &ProxyService,
@@ -386,6 +407,12 @@ async fn handle_success_non_streaming(
     req_model: String,
 ) -> Response {
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -410,8 +437,40 @@ async fn handle_success_non_streaming(
 
     let duration_ms = start.elapsed().as_millis() as i64;
 
+    // A 2xx response that is neither SSE nor JSON means the upstream URL is
+    // wrong (typically a gateway web page answering 200 HTML because the
+    // provider base_url misses the /v1 path). Fail loudly instead of relaying
+    // the page to the client, which surfaces as cryptic errors like Pi's
+    // "Stream ended without finish_reason".
+    if !content_type.contains("json") && !body_looks_like_json(&bytes) {
+        let msg = format!(
+            "xfade: upstream provider '{route_id}' returned a non-JSON response \
+             (content-type: '{content_type}'); its base_url is probably wrong — \
+             OpenAI/Anthropic-compatible upstreams usually need a /v1 path suffix"
+        );
+        log_request(
+            svc,
+            endpoint,
+            &model,
+            route_id,
+            StatusCode::BAD_GATEWAY.as_u16() as i64,
+            Usage::default(),
+            duration_ms,
+            Some(msg.clone()),
+        );
+        return Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(msg.into())
+            .unwrap();
+    }
+
     if convert_path {
-        match super::convert::response_openai_to_anthropic(&bytes, &req_model) {
+        let converted = if endpoint == "responses" {
+            super::convert::response_chat_to_responses(&bytes, &req_model)
+        } else {
+            super::convert::response_openai_to_anthropic(&bytes, &req_model)
+        };
+        match converted {
             Ok(anthropic_bytes) => {
                 let usage = Usage::from_json(&anthropic_bytes);
                 log_request(
@@ -775,6 +834,16 @@ where
     })
 }
 
+/// Append `chunk` to the tail ring buffer (~`SSE_TAIL_CAP` bytes).
+fn push_tail(tail: &Mutex<Vec<u8>>, chunk: &[u8]) {
+    let mut t = tail.lock().unwrap();
+    t.extend_from_slice(chunk);
+    if t.len() > SSE_TAIL_CAP {
+        let excess = t.len() - SSE_TAIL_CAP;
+        t.drain(..excess);
+    }
+}
+
 /// Build a streaming axum `Body` from the upstream chunk stream that:
 ///   - forwards each chunk to the client unchanged, and
 ///   - maintains a tail ring buffer (~`SSE_TAIL_CAP` bytes) of the most recent
@@ -797,25 +866,12 @@ where
 {
     let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
     let tail_for_stream = tail.clone();
-    let errored: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let errored_for_stream = errored.clone();
 
     let mapped = upstream.then(move |chunk_result| {
         let tail = tail_for_stream.clone();
-        let errored = errored_for_stream.clone();
         async move {
-            match &chunk_result {
-                Ok(chunk) => {
-                    let mut t = tail.lock().unwrap();
-                    t.extend_from_slice(chunk);
-                    if t.len() > SSE_TAIL_CAP {
-                        let excess = t.len() - SSE_TAIL_CAP;
-                        t.drain(..excess);
-                    }
-                }
-                Err(_) => {
-                    *errored.lock().unwrap() = true;
-                }
+            if let Ok(chunk) = &chunk_result {
+                push_tail(&tail, chunk);
             }
             chunk_result.map_err(|e| std::io::Error::other(e.to_string()))
         }
@@ -826,10 +882,9 @@ where
     // extraction still sees the empty frame's usage fields.
     let filtered = filter_empty_choices(mapped);
 
-    let finalized = TailStream {
+    Body::from_stream(TailLogStream {
         inner: Box::pin(filtered),
         tail,
-        errored,
         endpoint,
         model,
         provider_id,
@@ -837,17 +892,12 @@ where
         status,
         start,
         done_logged: false,
-    };
-
-    Body::from_stream(finalized)
+    })
 }
 
-/// Build a streaming axum `Body` for the conversion path: the input is a stream
-/// of already-converted Anthropic SSE `Bytes` frames. Each frame is forwarded
-/// to the client unchanged, and a tail ring buffer is maintained so that when
-/// the stream ends, usage is extracted from the converted Anthropic SSE tail
-/// (`Usage::from_sse_tail` handles Anthropic events) and a request log row is
-/// written.
+/// Same as `make_tapped_streaming_body`, but for the conversion path: the input
+/// is a stream of already-converted SSE frames (`Usage::from_sse_tail` handles
+/// both Anthropic and Responses events), so no empty-`choices` filtering.
 fn make_converted_tapped_streaming_body<S>(
     converted: S,
     db: crate::store::db::Database,
@@ -866,17 +916,12 @@ where
     let mapped = converted.then(move |chunk| {
         let tail = tail_for_stream.clone();
         async move {
-            let mut t = tail.lock().unwrap();
-            t.extend_from_slice(&chunk);
-            if t.len() > SSE_TAIL_CAP {
-                let excess = t.len() - SSE_TAIL_CAP;
-                t.drain(..excess);
-            }
+            push_tail(&tail, &chunk);
             Ok::<Bytes, std::io::Error>(chunk)
         }
     });
 
-    let finalized = ConvertedTailStream {
+    Body::from_stream(TailLogStream {
         inner: Box::pin(mapped),
         tail,
         endpoint,
@@ -886,14 +931,14 @@ where
         status,
         start,
         done_logged: false,
-    };
-
-    Body::from_stream(finalized)
+    })
 }
 
-// ── Stream wrappers ────────────────────────────────────────────────────────
+// ── Stream wrapper ─────────────────────────────────────────────────────────
 
-struct ConvertedTailStream {
+/// Forwards an inner SSE stream unchanged; on stream end (or the first error
+/// item) writes exactly one request-log row with usage extracted from the tail.
+struct TailLogStream {
     inner: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
     tail: Arc<Mutex<Vec<u8>>>,
     endpoint: String,
@@ -905,74 +950,26 @@ struct ConvertedTailStream {
     done_logged: bool,
 }
 
-impl futures::Stream for ConvertedTailStream {
-    type Item = std::io::Result<Bytes>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(item)) => {
-                if item.is_err() && !this.done_logged {
-                    this.done_logged = true;
-                    let tail_bytes = this.tail.lock().unwrap().clone();
-                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
-                    let duration_ms = this.start.elapsed().as_millis() as i64;
-                    let _ = this.db.insert_request_log(&RequestLog {
-                        ts: now_rfc3339(),
-                        endpoint: this.endpoint.clone(),
-                        model: this.model.clone(),
-                        provider_id: this.provider_id.clone(),
-                        status: this.status.as_u16() as i64,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        duration_ms,
-                        error: Some("upstream stream interrupted".to_string()),
-                    });
-                }
-                std::task::Poll::Ready(Some(item))
-            }
-            std::task::Poll::Ready(None) => {
-                if !this.done_logged {
-                    this.done_logged = true;
-                    let tail_bytes = this.tail.lock().unwrap().clone();
-                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
-                    let duration_ms = this.start.elapsed().as_millis() as i64;
-                    let _ = this.db.insert_request_log(&RequestLog {
-                        ts: now_rfc3339(),
-                        endpoint: this.endpoint.clone(),
-                        model: this.model.clone(),
-                        provider_id: this.provider_id.clone(),
-                        status: this.status.as_u16() as i64,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        duration_ms,
-                        error: None,
-                    });
-                }
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+impl TailLogStream {
+    fn log(&self, error: Option<String>) {
+        let tail_bytes = self.tail.lock().unwrap().clone();
+        let usage = Usage::from_sse_tail(&tail_bytes);
+        let duration_ms = self.start.elapsed().as_millis() as i64;
+        let _ = self.db.insert_request_log(&RequestLog {
+            ts: now_rfc3339(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+            provider_id: self.provider_id.clone(),
+            status: self.status.as_u16() as i64,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            duration_ms,
+            error,
+        });
     }
 }
 
-struct TailStream {
-    inner: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
-    tail: Arc<Mutex<Vec<u8>>>,
-    errored: Arc<Mutex<bool>>,
-    endpoint: String,
-    model: Option<String>,
-    provider_id: String,
-    db: crate::store::db::Database,
-    status: StatusCode,
-    start: Instant,
-    done_logged: bool,
-}
-
-impl futures::Stream for TailStream {
+impl futures::Stream for TailLogStream {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(
@@ -984,47 +981,14 @@ impl futures::Stream for TailStream {
             std::task::Poll::Ready(Some(item)) => {
                 if item.is_err() && !this.done_logged {
                     this.done_logged = true;
-                    *this.errored.lock().unwrap() = true;
-                    let tail_bytes = this.tail.lock().unwrap().clone();
-                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
-                    let duration_ms = this.start.elapsed().as_millis() as i64;
-                    let _ = this.db.insert_request_log(&RequestLog {
-                        ts: now_rfc3339(),
-                        endpoint: this.endpoint.clone(),
-                        model: this.model.clone(),
-                        provider_id: this.provider_id.clone(),
-                        status: this.status.as_u16() as i64,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        duration_ms,
-                        error: Some("upstream stream interrupted".to_string()),
-                    });
+                    this.log(Some("upstream stream interrupted".to_string()));
                 }
                 std::task::Poll::Ready(Some(item))
             }
             std::task::Poll::Ready(None) => {
                 if !this.done_logged {
                     this.done_logged = true;
-                    let tail_bytes = this.tail.lock().unwrap().clone();
-                    let errored = *this.errored.lock().unwrap();
-                    let usage = Usage::from_sse_tail(&this.endpoint, &tail_bytes);
-                    let duration_ms = this.start.elapsed().as_millis() as i64;
-                    let error = if errored {
-                        Some("upstream stream interrupted".to_string())
-                    } else {
-                        None
-                    };
-                    let _ = this.db.insert_request_log(&RequestLog {
-                        ts: now_rfc3339(),
-                        endpoint: this.endpoint.clone(),
-                        model: this.model.clone(),
-                        provider_id: this.provider_id.clone(),
-                        status: this.status.as_u16() as i64,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        duration_ms,
-                        error,
-                    });
+                    this.log(None);
                 }
                 std::task::Poll::Ready(None)
             }
