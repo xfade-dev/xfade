@@ -8,11 +8,11 @@ class Xfade < Formula
   on_macos do
     on_arm do
       url "https://github.com/xfade-dev/xfade/releases/download/v0.7.0/xfade-aarch64-apple-darwin.tar.gz"
-      sha256 "6e339dbcd2126dab7d7ba4a9b7ce263edf9295ac69d3073132d17a18c2aece23"
+      sha256 "da0dd5cee87fc6a3852fed4310ce455e3898137ffc944bf547a9ae539bf48581"
     end
     on_intel do
       url "https://github.com/xfade-dev/xfade/releases/download/v0.7.0/xfade-x86_64-apple-darwin.tar.gz"
-      sha256 "e6d745253b58edf0c0a24585454411ca422d78d15cd4b70d3e6624033f7852d2"
+      sha256 "d4b7761aeed5c9077fc4b6ff4ff1c52818a53c36b03ae8bb9658041d1517e0a0"
     end
   end
 
