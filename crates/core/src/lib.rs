@@ -12,4 +12,4 @@ pub use error::{CoreError, Result};
 pub use models::{Provider, ToolKind};
 pub use service::Core;
 pub use store::config::{Config, SecretsBackend};
-pub use store::secrets::{FileStore, KeyringStore, MockStore, SecretStore};
+pub use store::secrets::{FileStore, KeyringStore, SecretStore};

@@ -37,7 +37,7 @@ pub fn backup_file(path: &Path, backup_dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Sort by filename (timestamp suffix) and delete the oldest until `keep` remain.
-pub fn rotate(dir: &Path, keep: usize) -> Result<()> {
+fn rotate(dir: &Path, keep: usize) -> Result<()> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())

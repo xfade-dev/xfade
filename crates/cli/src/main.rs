@@ -16,7 +16,7 @@ mod tui;
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -208,7 +208,14 @@ fn data_dir() -> Result<PathBuf, CoreError> {
 }
 
 fn run(cli: Cli) -> Result<(), CoreError> {
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        // Bare `xfade`: the TUI is the default facade (see docs/architecture).
+        // run_tui degrades to a plain list when not on a terminal.
+        let core = build_core()?;
+        let tool = resolve_tui_tool(&core)?;
+        return tui::run_tui(&core, tool);
+    };
+    match cmd {
         Cmd::Add {
             tool,
             name,
