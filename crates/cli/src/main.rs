@@ -37,6 +37,15 @@ enum Cmd {
         /// Force official login (ignore the global base_url)
         #[arg(long)]
         official: bool,
+        /// Claude Code only: model for the `opus` slot (ANTHROPIC_DEFAULT_OPUS_MODEL)
+        #[arg(long)]
+        opus_model: Option<String>,
+        /// Claude Code only: model for the `sonnet` slot (ANTHROPIC_DEFAULT_SONNET_MODEL)
+        #[arg(long)]
+        sonnet_model: Option<String>,
+        /// Claude Code only: model for the `haiku` slot (ANTHROPIC_DEFAULT_HAIKU_MODEL)
+        #[arg(long)]
+        haiku_model: Option<String>,
     },
     /// List providers
     Ls {
@@ -62,6 +71,15 @@ enum Cmd {
         key: Option<String>,
         #[arg(long = "set", value_parser = parse_kv)]
         sets: Vec<(String, String)>,
+        /// Claude Code only: model for the `opus` slot (ANTHROPIC_DEFAULT_OPUS_MODEL)
+        #[arg(long)]
+        opus_model: Option<String>,
+        /// Claude Code only: model for the `sonnet` slot (ANTHROPIC_DEFAULT_SONNET_MODEL)
+        #[arg(long)]
+        sonnet_model: Option<String>,
+        /// Claude Code only: model for the `haiku` slot (ANTHROPIC_DEFAULT_HAIKU_MODEL)
+        #[arg(long)]
+        haiku_model: Option<String>,
     },
     /// Remove a provider (the active one cannot be removed)
     Rm {
@@ -187,6 +205,40 @@ fn parse_set_value(s: &str) -> serde_json::Value {
     serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
 }
 
+/// Claude Code per-slot model flags (opus/sonnet/haiku). Grouped so the
+/// add/edit commands don't grow a long, slot-flavored parameter list.
+#[derive(Default)]
+struct PerSlotModels {
+    opus: Option<String>,
+    sonnet: Option<String>,
+    haiku: Option<String>,
+}
+
+impl PerSlotModels {
+    /// Convert to `extra` entries. These flags only make sense for Claude Code;
+    /// using one on another tool is a usage error rather than something to
+    /// silently ignore.
+    fn entries(&self, tool: ToolKind) -> Result<Vec<(String, serde_json::Value)>, CoreError> {
+        let mut out = Vec::new();
+        for (flag, val) in [
+            ("opus-model", &self.opus),
+            ("sonnet-model", &self.sonnet),
+            ("haiku-model", &self.haiku),
+        ] {
+            if let Some(v) = val {
+                if tool != ToolKind::ClaudeCode {
+                    return Err(CoreError::ConfigParse {
+                        path: "args".into(),
+                        msg: format!("`--{flag}` is only valid for `--tool claude`"),
+                    });
+                }
+                out.push((flag.replace('-', "_"), serde_json::Value::String(v.clone())));
+            }
+        }
+        Ok(out)
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -223,7 +275,22 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             key,
             sets,
             official,
-        } => cmd_add(tool, name, base_url, key, sets, official),
+            opus_model,
+            sonnet_model,
+            haiku_model,
+        } => cmd_add(
+            tool,
+            name,
+            base_url,
+            key,
+            sets,
+            official,
+            PerSlotModels {
+                opus: opus_model,
+                sonnet: sonnet_model,
+                haiku: haiku_model,
+            },
+        ),
         Cmd::Ls { tool } => {
             let core = build_core()?;
             let list = core.list(tool)?;
@@ -356,6 +423,9 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             base_url,
             key,
             sets,
+            opus_model,
+            sonnet_model,
+            haiku_model,
         } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
@@ -370,6 +440,14 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             let mut map = p.extra.as_object().cloned().unwrap_or_default();
             for (k, v) in sets {
                 map.insert(k, parse_set_value(&v));
+            }
+            let slots = PerSlotModels {
+                opus: opus_model,
+                sonnet: sonnet_model,
+                haiku: haiku_model,
+            };
+            for (k, v) in slots.entries(tool)? {
+                map.insert(k, v);
             }
             if !map.is_empty() {
                 p.extra = serde_json::Value::Object(map);
@@ -734,6 +812,7 @@ fn cmd_add(
     key: Option<String>,
     sets: Vec<(String, String)>,
     official: bool,
+    slots: PerSlotModels,
 ) -> Result<(), CoreError> {
     let core = build_core()?;
     let global = core.config();
@@ -812,8 +891,16 @@ fn cmd_add(
     for (k, v) in sets {
         map.insert(k, parse_set_value(&v));
     }
-    // Non-interactive: global default model applies when the provider didn't set one.
-    if !interactive && !map.contains_key("model") {
+    // Explicit per-slot flags win over a `--set` of the same key.
+    for (k, v) in slots.entries(tool)? {
+        map.insert(k, v);
+    }
+    let has_per_slot = map.contains_key("opus_model")
+        || map.contains_key("sonnet_model")
+        || map.contains_key("haiku_model");
+    // Non-interactive: global default model applies when the provider didn't set
+    // one (and isn't in per-slot mode, where the single model is ignored).
+    if !interactive && !map.contains_key("model") && !has_per_slot {
         if let Some(m) = &global.model {
             map.insert("model".to_string(), serde_json::Value::String(m.clone()));
         }

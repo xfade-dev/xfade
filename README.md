@@ -48,6 +48,16 @@ xfade use kimi --tool codex
 xfade current --tool codex
 ```
 
+Claude Code supports per-slot models — pin a different model for each of the
+`opus` / `sonnet` / `haiku` slots (written as `ANTHROPIC_DEFAULT_*_MODEL`):
+
+```bash
+xfade add work --tool claude --base-url https://... --key sk-xxx \
+  --opus-model deepseek/deepseek-v4-pro \
+  --sonnet-model deepseek/deepseek-v4-flash \
+  --haiku-model deepseek/deepseek-v4-flash
+```
+
 Same for the other tools: `--tool claude-code|codex|open-code|pi|oh-my-pi|aider`.
 
 ## CLI command reference

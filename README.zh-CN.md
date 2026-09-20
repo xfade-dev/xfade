@@ -48,6 +48,16 @@ xfade use kimi --tool codex
 xfade current --tool codex
 ```
 
+Claude Code 支持按 slot 分别指定模型——为 `opus` / `sonnet` / `haiku` 每个 slot
+绑定不同模型（写入 `ANTHROPIC_DEFAULT_*_MODEL`）：
+
+```bash
+xfade add work --tool claude --base-url https://... --key sk-xxx \
+  --opus-model deepseek/deepseek-v4-pro \
+  --sonnet-model deepseek/deepseek-v4-flash \
+  --haiku-model deepseek/deepseek-v4-flash
+```
+
 其余工具同理：`--tool claude-code|codex|open-code|pi|oh-my-pi|aider`。
 
 ## CLI 命令速查

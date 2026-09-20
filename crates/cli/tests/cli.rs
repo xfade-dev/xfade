@@ -506,3 +506,60 @@ fn aider_end_to_end() {
     assert!(s.contains("sk-1"));
     assert!(s.contains("api.moonshot.cn"));
 }
+
+#[test]
+fn add_per_slot_model_writes_default_vars() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "work",
+            "--base-url",
+            "https://gw.example/anthropic",
+            "--key",
+            "sk-1",
+            "--opus-model",
+            "deepseek/deepseek-v4-pro",
+            "--sonnet-model",
+            "deepseek/deepseek-v4-flash",
+            "--haiku-model",
+            "deepseek/deepseek-v4-flash",
+        ])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["use", "work", "--tool", "claude"])
+        .assert()
+        .success();
+
+    let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+    assert!(s.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+    assert!(s.contains("deepseek/deepseek-v4-pro"));
+    assert!(s.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+    assert!(s.contains("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    // Per-slot mode must not also pin the single ANTHROPIC_MODEL.
+    assert!(!s.contains("\"ANTHROPIC_MODEL\""));
+}
+
+#[test]
+fn per_slot_flag_on_non_claude_fails() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args([
+            "add",
+            "--tool",
+            "codex",
+            "k",
+            "--base-url",
+            "https://x",
+            "--key",
+            "1",
+            "--opus-model",
+            "some-model",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only valid for `--tool claude`"));
+}
