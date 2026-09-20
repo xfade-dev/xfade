@@ -86,30 +86,58 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
     let mut app = App::new(tool, core);
-    let mut stats = load_stats(core);
+    let mut stats = load_stats(core, &app.tool);
 
     // Latency probes run in worker threads; results arrive over this channel.
     let (probe_tx, probe_rx) = mpsc::channel::<(String, Option<u128>)>();
-    let mut probing = false;
+    // Accumulators for the end-of-round summary message.
+    let (mut probe_ok, mut probe_fail, mut probe_worst) = (0u32, 0u32, 0u128);
 
     loop {
+        let mut drained = false;
         while let Ok((id, ms)) = probe_rx.try_recv() {
-            probing = false;
+            app.probing.remove(&id);
             match ms {
                 Some(ms) => {
-                    app.probes.insert(id.clone(), ms);
-                    app.message = Some(format!("{id}: {ms}ms"));
+                    app.probes.insert(id.clone(), app::ProbeResult::Ms(ms));
+                    probe_ok += 1;
+                    probe_worst = probe_worst.max(ms);
                 }
-                None => app.message = Some(format!("{id}: unreachable")),
+                None => {
+                    app.probes.insert(id.clone(), app::ProbeResult::Failed);
+                    probe_fail += 1;
+                }
             }
+            drained = true;
         }
+        // Per-provider badges carry the detail; the message line only needs a
+        // summary once the whole round finishes (results arrive out of order,
+        // so per-result messages would just overwrite each other).
+        if drained && app.probing.is_empty() {
+            let n = probe_ok + probe_fail;
+            app.message = Some(if probe_fail == 0 {
+                format!("{probe_ok}/{n} ok · worst {probe_worst}ms")
+            } else if probe_ok == 0 {
+                format!("all {n} unreachable")
+            } else {
+                format!("{probe_ok}/{n} ok · {probe_fail} down · worst {probe_worst}ms")
+            });
+            probe_ok = 0;
+            probe_fail = 0;
+            probe_worst = 0;
+        }
+
+        app.tick();
 
         terminal
             .draw(|f| ui::draw(f, &app, &stats))
             .map_err(|e| CoreError::Proxy(format!("draw: {e}")))?;
 
         // Poll with a timeout so probe results repaint without a keypress.
-        if !event::poll(Duration::from_millis(100))
+        // While the fader is sliding or a probe spinner is up, poll fast for
+        // smooth frames; otherwise idle at a slower cadence.
+        let poll_ms = if app.is_animating() { 16 } else { 100 };
+        if !event::poll(Duration::from_millis(poll_ms))
             .map_err(|e| CoreError::Proxy(format!("poll event: {e}")))?
         {
             continue;
@@ -128,7 +156,7 @@ fn event_loop(
                 KeyCode::Esc => app.cancel_edit(),
                 KeyCode::Enter => {
                     app.submit_edit(core);
-                    stats = load_stats(core);
+                    stats = load_stats(core, &app.tool);
                 }
                 KeyCode::Tab | KeyCode::Down => app.edit_next_field(),
                 KeyCode::Up => app.edit_prev_field(),
@@ -143,28 +171,48 @@ fn event_loop(
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('j') | KeyCode::Down => app.next(),
             KeyCode::Char('k') | KeyCode::Up => app.prev(),
-            KeyCode::Tab => app.next_tool(core),
+            KeyCode::Tab => {
+                app.next_tool(core);
+                stats = load_stats(core, &app.tool);
+            }
             KeyCode::Enter => {
                 app.switch_selected(core);
-                stats = load_stats(core);
+                stats = load_stats(core, &app.tool);
             }
             KeyCode::Char('e') => app.start_edit(),
             KeyCode::Char('t') => {
-                if probing {
+                if !app.probing.is_empty() {
                     app.message = Some("probe already running…".into());
-                } else if let Some(p) = app.selected_provider() {
-                    match p.base_url.as_deref().and_then(probe_target) {
-                        Some((host, port)) => {
-                            let id = p.id.clone();
+                } else {
+                    // Probe every provider of the current tool in parallel.
+                    // Official-login providers (no base_url) are skipped, as
+                    // are base_urls that fail to parse (counted separately).
+                    let mut targets: Vec<(String, String, u16)> = Vec::new();
+                    let mut unparseable = 0usize;
+                    for p in &app.providers {
+                        match p.base_url.as_deref().and_then(probe_target) {
+                            Some((host, port)) => targets.push((p.id.clone(), host, port)),
+                            None if p.base_url.is_some() => unparseable += 1,
+                            None => {}
+                        }
+                    }
+                    if targets.is_empty() {
+                        app.message = Some(if unparseable > 0 {
+                            format!("no probeable base_url ({unparseable} unparseable)")
+                        } else {
+                            "no probeable provider (all official)".into()
+                        });
+                    } else {
+                        let n = targets.len();
+                        for (id, host, port) in targets {
                             let tx = probe_tx.clone();
-                            probing = true;
-                            app.message = Some(format!("probing {id}…"));
+                            app.probing.insert(id.clone());
                             std::thread::spawn(move || {
                                 let ms = probe_latency(&host, port, Duration::from_secs(3));
                                 let _ = tx.send((id, ms));
                             });
                         }
-                        None => app.message = Some(format!("{} has no probeable base_url", p.id)),
+                        app.message = Some(format!("probing {n} providers…"));
                     }
                 }
             }
@@ -175,11 +223,13 @@ fn event_loop(
 }
 
 /// Token/latency aggregates for the status line, over the last `STATS_DAYS`.
-fn load_stats(core: &Core) -> Vec<StatsRow> {
+/// Scoped to `tool`: provider ids can collide across tools, so an unfiltered
+/// query would bleed another tool's numbers into this view.
+fn load_stats(core: &Core, tool: &ToolKind) -> Vec<StatsRow> {
     let Ok(since) = crate::parse_since(ui::STATS_DAYS) else {
         return Vec::new();
     };
     core.db()
-        .stats_since(&since, StatsGroupBy::Provider)
+        .stats_since(&since, StatsGroupBy::Provider, Some(tool))
         .unwrap_or_default()
 }

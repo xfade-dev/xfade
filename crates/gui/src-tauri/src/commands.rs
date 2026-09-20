@@ -280,7 +280,7 @@ pub async fn stats(
     by: StatsGroupBy,
 ) -> CmdResult<Vec<StatsRow>> {
     let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || core.db().stats_since(&since, by))
+    tauri::async_runtime::spawn_blocking(move || core.db().stats_since(&since, by, None))
         .await
         .map_err(err)?
         .map_err(err)

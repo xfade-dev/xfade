@@ -162,6 +162,7 @@ fn log_request(
     endpoint: &str,
     model: &Option<String>,
     provider_id: &str,
+    tool: &str,
     status: i64,
     usage: Usage,
     duration_ms: i64,
@@ -172,6 +173,7 @@ fn log_request(
         endpoint: endpoint.to_string(),
         model: model.clone(),
         provider_id: provider_id.to_string(),
+        tool: tool.to_string(),
         status,
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
@@ -275,6 +277,7 @@ fn prepare_bodies(
 async fn handle_success(
     svc: &ProxyService,
     route_id: &str,
+    tool: &str,
     resp: reqwest::Response,
     endpoint: &str,
     model: Option<String>,
@@ -290,6 +293,7 @@ async fn handle_success(
         handle_success_streaming(
             svc,
             route_id,
+            tool,
             resp,
             endpoint,
             model,
@@ -301,6 +305,7 @@ async fn handle_success(
         handle_success_non_streaming(
             svc,
             route_id,
+            tool,
             resp,
             endpoint,
             model,
@@ -316,6 +321,7 @@ async fn handle_success(
 fn handle_success_streaming(
     svc: &ProxyService,
     route_id: &str,
+    tool: &str,
     resp: reqwest::Response,
     endpoint: &str,
     model: Option<String>,
@@ -335,6 +341,7 @@ fn handle_success_streaming(
     };
 
     let provider_id_owned = route_id.to_string();
+    let tool_owned = tool.to_string();
     let endpoint_owned = endpoint.to_string();
     let model_owned = model.clone();
     let db = svc.core.db().clone();
@@ -362,6 +369,7 @@ fn handle_success_streaming(
             endpoint_owned,
             model_owned,
             provider_id_owned,
+            tool_owned,
             status,
             start,
         )
@@ -372,6 +380,7 @@ fn handle_success_streaming(
             endpoint_owned,
             model_owned,
             provider_id_owned,
+            tool_owned,
             status,
             start,
         )
@@ -399,6 +408,7 @@ fn body_looks_like_json(bytes: &[u8]) -> bool {
 async fn handle_success_non_streaming(
     svc: &ProxyService,
     route_id: &str,
+    tool: &str,
     resp: reqwest::Response,
     endpoint: &str,
     model: Option<String>,
@@ -422,6 +432,7 @@ async fn handle_success_non_streaming(
                 endpoint,
                 &model,
                 route_id,
+                tool,
                 0,
                 Usage::default(),
                 duration_ms,
@@ -453,6 +464,7 @@ async fn handle_success_non_streaming(
             endpoint,
             &model,
             route_id,
+            tool,
             StatusCode::BAD_GATEWAY.as_u16() as i64,
             Usage::default(),
             duration_ms,
@@ -478,6 +490,7 @@ async fn handle_success_non_streaming(
                     endpoint,
                     &model,
                     route_id,
+                    tool,
                     status.as_u16() as i64,
                     usage,
                     duration_ms,
@@ -495,6 +508,7 @@ async fn handle_success_non_streaming(
                     endpoint,
                     &model,
                     route_id,
+                    tool,
                     status.as_u16() as i64,
                     Usage::default(),
                     duration_ms,
@@ -514,6 +528,7 @@ async fn handle_success_non_streaming(
         endpoint,
         &model,
         route_id,
+        tool,
         status.as_u16() as i64,
         usage,
         duration_ms,
@@ -531,6 +546,7 @@ async fn handle_success_non_streaming(
 async fn handle_upstream_error(
     svc: &ProxyService,
     route_id: &str,
+    tool: &str,
     resp: reqwest::Response,
     endpoint: &str,
     model: &Option<String>,
@@ -547,6 +563,7 @@ async fn handle_upstream_error(
             endpoint,
             model,
             route_id,
+            tool,
             status.as_u16() as i64,
             usage,
             duration_ms,
@@ -569,6 +586,7 @@ async fn handle_upstream_error(
         endpoint,
         model,
         route_id,
+        tool,
         status.as_u16() as i64,
         usage,
         duration_ms,
@@ -644,6 +662,7 @@ async fn failover_loop(
                     return handle_success(
                         svc,
                         route_id,
+                        provider.tool.as_str(),
                         resp,
                         endpoint,
                         model,
@@ -654,13 +673,30 @@ async fn failover_loop(
                     .await;
                 }
                 if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    let _resp =
-                        handle_upstream_error(svc, route_id, resp, endpoint, &model, start).await;
+                    let _resp = handle_upstream_error(
+                        svc,
+                        route_id,
+                        provider.tool.as_str(),
+                        resp,
+                        endpoint,
+                        &model,
+                        start,
+                    )
+                    .await;
                     last_err = Some((status, String::new()));
                     continue;
                 }
                 // Other 4xx: passthrough, stop failover.
-                return handle_upstream_error(svc, route_id, resp, endpoint, &model, start).await;
+                return handle_upstream_error(
+                    svc,
+                    route_id,
+                    provider.tool.as_str(),
+                    resp,
+                    endpoint,
+                    &model,
+                    start,
+                )
+                .await;
             }
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
@@ -669,6 +705,7 @@ async fn failover_loop(
                     endpoint,
                     &model,
                     route_id,
+                    provider.tool.as_str(),
                     0,
                     Usage::default(),
                     duration_ms,
@@ -858,6 +895,7 @@ fn make_tapped_streaming_body<S>(
     endpoint: String,
     model: Option<String>,
     provider_id: String,
+    tool: String,
     status: StatusCode,
     start: Instant,
 ) -> Body
@@ -888,6 +926,7 @@ where
         endpoint,
         model,
         provider_id,
+        tool,
         db,
         status,
         start,
@@ -904,6 +943,7 @@ fn make_converted_tapped_streaming_body<S>(
     endpoint: String,
     model: Option<String>,
     provider_id: String,
+    tool: String,
     status: StatusCode,
     start: Instant,
 ) -> Body
@@ -927,6 +967,7 @@ where
         endpoint,
         model,
         provider_id,
+        tool,
         db,
         status,
         start,
@@ -944,6 +985,7 @@ struct TailLogStream {
     endpoint: String,
     model: Option<String>,
     provider_id: String,
+    tool: String,
     db: crate::store::db::Database,
     status: StatusCode,
     start: Instant,
@@ -960,6 +1002,7 @@ impl TailLogStream {
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             provider_id: self.provider_id.clone(),
+            tool: self.tool.clone(),
             status: self.status.as_u16() as i64,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,

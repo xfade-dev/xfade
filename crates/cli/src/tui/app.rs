@@ -2,9 +2,25 @@
 //! everything here is pure logic over `Core` so it can be unit-tested
 //! without a terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use xfade_core::{Core, Provider, ToolKind};
+
+/// Normalized knob positions (0.0 = far local end, 1.0 = far cloud end).
+pub const FADER_LOCAL: f32 = 0.2;
+pub const FADER_CLOUD: f32 = 0.8;
+/// Braille spinner frames shown while a latency probe is in flight.
+pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// How long the fader/status highlight lasts after a successful switch.
+const FLASH_DURATION: Duration = Duration::from_millis(450);
+
+/// Outcome of a latency probe against one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeResult {
+    Ms(u128),
+    Failed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
@@ -28,8 +44,17 @@ pub struct App {
     pub selected: usize,
     pub message: Option<String>,
     pub edit: Option<EditState>,
-    /// provider id -> last measured latency (ms) from the `t` probe.
-    pub probes: HashMap<String, u128>,
+    /// provider id -> outcome of the latest `t` probe.
+    pub probes: HashMap<String, ProbeResult>,
+    /// Animated knob position; eased toward [`fader_target`] on every tick.
+    pub fader_pos: f32,
+    /// provider ids with in-flight probes (the `t` key probes all probeable
+    /// providers of the current tool in parallel).
+    pub probing: HashSet<String>,
+    /// Frame counter driving the braille spinner.
+    pub spinner_tick: usize,
+    /// Switch-flash highlight deadline; cleared by [`tick`] once expired.
+    pub flash_until: Option<Instant>,
 }
 
 impl App {
@@ -41,8 +66,14 @@ impl App {
             message: None,
             edit: None,
             probes: HashMap::new(),
+            fader_pos: 0.5,
+            probing: HashSet::new(),
+            spinner_tick: 0,
+            flash_until: None,
         };
         app.reload(core);
+        // Snap to the target on open; only *changes* animate.
+        app.fader_pos = app.fader_target();
         app
     }
 
@@ -97,6 +128,43 @@ impl App {
         self.providers.iter().find(|p| p.is_active)
     }
 
+    /// Where the knob *should* rest for the current active provider.
+    fn fader_target(&self) -> f32 {
+        if is_local_url(self.active_provider().and_then(|p| p.base_url.as_deref())) {
+            FADER_LOCAL
+        } else {
+            FADER_CLOUD
+        }
+    }
+
+    /// True while the fader is mid-slide or a probe is in flight — the event
+    /// loop uses this to shorten its poll timeout for smooth frames.
+    pub fn is_animating(&self) -> bool {
+        (self.fader_pos - self.fader_target()).abs() > 0.005 || !self.probing.is_empty()
+    }
+
+    /// Advance all time-based state: fader easing, spinner frame, flash expiry.
+    pub fn tick(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        let target = self.fader_target();
+        let delta = target - self.fader_pos;
+        if delta.abs() > 0.005 {
+            self.fader_pos += delta * 0.35;
+        } else {
+            self.fader_pos = target;
+        }
+        if self
+            .flash_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.flash_until = None;
+        }
+    }
+
+    pub fn spinner_glyph(&self) -> char {
+        SPINNER[self.spinner_tick % SPINNER.len()]
+    }
+
     pub fn is_editing(&self) -> bool {
         self.edit.is_some()
     }
@@ -106,7 +174,10 @@ impl App {
             return;
         };
         self.message = Some(match core.use_provider(self.tool, &id) {
-            Ok(()) => format!("Switched to {id}"),
+            Ok(()) => {
+                self.flash_until = Some(Instant::now() + FLASH_DURATION);
+                format!("Switched to {id}")
+            }
             Err(e) => format!("Error: {e}"),
         });
         self.reload(core);
@@ -386,7 +457,7 @@ mod tests {
         add(&core, ToolKind::ClaudeCode, "dup", Some("http://old"));
         add(&core, ToolKind::Codex, "dup", Some("http://new"));
         let mut app = App::new(ToolKind::ClaudeCode, &core);
-        app.probes.insert("dup".into(), 42);
+        app.probes.insert("dup".into(), ProbeResult::Ms(42));
         app.next_tool(&core);
         assert!(
             !app.probes.contains_key("dup"),
@@ -409,6 +480,98 @@ mod tests {
             "provider b should be active after switch"
         );
         assert!(app.message.as_deref().unwrap_or("").contains('b'));
+    }
+
+    #[test]
+    fn fader_snaps_to_cloud_target_on_open_without_animating() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(
+            &core,
+            ToolKind::ClaudeCode,
+            "glm",
+            Some("http://gw.example:3000"),
+        );
+        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+        assert!(
+            (app.fader_pos - FADER_CLOUD).abs() < 1e-6,
+            "open must snap to cloud target, got {}",
+            app.fader_pos
+        );
+        assert!(!app.is_animating());
+    }
+
+    #[test]
+    fn fader_eases_to_local_target_after_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(
+            &core,
+            ToolKind::ClaudeCode,
+            "cloudy",
+            Some("http://gw.example:3000"),
+        );
+        add(
+            &core,
+            ToolKind::ClaudeCode,
+            "localy",
+            Some("http://127.0.0.1:11434"),
+        );
+        core.use_provider(ToolKind::ClaudeCode, "cloudy").unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.next(); // select localy
+        app.switch_selected(&core);
+        assert!(app.is_animating(), "switch must start a slide");
+        let mut positions = vec![app.fader_pos];
+        for _ in 0..60 {
+            app.tick();
+            positions.push(app.fader_pos);
+        }
+        assert!(
+            positions.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-4),
+            "knob must move across frames: {positions:?}"
+        );
+        assert!(
+            (app.fader_pos - FADER_LOCAL).abs() < 1e-3,
+            "knob must settle on the local target, got {}",
+            app.fader_pos
+        );
+        assert!(!app.is_animating());
+    }
+
+    #[test]
+    fn successful_switch_sets_flash_and_tick_expires_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        add(&core, ToolKind::ClaudeCode, "b", Some("http://y"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.next();
+        app.switch_selected(&core);
+        assert!(app.flash_until.is_some(), "flash must follow a switch");
+        app.flash_until = Some(Instant::now() - Duration::from_millis(1));
+        app.tick();
+        assert!(app.flash_until.is_none(), "expired flash must clear");
+    }
+
+    #[test]
+    fn tick_cycles_the_spinner_glyph() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        let first = app.spinner_glyph();
+        app.tick();
+        assert_ne!(first, app.spinner_glyph(), "spinner must advance");
+        for _ in 0..(SPINNER.len() - 1) {
+            app.tick();
+        }
+        assert_eq!(
+            app.spinner_glyph(),
+            first,
+            "spinner must wrap the full cycle"
+        );
     }
 
     #[test]

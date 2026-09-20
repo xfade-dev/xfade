@@ -9,8 +9,9 @@ use ratatui::{
     Frame,
 };
 use xfade_core::store::db::StatsRow;
+use xfade_core::ToolKind;
 
-use crate::tui::app::{is_local_url, App, EditField};
+use crate::tui::app::{App, EditField, ProbeResult};
 
 /// Stats window shown in the header (e.g. `7d`), parsed by `crate::parse_since`.
 pub const STATS_DAYS: &str = "7d";
@@ -30,71 +31,156 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
     if app.is_editing() {
         draw_edit(f, app, chunks[1]);
     } else {
-        draw_list(f, app, chunks[1]);
+        draw_list(f, app, stats, chunks[1]);
     }
     draw_footer(f, app, chunks[2]);
+}
+
+/// Mini tab bar over all tools; the current one is inverted.
+fn tool_tabs(app: &App) -> Line<'static> {
+    let spans = ToolKind::ALL
+        .iter()
+        .flat_map(|t| {
+            let style = if *t == app.tool {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            [
+                Span::styled(format!(" {} ", t.as_str()), style),
+                Span::raw(" "),
+            ]
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 /// The crossfader header: local ◀───[ ■ ]───▶ cloud, plus a status line with
 /// route / latency / token usage for the active provider.
 fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     let active = app.active_provider();
-    let local = is_local_url(active.and_then(|p| p.base_url.as_deref()));
-    let fader = fader_line(area.width.saturating_sub(2), local);
+    let flash = app.flash_until.is_some();
+    let fader = fader_line(area.width.saturating_sub(2), app.fader_pos, flash);
 
     let status = match active {
         Some(p) => {
-            let latency = app
-                .probes
-                .get(&p.id)
-                .map(|ms| format!("{ms}ms"))
-                .or_else(|| {
-                    stats
-                        .iter()
-                        .find(|r| r.group == p.id)
-                        .map(|r| format!("avg {}ms", r.avg_duration_ms))
-                })
-                .unwrap_or_else(|| "-".into());
+            let route_style = if flash {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let mut spans = vec![
+                Span::raw("Route: "),
+                Span::styled(p.id.clone(), route_style),
+                Span::raw("   Latency: "),
+            ];
+            if app.probing.contains(p.id.as_str()) {
+                spans.push(Span::styled(
+                    app.spinner_glyph().to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            } else if let Some(result) = app.probes.get(&p.id) {
+                match result {
+                    ProbeResult::Ms(ms) => spans.push(Span::styled(
+                        format!("{ms}ms"),
+                        Style::default().fg(latency_color(*ms)),
+                    )),
+                    ProbeResult::Failed => {
+                        spans.push(Span::styled("✖ timeout", Style::default().fg(Color::Red)))
+                    }
+                }
+            } else if let Some(row) = stats.iter().find(|r| r.group == p.id) {
+                spans.push(Span::styled(
+                    format!("avg {}ms", row.avg_duration_ms),
+                    Style::default().fg(latency_color(row.avg_duration_ms.max(0) as u128)),
+                ));
+            } else {
+                spans.push(Span::styled("-", Style::default().fg(Color::DarkGray)));
+            }
             let tokens = stats
                 .iter()
                 .find(|r| r.group == p.id)
                 .map(|r| format_tokens((r.prompt_tokens + r.completion_tokens).max(0) as u64))
                 .unwrap_or_else(|| "-".into());
-            format!(
-                "Route: {}   Latency: {latency}   Tokens({STATS_DAYS}): {tokens}",
-                p.id
-            )
+            spans.push(Span::raw(format!("   Tokens({STATS_DAYS}): ")));
+            spans.push(Span::raw(tokens));
+            Line::from(spans)
         }
-        None => "Route: (none)".into(),
+        None => Line::from("Route: (none)"),
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" xfade · {} ", app.tool.as_str()));
-    let text = Paragraph::new(vec![fader, Line::from(status)]).block(block);
+    let text = Paragraph::new(vec![tool_tabs(app), fader, status]).block(block);
     f.render_widget(text, area);
 }
 
-/// `local ◀──────[ ■ ]──────▶ cloud` with the knob on the local or cloud side.
-fn fader_line(width: u16, local: bool) -> Line<'static> {
+/// `local ◀──────[ ■ ]──────▶ cloud` with the knob at a continuous `pos`
+/// (0.0 = local end, 1.0 = cloud end). Flash paints the knob white.
+fn fader_line(width: u16, pos: f32, flash: bool) -> Line<'static> {
     let label_l = "local ";
     let label_r = " cloud";
     let track = (width as usize).saturating_sub(label_l.len() + label_r.len() + 2);
-    let knob_pos = if local { track / 5 } else { track * 4 / 5 };
-    let mut bar = String::with_capacity(track + 2);
-    bar.push('◀');
-    for i in 0..track {
-        bar.push(if i == knob_pos { '■' } else { '─' });
-    }
-    bar.push('▶');
+    let knob = ((pos.clamp(0.0, 1.0)) * track.saturating_sub(1) as f32).round() as usize;
+    let left: String = "─".repeat(knob);
+    let right: String = "─".repeat(track.saturating_sub(knob + 1));
+    let knob_style = if flash {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if pos < 0.5 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    };
     Line::from(vec![
         Span::styled(label_l, Style::default().fg(Color::Cyan)),
-        Span::raw(bar),
+        Span::raw("◀"),
+        Span::styled(left, Style::default().fg(Color::DarkGray)),
+        Span::styled("■", knob_style),
+        Span::styled(right, Style::default().fg(Color::DarkGray)),
+        Span::raw("▶"),
         Span::styled(label_r, Style::default().fg(Color::Magenta)),
     ])
 }
 
-fn draw_list(f: &mut Frame, app: &App, area: Rect) {
+/// Health color for a measured latency. Single source of truth for tiers —
+/// both the status line and the list badges use it, so a given latency always
+/// renders the same color everywhere.
+fn latency_color(ms: u128) -> Color {
+    if ms <= 100 {
+        Color::Cyan
+    } else if ms <= 300 {
+        Color::Green
+    } else if ms <= 800 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Per-row latency badge: ⚡ fast / ● tiered by threshold / ✖ timeout.
+fn latency_badge(result: &ProbeResult) -> (String, Color) {
+    match *result {
+        ProbeResult::Ms(ms) => (
+            format!("{} {ms}ms", if ms <= 100 { "⚡" } else { "●" }),
+            latency_color(ms),
+        ),
+        ProbeResult::Failed => ("✖ timeout".into(), Color::Red),
+    }
+}
+
+fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     let items: Vec<ListItem> = app
         .providers
         .iter()
@@ -102,12 +188,29 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, p)| {
             let mark = if p.is_active { "*" } else { " " };
             let base = p.base_url.as_deref().unwrap_or("(official)");
-            let probe = app
-                .probes
-                .get(&p.id)
-                .map(|ms| format!("{ms}ms"))
-                .unwrap_or_default();
-            let line = Line::from(Span::raw(format!("{mark} {:<18} {base:<40} {probe}", p.id)));
+            let mut spans = vec![Span::raw(format!("{mark} {:<18} {base:<40} ", p.id))];
+            if app.probing.contains(p.id.as_str()) {
+                spans.push(Span::styled(
+                    app.spinner_glyph().to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            } else if let Some(result) = app.probes.get(&p.id) {
+                let (badge, color) = latency_badge(result);
+                spans.push(Span::styled(badge, Style::default().fg(color)));
+            }
+            if let Some(row) = stats.iter().find(|r| r.group == p.id && r.requests > 0) {
+                let ok = 100.0 * (1.0 - row.errors as f64 / row.requests as f64);
+                let color = if ok >= 95.0 {
+                    Color::DarkGray
+                } else {
+                    Color::Red
+                };
+                spans.push(Span::styled(
+                    format!("   {ok:.0}% ok"),
+                    Style::default().fg(color),
+                ));
+            }
+            let line = Line::from(spans);
             let style = if i == app.selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -210,7 +313,7 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::App;
+    use crate::tui::app::{App, FADER_CLOUD, FADER_LOCAL, SPINNER};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::sync::Arc;
@@ -265,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn fader_knob_moves_to_local_side_for_loopback() {
-        let local = fader_line(60, true);
-        let cloud = fader_line(60, false);
+    fn fader_knob_moves_toward_local_end_as_pos_decreases() {
+        let local = fader_line(60, FADER_LOCAL, false);
+        let cloud = fader_line(60, FADER_CLOUD, false);
         let pos = |l: &Line| {
             l.spans
                 .iter()
@@ -277,6 +380,136 @@ mod tests {
                 .unwrap()
         };
         assert!(pos(&local) < pos(&cloud));
+        let mid = fader_line(60, 0.5, false);
+        assert!(pos(&local) < pos(&mid) && pos(&mid) < pos(&cloud));
+    }
+
+    #[test]
+    fn fader_knob_color_follows_side_and_flash() {
+        let knob_style = |l: &Line| {
+            l.spans
+                .iter()
+                .find(|s| s.content.as_ref() == "■")
+                .unwrap()
+                .style
+        };
+        assert_eq!(
+            knob_style(&fader_line(60, FADER_LOCAL, false)).fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            knob_style(&fader_line(60, FADER_CLOUD, false)).fg,
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            knob_style(&fader_line(60, 0.5, true)).fg,
+            Some(Color::White)
+        );
+    }
+
+    #[test]
+    fn fader_line_survives_degenerate_widths() {
+        // Track goes to zero below the label+borders width; the knob must
+        // still render and nothing may panic.
+        for width in [0u16, 5, 10, 11] {
+            let line = fader_line(width, 0.5, false);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.contains('■'),
+                "width {width} must keep the knob: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_line_shows_spinner_while_probing_active_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.probing.insert("glm".to_string());
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            SPINNER.iter().any(|g| text.contains(*g)),
+            "spinner glyph must render while probing:\n{text}"
+        );
+        assert!(!text.contains("Latency: -"), "no dead dash:\n{text}");
+    }
+
+    #[test]
+    fn tab_bar_renders_all_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        for t in ToolKind::ALL {
+            assert!(
+                text.contains(t.as_str()),
+                "tab for {} missing:\n{text}",
+                t.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn latency_badge_tiers_and_timeout() {
+        assert_eq!(latency_badge(&ProbeResult::Ms(12)).0, "⚡ 12ms");
+        assert_eq!(latency_badge(&ProbeResult::Ms(12)).1, Color::Cyan);
+        assert_eq!(latency_badge(&ProbeResult::Ms(201)).0, "● 201ms");
+        assert_eq!(latency_badge(&ProbeResult::Ms(201)).1, Color::Green);
+        assert_eq!(latency_badge(&ProbeResult::Ms(600)).1, Color::Yellow);
+        assert_eq!(latency_badge(&ProbeResult::Ms(1500)).1, Color::Red);
+        assert_eq!(latency_badge(&ProbeResult::Failed).0, "✖ timeout");
+        assert_eq!(latency_badge(&ProbeResult::Failed).1, Color::Red);
+    }
+
+    #[test]
+    fn list_rows_show_badge_and_success_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.probes.insert("glm".into(), ProbeResult::Ms(12));
+        let stats = vec![StatsRow {
+            group: "glm".into(),
+            requests: 100,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            errors: 2,
+            avg_duration_ms: 150,
+        }];
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &stats)).unwrap();
+        let text = buffer_text(&terminal);
+        // ⚡ is a wide (2-column) glyph, so assert the parts separately.
+        assert!(text.contains('⚡'), "badge glyph missing:\n{text}");
+        assert!(text.contains("12ms"), "badge latency missing:\n{text}");
+        assert!(text.contains("98% ok"), "success rate missing:\n{text}");
     }
 
     #[test]

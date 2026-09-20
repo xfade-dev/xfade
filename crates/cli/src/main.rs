@@ -567,7 +567,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 _ => StatsGroupBy::Provider,
             };
             let core = build_core()?;
-            let rows = core.db().stats_since(&since_ts, group_by)?;
+            let rows = core.db().stats_since(&since_ts, group_by, None)?;
             if rows.is_empty() {
                 println!("no requests in the last {since}");
                 return Ok(());

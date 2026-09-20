@@ -245,6 +245,7 @@ mod tests {
             .stats_since(
                 "2020-01-01T00:00:00Z",
                 crate::store::db::StatsGroupBy::Provider,
+                None,
             )
             .unwrap();
         assert_eq!(stats.len(), 1);
@@ -345,6 +346,7 @@ mod tests {
             .stats_since(
                 "2020-01-01T00:00:00Z",
                 crate::store::db::StatsGroupBy::Provider,
+                None,
             )
             .unwrap();
         assert_eq!(stats[0].prompt_tokens, 7);
@@ -382,6 +384,7 @@ mod tests {
             .stats_since(
                 "2020-01-01T00:00:00Z",
                 crate::store::db::StatsGroupBy::Provider,
+                None,
             )
             .unwrap();
         assert_eq!(stats.iter().find(|s| s.group == "yy").unwrap().errors, 1);

@@ -51,6 +51,7 @@ export interface RequestLog {
   endpoint: string;
   model: string | null;
   provider_id: string;
+  tool: string;
   status: number;
   prompt_tokens: number;
   completion_tokens: number;

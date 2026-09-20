@@ -13,6 +13,8 @@ pub struct RequestLog {
     pub endpoint: String,
     pub model: Option<String>,
     pub provider_id: String,
+    /// Tool the provider belongs to (provider ids can collide across tools).
+    pub tool: String,
     pub status: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -108,7 +110,8 @@ impl Database {
                 provider_id TEXT NOT NULL, status INTEGER NOT NULL,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
-                duration_ms INTEGER NOT NULL, error TEXT
+                duration_ms INTEGER NOT NULL, error TEXT,
+                tool TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);
             CREATE TABLE IF NOT EXISTS circuit_state (
@@ -135,6 +138,23 @@ impl Database {
         if !existing_cols.contains("target_protocol") {
             conn.execute(
                 "ALTER TABLE proxy_state ADD COLUMN target_protocol TEXT NOT NULL DEFAULT 'chat'",
+                [],
+            )?;
+        }
+        // Same pattern for request_logs: pre-tool-column databases get a
+        // default of '' (those rows only show up in unfiltered stats views).
+        let mut stmt = conn.prepare("PRAGMA table_info(request_logs)")?;
+        let mut rows = stmt.query([])?;
+        let mut log_cols = std::collections::HashSet::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            log_cols.insert(name);
+        }
+        drop(rows);
+        drop(stmt);
+        if !log_cols.contains("tool") {
+            conn.execute(
+                "ALTER TABLE request_logs ADD COLUMN tool TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -301,13 +321,14 @@ impl Database {
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO request_logs (ts, endpoint, model, provider_id, status, prompt_tokens, completion_tokens, duration_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 log.ts,
                 log.endpoint,
                 log.model,
                 log.provider_id,
+                log.tool,
                 log.status,
                 log.prompt_tokens,
                 log.completion_tokens,
@@ -330,24 +351,36 @@ impl Database {
         Ok(())
     }
 
-    /// Aggregate request stats since `since_ts` (RFC3339).
-    pub fn stats_since(&self, since_ts: &str, by: StatsGroupBy) -> Result<Vec<StatsRow>> {
+    /// Aggregate request stats since `since_ts` (RFC3339). When `tool` is
+    /// given, only rows logged for that tool's providers are counted —
+    /// provider ids can collide across tools, so scoped views (TUI) must
+    /// filter by tool to avoid bleeding another tool's numbers in.
+    pub fn stats_since(
+        &self,
+        since_ts: &str,
+        by: StatsGroupBy,
+        tool: Option<&ToolKind>,
+    ) -> Result<Vec<StatsRow>> {
         let group_expr = match by {
             StatsGroupBy::Provider => "provider_id",
             StatsGroupBy::Model => "COALESCE(model, '(unknown)')",
         };
+        let tool_filter = if tool.is_some() { " AND tool = ?2" } else { "" };
         let sql = format!(
             "SELECT {group_expr}, COUNT(*),
                     COALESCE(SUM(prompt_tokens), 0),
                     COALESCE(SUM(completion_tokens), 0),
                     SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
                     CAST(AVG(duration_ms) AS INTEGER)
-             FROM request_logs WHERE ts >= ?1
+             FROM request_logs WHERE ts >= ?1{tool_filter}
              GROUP BY {group_expr} ORDER BY 2 DESC"
         );
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(params![since_ts])?;
+        let mut rows = match tool {
+            Some(t) => stmt.query(params![since_ts, t.as_str()])?,
+            None => stmt.query(params![since_ts])?,
+        };
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(StatsRow {
@@ -366,7 +399,7 @@ impl Database {
     pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT ts, endpoint, model, provider_id, status, prompt_tokens, completion_tokens, duration_ms, error
+            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![limit as i64])?;
@@ -377,11 +410,12 @@ impl Database {
                 endpoint: row.get(1)?,
                 model: row.get(2)?,
                 provider_id: row.get(3)?,
-                status: row.get(4)?,
-                prompt_tokens: row.get(5)?,
-                completion_tokens: row.get(6)?,
-                duration_ms: row.get(7)?,
-                error: row.get(8)?,
+                tool: row.get(4)?,
+                status: row.get(5)?,
+                prompt_tokens: row.get(6)?,
+                completion_tokens: row.get(7)?,
+                duration_ms: row.get(8)?,
+                error: row.get(9)?,
             });
         }
         Ok(out)
@@ -615,6 +649,29 @@ mod tests {
         assert_eq!(routes, vec!["yy".to_string()]);
         assert_eq!(model_override.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(target_protocol, "messages");
+        // The old request_logs schema had no tool column; migrate() must add it.
+        db.insert_request_log(&RequestLog {
+            ts: "2026-07-26T10:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: None,
+            provider_id: "yy".into(),
+            tool: "claude".into(),
+            status: 200,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            duration_ms: 5,
+            error: None,
+        })
+        .unwrap();
+        let rows = db
+            .stats_since(
+                "2026-01-01T00:00:00Z",
+                StatsGroupBy::Provider,
+                Some(&ToolKind::ClaudeCode),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 1);
     }
 
     #[test]
@@ -625,6 +682,7 @@ mod tests {
             endpoint: "chat".into(),
             model: Some("gpt-5.6-luna".into()),
             provider_id: "yy".into(),
+            tool: "claude".into(),
             status: 200,
             prompt_tokens: 100,
             completion_tokens: 50,
@@ -637,6 +695,7 @@ mod tests {
             endpoint: "messages".into(),
             model: Some("claude-sonnet-4-6".into()),
             provider_id: "yy".into(),
+            tool: "claude".into(),
             status: 429,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -650,6 +709,7 @@ mod tests {
             endpoint: "chat".into(),
             model: Some("claude-sonnet-4-6".into()),
             provider_id: "yy".into(),
+            tool: "claude".into(),
             status: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -658,16 +718,73 @@ mod tests {
         })
         .unwrap();
         let rows = db
-            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider)
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider, None)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].requests, 3);
         assert_eq!(rows[0].prompt_tokens, 100);
         assert_eq!(rows[0].errors, 2);
         let by_model = db
-            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model)
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model, None)
             .unwrap();
         assert_eq!(by_model.len(), 2);
+    }
+
+    #[test]
+    fn stats_tool_filter_isolates_same_id_providers_across_tools() {
+        let db = Database::open_memory().unwrap();
+        let log = |tool: &str| {
+            db.insert_request_log(&RequestLog {
+                ts: "2026-07-26T10:00:00Z".into(),
+                endpoint: "chat".into(),
+                model: None,
+                provider_id: "dup".into(),
+                tool: tool.into(),
+                status: 200,
+                prompt_tokens: 10,
+                completion_tokens: 0,
+                duration_ms: 100,
+                error: None,
+            })
+            .unwrap();
+        };
+        log("claude");
+        log("claude");
+        log("codex");
+        // Unfiltered: rows merge under the shared id.
+        let all = db
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider, None)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].requests, 3);
+        // Tool-scoped: only that tool's rows count.
+        let claude = db
+            .stats_since(
+                "2026-07-25T00:00:00Z",
+                StatsGroupBy::Provider,
+                Some(&ToolKind::ClaudeCode),
+            )
+            .unwrap();
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].requests, 2);
+        let codex = db
+            .stats_since(
+                "2026-07-25T00:00:00Z",
+                StatsGroupBy::Provider,
+                Some(&ToolKind::Codex),
+            )
+            .unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].requests, 1);
+        // A tool with no logs returns nothing.
+        assert!(db
+            .stats_since(
+                "2026-07-25T00:00:00Z",
+                StatsGroupBy::Provider,
+                Some(&ToolKind::Aider)
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -677,6 +794,7 @@ mod tests {
             endpoint: "chat".into(),
             model: Some("gpt-x".into()),
             provider_id: "yy".into(),
+            tool: "claude".into(),
             status: 200,
             prompt_tokens: 1,
             completion_tokens: 2,
