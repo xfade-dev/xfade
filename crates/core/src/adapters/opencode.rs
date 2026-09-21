@@ -102,10 +102,19 @@ impl ToolAdapter for OpenCodeAdapter {
                     path: "provider".into(),
                     msg: format!("third-party provider '{id}' is missing base_url"),
                 })?;
+            // Canonical form: `models` object ({ "<model-id>": { "name": ... } }).
+            // Accept `model = "<id>"` as a shorthand and synthesize that object.
             let models = provider
                 .extra
                 .get("models")
                 .cloned()
+                .or_else(|| {
+                    provider.extra.get("model").and_then(|m| m.as_str()).map(|m| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert(m.to_string(), json!({ "name": m }));
+                        serde_json::Value::Object(obj)
+                    })
+                })
                 .unwrap_or_else(|| json!({}));
             // The openai-compatible SDK appends /chat/completions to baseURL,
             // so a bare host must carry the /v1 suffix.
@@ -201,6 +210,18 @@ mod tests {
         let auth = read_auth(&dir);
         assert_eq!(auth["kimi"]["type"], "api");
         assert_eq!(auth["kimi"]["key"], "sk-k");
+    }
+
+    #[test]
+    fn model_shorthand_synthesizes_models() {
+        let (dir, ad) = setup();
+        let mut p = Provider::new("office", ToolKind::OpenCode, Some("https://x".into()));
+        p.extra = json!({"model": "deepseek-v4-flash"});
+        ad.apply(&p, Some("k")).unwrap();
+
+        let doc = read_doc(&dir);
+        let models = &doc["provider"]["office"]["models"];
+        assert_eq!(models["deepseek-v4-flash"]["name"], "deepseek-v4-flash");
     }
 
     #[test]
