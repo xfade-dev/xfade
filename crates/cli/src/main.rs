@@ -774,7 +774,15 @@ fn self_update() -> Result<(), CoreError> {
         let current_exe =
             std::env::current_exe().map_err(|e| CoreError::Proxy(format!("current_exe: {e}")))?;
         std::fs::copy(&new_bin, &current_exe).map_err(|e| {
-            CoreError::Proxy(format!("replace binary ({}): {e}", current_exe.display()))
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                CoreError::Proxy(format!(
+                    "replace binary ({}): permission denied — \
+                     run `sudo xfade self-update` to overwrite a system-installed binary",
+                    current_exe.display()
+                ))
+            } else {
+                CoreError::Proxy(format!("replace binary ({}): {e}", current_exe.display()))
+            }
         })?;
         println!("xfade: updated to {tag}");
         Ok(())
