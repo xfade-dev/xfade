@@ -135,10 +135,7 @@ impl ToolAdapter for CodexAdapter {
             prov.insert("name".into(), toml::Value::String(id.clone()));
             prov.insert("base_url".into(), toml::Value::String(url.to_string()));
             prov.insert("wire_api".into(), toml::Value::String(wire_api.to_string()));
-            prov.insert(
-                "requires_openai_auth".into(),
-                toml::Value::Boolean(true),
-            );
+            prov.insert("requires_openai_auth".into(), toml::Value::Boolean(true));
 
             let providers = root
                 .entry("model_providers")
@@ -295,9 +292,9 @@ mod tests {
         );
         assert_eq!(prov["wire_api"].as_str().unwrap(), "responses");
         assert!(prov.get("env_key").is_none()); // don't write env_key; go through auth.json
-        // requires_openai_auth must be set, else Codex sends no Authorization
-        // header (upstream 401 "No api key passed in").
-        assert_eq!(prov["requires_openai_auth"].as_bool().unwrap(), true);
+                                                // requires_openai_auth must be set, else Codex sends no Authorization
+                                                // header (upstream 401 "No api key passed in").
+        assert!(prov["requires_openai_auth"].as_bool().unwrap());
 
         let auth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),

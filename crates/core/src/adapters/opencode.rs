@@ -109,11 +109,15 @@ impl ToolAdapter for OpenCodeAdapter {
                 .get("models")
                 .cloned()
                 .or_else(|| {
-                    provider.extra.get("model").and_then(|m| m.as_str()).map(|m| {
-                        let mut obj = serde_json::Map::new();
-                        obj.insert(m.to_string(), json!({ "name": m }));
-                        serde_json::Value::Object(obj)
-                    })
+                    provider
+                        .extra
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .map(|m| {
+                            let mut obj = serde_json::Map::new();
+                            obj.insert(m.to_string(), json!({ "name": m }));
+                            serde_json::Value::Object(obj)
+                        })
                 })
                 .unwrap_or_else(|| json!({}));
             // The openai-compatible SDK appends /chat/completions to baseURL,

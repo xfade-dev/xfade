@@ -185,7 +185,7 @@ pub fn load(home: &Path) -> Result<()> {
 /// unloading a job that was never loaded only prints a launchctl warning
 /// (exit 0) and is ignored.
 pub fn unload_job(home: &Path) -> Result<()> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     let _ = home;
     #[cfg(target_os = "macos")]
     {
