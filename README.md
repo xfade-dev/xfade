@@ -6,8 +6,11 @@ Switch API providers between AI coding tools like Claude Code / Codex / OpenCode
 
 CLI (`xfade`) + Tauri GUI, implemented in Rust.
 
+![xfade TUI — the crossfader](docs/demo.gif)
+
 ## Features
 
+- **TUI**: bare `xfade` opens a crossfader-style TUI — per-tool tabs, provider health badges, parallel probe-all, and inline edit; falls back to a plain list when stdout is not a terminal.
 - **Provider switching**: add/remove/edit providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, one-command switch writes each tool's config (settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml), stores keys in the system keyring, auto-backs-up before switching.
 - **Local proxy**: `xfade serve` exposes OpenAI/Anthropic-compatible endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`) with route failover, circuit breaking, token stats, and request logs.
 - **Protocol conversion**: bidirectional Anthropic↔OpenAI conversion (`target_protocol`), decoupling clients from the upstream protocol.
@@ -48,6 +51,8 @@ xfade use kimi --tool codex
 xfade current --tool codex
 ```
 
+Tip: run bare `xfade` to open the interactive TUI and switch providers with arrow keys / fader.
+
 Claude Code supports per-slot models — pin a different model for each of the
 `opus` / `sonnet` / `haiku` slots (written as `ANTHROPIC_DEFAULT_*_MODEL`):
 
@@ -69,10 +74,13 @@ xfade use <id> --tool <t>
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
-xfade presets --tool <t>
+xfade presets                     # list built-in presets for all tools
 xfade import --tool <t>            # import from the tool's existing config
 xfade backup ls|restore --tool <t>
 xfade completion <shell>
+xfade tui [--tool <t>]             # interactive crossfader TUI (default: bare `xfade`)
+xfade config [set <k> <v>]         # view/set global config (secrets backend, shared base_url/model/api)
+xfade self-update                  # update to the latest GitHub release
 ```
 
 ### Local proxy

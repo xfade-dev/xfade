@@ -6,8 +6,11 @@
 
 CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 
+![xfade TUI —— crossfader 演示](docs/demo.gif)
+
 ## 功能
 
+- **TUI**：裸 `xfade` 直接打开 crossfader 风格 TUI——按工具分页签、provider 健康徽章、并行探测全部 provider、行内编辑；非终端环境自动退化为普通列表。
 - **Provider 切换**：为 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 增删改查 provider，一键切换写各自配置（settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml），系统钥匙串存 key，切换前自动备份。
 - **本地代理**：`xfade serve` 起 OpenAI/Anthropic 兼容端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/models`），支持路由 failover、熔断、token 统计、请求日志。
 - **协议互转**：Anthropic↔OpenAI 双向转换（`target_protocol`），让客户端与上游协议解耦。
@@ -48,6 +51,8 @@ xfade use kimi --tool codex
 xfade current --tool codex
 ```
 
+提示：直接运行 `xfade` 打开交互式 TUI，用方向键 / 推子切换 provider。
+
 Claude Code 支持按 slot 分别指定模型——为 `opus` / `sonnet` / `haiku` 每个 slot
 绑定不同模型（写入 `ANTHROPIC_DEFAULT_*_MODEL`）：
 
@@ -69,10 +74,13 @@ xfade use <id> --tool <t>
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
-xfade presets --tool <t>
+xfade presets                     # 列出所有工具的内置预设
 xfade import --tool <t>            # 从工具现有配置导入
 xfade backup ls|restore --tool <t>
 xfade completion <shell>
+xfade tui [--tool <t>]             # 交互式 crossfader TUI（默认：裸 `xfade`）
+xfade config [set <k> <v>]         # 查看/设置全局配置（secrets 后端、共享 base_url/model/api）
+xfade self-update                  # 自更新到最新 GitHub Release
 ```
 
 ### 本地代理

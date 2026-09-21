@@ -2,6 +2,18 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.8.0 — 2026-09-21
+
+### New
+- **feat(cli)**: crossfader TUI is now the default facade — bare `xfade` opens it (per-tool tabs, provider health badges, parallel probe-all, inline edit). Non-TTY environments degrade to a plain list, so scripts stay safe. Previously bare `xfade` printed help.
+- **feat(cli)**: Claude Code per-slot models — `--opus-model` / `--sonnet-model` / `--haiku-model` on `add`/`edit` (written as `ANTHROPIC_DEFAULT_*_MODEL`); rejected on non-Claude tools instead of being silently ignored.
+
+### Fixes & refactor
+- **feat(core)**: integration fixes across the seven supported clients + core audit refactor.
+
+### Docs
+- **docs**: README (EN/zh-CN) now documents the TUI, `xfade self-update`, and `xfade config`; fixed the `presets` reference (the `--tool` flag never existed).
+
 ## v0.7.0 — 2026-09-14
 
 ### New tools
