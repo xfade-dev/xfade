@@ -2,6 +2,15 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.8.1 — 2026-09-21
+
+### Fixes
+- **fix(codex)**: third-party providers now write `requires_openai_auth = true` — Codex ≥0.155 treats a provider with neither `env_key` nor `requires_openai_auth` as unauthenticated and drops the Authorization header (upstream 401 "No api key passed in").
+- **fix(daemon)**: `xfade serve install` no longer deletes the plist it just wrote (the old `unload()` removed the file, so `load()` failed with "daemon not installed"); `serve status` now prints the host.
+
+### New
+- **feat(opencode)**: accept `--set model=<id>` shorthand (synthesizes the `models` object) alongside the verbose `--set 'models={...}'` form.
+
 ## v0.8.0 — 2026-09-21
 
 ### New

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "xfade-gui",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "identifier": "ai.xfade.gui",
   "build": {
     "frontendDist": "../dist",
