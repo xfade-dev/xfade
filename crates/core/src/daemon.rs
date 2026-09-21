@@ -179,18 +179,26 @@ pub fn load(home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unload the daemon.
-pub fn unload(home: &Path) -> Result<()> {
-    #[cfg(not(target_os = "macos"))]
+/// Unload the running job WITHOUT removing the plist/systemd unit file.
+/// Used by `install` to tear down a previously-loaded job before reloading:
+/// the freshly-written plist must survive so `load` can find it. Idempotent —
+/// unloading a job that was never loaded only prints a launchctl warning
+/// (exit 0) and is ignored.
+pub fn unload_job(home: &Path) -> Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = home;
     #[cfg(target_os = "macos")]
     {
         let p = plist_path(home);
         if p.exists() {
+            // Best-effort teardown: a job that was never loaded (or was already
+            // unloaded) makes `launchctl unload` print "Unload failed" to stderr;
+            // that's the expected common case here, so silence it.
             let _ = std::process::Command::new("launchctl")
                 .args(["unload", &p.display().to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
-            let _ = std::fs::remove_file(&p);
         }
     }
     #[cfg(target_os = "linux")]
@@ -198,8 +206,20 @@ pub fn unload(home: &Path) -> Result<()> {
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "disable", "--now", LABEL])
             .status();
-        let p = systemd_unit_path();
-        let _ = std::fs::remove_file(&p);
+    }
+    Ok(())
+}
+
+/// Unload the daemon and remove its plist/systemd unit file (uninstall).
+pub fn unload(home: &Path) -> Result<()> {
+    unload_job(home)?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::fs::remove_file(plist_path(home));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::fs::remove_file(systemd_unit_path());
     }
     Ok(())
 }

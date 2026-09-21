@@ -553,7 +553,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                                 Ok(r) if r.status().is_success() => {
                                     let v: serde_json::Value = r.json().await.unwrap_or_default();
                                     println!(
-                                        "daemon: running :{} auth={}",
+                                        "daemon: running {}:{} auth={}",
+                                        cfg.host,
                                         cfg.port,
                                         cfg.auth_token.is_some()
                                     );

@@ -37,7 +37,7 @@ pub fn install(
     }
 
     if load {
-        daemon::unload(home)?;
+        daemon::unload_job(home)?;
         daemon::load(home)?;
     }
     Ok(())
@@ -101,5 +101,63 @@ mod tests {
     fn uninstall_idempotent_when_not_installed() {
         let dir = setup_home();
         uninstall(dir.path(), false).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unload_job_keeps_plist_but_unload_removes_it() {
+        let dir = setup_home();
+        let home = dir.path();
+        daemon::write_plist(
+            "/usr/bin/true",
+            &DaemonConfig {
+                host: "127.0.0.1".into(),
+                port: 24860,
+                auth_token: None,
+            },
+            home,
+        )
+        .unwrap();
+        let p = daemon::plist_path(home);
+        assert!(p.exists());
+        // install's reload path must keep the plist so load() can find it.
+        daemon::unload_job(home).unwrap();
+        assert!(p.exists(), "unload_job must not remove the plist");
+        // uninstall's unload removes it.
+        daemon::unload(home).unwrap();
+        assert!(!p.exists(), "unload must remove the plist");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_errors_when_plist_missing() {
+        let dir = setup_home();
+        let err = daemon::load(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("daemon not installed"),
+            "expected 'daemon not installed' hint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn daemon_json_roundtrip() {
+        let dir = setup_home();
+        let dd = daemon::data_dir(dir.path());
+        let cfg = DaemonConfig {
+            host: "127.0.0.1".into(),
+            port: 9999,
+            auth_token: Some("tok".into()),
+        };
+        daemon::write(&dd, &cfg).unwrap();
+        let got = daemon::read(&dd).expect("daemon.json should be readable");
+        assert_eq!(got.host, "127.0.0.1");
+        assert_eq!(got.port, 9999);
+        assert_eq!(got.auth_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn daemon_json_read_none_when_missing() {
+        let dir = setup_home();
+        assert!(daemon::read(&daemon::data_dir(dir.path())).is_none());
     }
 }
