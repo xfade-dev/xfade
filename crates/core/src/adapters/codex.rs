@@ -126,13 +126,19 @@ impl ToolAdapter for CodexAdapter {
                 root.insert("model_context_window".into(), toml::Value::Integer(cw));
             }
 
-            // Note: don't write env_key. Codex forces a provider with env_key to read the key
-            // from that env var (ignoring auth.json entirely); omitting env_key falls back to
-            // auth.json's OPENAI_API_KEY — consistent with this tool's keyring → auth.json flow.
+            // Note: newer Codex treats a provider with neither env_key nor
+            // requires_openai_auth as "no auth" and sends no Authorization header
+            // (upstreams then 401 "No api key passed in"). Set requires_openai_auth
+            // so Codex authenticates with the OPENAI_API_KEY written to auth.json
+            // (it ignores env_key when requires_openai_auth is set).
             let mut prov = toml::map::Map::new();
             prov.insert("name".into(), toml::Value::String(id.clone()));
             prov.insert("base_url".into(), toml::Value::String(url.to_string()));
             prov.insert("wire_api".into(), toml::Value::String(wire_api.to_string()));
+            prov.insert(
+                "requires_openai_auth".into(),
+                toml::Value::Boolean(true),
+            );
 
             let providers = root
                 .entry("model_providers")
@@ -289,6 +295,9 @@ mod tests {
         );
         assert_eq!(prov["wire_api"].as_str().unwrap(), "responses");
         assert!(prov.get("env_key").is_none()); // don't write env_key; go through auth.json
+        // requires_openai_auth must be set, else Codex sends no Authorization
+        // header (upstream 401 "No api key passed in").
+        assert_eq!(prov["requires_openai_auth"].as_bool().unwrap(), true);
 
         let auth: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".codex/auth.json")).unwrap(),
