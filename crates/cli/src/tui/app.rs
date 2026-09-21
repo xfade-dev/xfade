@@ -306,7 +306,13 @@ fn is_loopback_or_private(host: &str) -> bool {
     if host == "localhost" || host == "::1" {
         return true;
     }
-    let octets: Vec<u8> = host.split('.').filter_map(|s| s.parse().ok()).collect();
+    // `parse::<u8>` must be explicit: on Windows, crossterm pulls in
+    // `encode_unicode`, whose extra `FromIterator<u8>` impls make the
+    // inferred collect target ambiguous (E0283/E0284).
+    let octets: Vec<u8> = host
+        .split('.')
+        .filter_map(|s| s.parse::<u8>().ok())
+        .collect();
     if octets.len() != 4 {
         return false;
     }
