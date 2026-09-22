@@ -1,4 +1,13 @@
-export type ToolKind = "claude-code" | "codex" | "open-code" | "pi" | "oh-my-pi" | "aider";
+export type ToolKind =
+  | "claude-code"
+  | "codex"
+  | "open-code"
+  | "pi"
+  | "oh-my-pi"
+  | "aider"
+  | "cline"
+  | "hermes"
+  | "openclaw";
 
 export interface Provider {
   id: string;

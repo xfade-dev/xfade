@@ -120,6 +120,50 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
         ToolKind::Pi | ToolKind::OhMyPi | ToolKind::Aider | ToolKind::Cline => {
             v.extend(openai_presets());
         }
+        ToolKind::Hermes => {
+            v.extend([
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::json!({"model": "anthropic/claude-sonnet-4"}),
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::json!({"model": "kimi-k2.5"}),
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com"),
+                    serde_json::json!({"model": "deepseek-chat"}),
+                ),
+            ]);
+        }
+        ToolKind::OpenClaw => {
+            v.extend([
+                p(
+                    "openrouter",
+                    "OpenRouter",
+                    Some("https://openrouter.ai/api/v1"),
+                    serde_json::json!({"model": "anthropic/claude-sonnet-4"}),
+                ),
+                p(
+                    "kimi",
+                    "Kimi (Moonshot)",
+                    Some("https://api.moonshot.cn/v1"),
+                    serde_json::json!({"model": "kimi-k2.5"}),
+                ),
+                p(
+                    "deepseek",
+                    "DeepSeek",
+                    Some("https://api.deepseek.com"),
+                    serde_json::json!({"model": "deepseek-chat"}),
+                ),
+            ]);
+        }
     }
     // Load user custom presets
     if let Some(custom) = load_custom_presets() {
@@ -159,7 +203,9 @@ fn local_proxy_base_url(tool: ToolKind) -> &'static str {
         | ToolKind::Pi
         | ToolKind::OhMyPi
         | ToolKind::Aider
-        | ToolKind::Cline => "http://127.0.0.1:24860/v1",
+        | ToolKind::Cline
+        | ToolKind::Hermes
+        | ToolKind::OpenClaw => "http://127.0.0.1:24860/v1",
     }
 }
 

@@ -2,6 +2,14 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### New
+- **feat(core)**: Hermes Agent (`hermes`) adapter — writes a `model:` block (provider: custom / default / base_url / api_key) to `~/.hermes/config.yaml`; switching back to official restores the captured OAuth `model:` block.
+- **feat(core)**: OpenClaw (`openclaw`) adapter — writes a custom provider under `models.providers.xfade` (baseUrl / apiKey / api / models[]) and pins `agents.defaults.model.primary` to `xfade/<model>`; reads JSON5 configs (comments, trailing commas, unquoted keys); switching back to official removes the provider and restores the captured primary.
+- **feat(presets)**: OpenRouter / Kimi / DeepSeek presets + local proxy (`http://127.0.0.1:24860/v1`) for Hermes and OpenClaw.
+- **feat(gui)**: Cline (previously missing) and Hermes / OpenClaw added to the provider-management UI.
+
 ## v0.8.1 — 2026-09-21
 
 ### Fixes

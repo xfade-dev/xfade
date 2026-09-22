@@ -385,6 +385,39 @@ fn use_third_party_preset_without_key_errors() {
 }
 
 #[test]
+fn use_local_proxy_openclaw_requires_model() {
+    // Regression: `xfade use local-proxy --tool openclaw` used to auto-create a
+    // provider with no model, then fail in `apply` (OpenClaw needs a model to set
+    // `agents.defaults.model.primary`), leaving a half-added provider behind.
+    let home = tempfile::tempdir().unwrap();
+
+    // No global model → clear error, and no half-added provider.
+    xfade(home.path())
+        .args(["use", "local-proxy", "--tool", "openclaw"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs a model"));
+    xfade(home.path())
+        .args(["ls", "--tool", "openclaw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local-proxy").not());
+
+    // With a global default model, the auto-create succeeds and pins the primary.
+    xfade(home.path())
+        .args(["config", "set", "model", "gpt-4o"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["use", "local-proxy", "--tool", "openclaw"])
+        .assert()
+        .success();
+
+    let doc = fs::read_to_string(home.path().join(".openclaw/openclaw.json")).unwrap();
+    assert!(doc.contains("xfade/gpt-4o"));
+}
+
+#[test]
 fn config_view_and_set_secrets() {
     let home = tempfile::tempdir().unwrap();
 

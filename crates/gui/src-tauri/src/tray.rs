@@ -70,26 +70,20 @@ fn build_menu(app: &AppHandle, status: &ProxyStatus, autostart: bool) -> tauri::
     let sep2 = PredefinedMenuItem::separator(app)?;
     let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit GUI", true, None::<&str>)?;
-    let claude = provider_submenu(app, "Claude Code", ToolKind::ClaudeCode)?;
-    let codex = provider_submenu(app, "Codex", ToolKind::Codex)?;
-    let opencode = provider_submenu(app, "OpenCode", ToolKind::OpenCode)?;
-    let pi = provider_submenu(app, "Pi", ToolKind::Pi)?;
-    let omp = provider_submenu(app, "Oh My Pi", ToolKind::OhMyPi)?;
-    let items: Vec<&dyn IsMenuItem<Wry>> = vec![
-        &status_item,
-        &start,
-        &stop,
-        &autostart_item,
-        &sep1,
-        &claude,
-        &codex,
-        &opencode,
-        &pi,
-        &omp,
-        &sep2,
-        &show,
-        &quit,
-    ];
+    let provider_submenus: Vec<Submenu<Wry>> = ToolKind::ALL
+        .iter()
+        .map(|&t| provider_submenu(app, t.label(), t))
+        .collect::<tauri::Result<_>>()?;
+    let provider_refs: Vec<&dyn IsMenuItem<Wry>> = provider_submenus
+        .iter()
+        .map(|s| s as &dyn IsMenuItem<Wry>)
+        .collect();
+    let mut items: Vec<&dyn IsMenuItem<Wry>> =
+        vec![&status_item, &start, &stop, &autostart_item, &sep1];
+    items.extend(provider_refs);
+    items.push(&sep2);
+    items.push(&show);
+    items.push(&quit);
     Menu::with_items(app, &items)
 }
 

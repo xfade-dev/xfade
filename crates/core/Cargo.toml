@@ -12,6 +12,7 @@ categories.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+json5 = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 keyring = { workspace = true }

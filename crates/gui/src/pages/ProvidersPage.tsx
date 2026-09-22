@@ -19,6 +19,9 @@ const TOOLS: { key: ToolKind; label: string }[] = [
   { key: "pi", label: "Pi" },
   { key: "oh-my-pi", label: "Oh My Pi" },
   { key: "aider", label: "Aider" },
+  { key: "cline", label: "Cline" },
+  { key: "hermes", label: "Hermes Agent" },
+  { key: "openclaw", label: "OpenClaw" },
 ];
 
 export default function ProvidersPage() {

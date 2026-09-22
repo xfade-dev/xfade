@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-在 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 等 AI 编码工具之间切换 API provider，并提供本地代理（OpenAI/Anthropic 兼容端点、failover、协议互转）与 macOS/Linux 常驻 daemon。
+在 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw 等 AI 编码工具之间切换 API provider，并提供本地代理（OpenAI/Anthropic 兼容端点、failover、协议互转）与 macOS/Linux 常驻 daemon。
 
 CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 
@@ -11,7 +11,7 @@ CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 ## 功能
 
 - **TUI**：裸 `xfade` 直接打开 crossfader 风格 TUI——按工具分页签、provider 健康徽章、并行探测全部 provider、行内编辑；非终端环境自动退化为普通列表。
-- **Provider 切换**：为 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider 增删改查 provider，一键切换写各自配置（settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml），系统钥匙串存 key，切换前自动备份。
+- **Provider 切换**：为 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw 增删改查 provider，一键切换写各自配置（settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml / .cline/data/settings/ / .hermes/config.yaml / .openclaw/openclaw.json），系统钥匙串存 key，切换前自动备份。
 - **本地代理**：`xfade serve` 起 OpenAI/Anthropic 兼容端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/models`），支持路由 failover、熔断、token 统计、请求日志。
 - **协议互转**：Anthropic↔OpenAI 双向转换（`target_protocol`），让客户端与上游协议解耦。
 - **daemon（macOS + Linux）**：launchd/systemd 常驻 + 开机自启 + 崩溃重启；`/__xfade/status` 管理端点。
@@ -63,7 +63,7 @@ xfade add work --tool claude --base-url https://... --key sk-xxx \
   --haiku-model deepseek/deepseek-v4-flash
 ```
 
-其余工具同理：`--tool claude-code|codex|open-code|pi|oh-my-pi|aider`。
+其余工具同理：`--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`。
 
 ## CLI 命令速查
 

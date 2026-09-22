@@ -2,7 +2,9 @@ pub mod aider;
 pub mod claude_code;
 pub mod cline;
 pub mod codex;
+pub mod hermes;
 pub mod omp;
+pub mod openclaw;
 pub mod opencode;
 pub mod pi;
 
@@ -44,6 +46,8 @@ pub fn adapter_for(tool: ToolKind, home: &Path) -> Box<dyn ToolAdapter> {
         ToolKind::OhMyPi => Box::new(omp::OmpAdapter::new(home)),
         ToolKind::Aider => Box::new(aider::AiderAdapter::new(home)),
         ToolKind::Cline => Box::new(cline::ClineAdapter::new(home)),
+        ToolKind::Hermes => Box::new(hermes::HermesAdapter::new(home)),
+        ToolKind::OpenClaw => Box::new(openclaw::OpenClawAdapter::new(home)),
     }
 }
 
@@ -61,11 +65,28 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// Load a JSON object file, returning `{}` when the file is absent.
 /// Errors if the top-level value is not an object.
 pub(crate) fn load_json_or_empty(path: &Path) -> Result<Value> {
+    load_object_or_empty(path, |s| serde_json::from_str(s).map_err(|e| e.to_string()))
+}
+
+/// Like [`load_json_or_empty`], but parses JSON5 (comments, trailing commas,
+/// unquoted keys, single quotes) — for tools whose native config format is JSON5
+/// (OpenClaw). A plain-JSON file parses identically; only hand-edited configs
+/// that use JSON5 extensions reach this path.
+pub(crate) fn load_json5_or_empty(path: &Path) -> Result<Value> {
+    load_object_or_empty(path, |s| {
+        json5::from_str::<Value>(s).map_err(|e| e.to_string())
+    })
+}
+
+fn load_object_or_empty(
+    path: &Path,
+    parse: impl Fn(&str) -> std::result::Result<Value, String>,
+) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
-            let v: Value = serde_json::from_str(&s).map_err(|e| CoreError::ConfigParse {
+            let v = parse(&s).map_err(|msg| CoreError::ConfigParse {
                 path: path.display().to_string(),
-                msg: e.to_string(),
+                msg,
             })?;
             if !v.is_object() {
                 return Err(CoreError::ConfigParse {

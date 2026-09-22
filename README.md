@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Switch API providers between AI coding tools like Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, with a local proxy (OpenAI/Anthropic-compatible endpoints, failover, protocol conversion) and a macOS/Linux resident daemon.
+Switch API providers between AI coding tools like Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw, with a local proxy (OpenAI/Anthropic-compatible endpoints, failover, protocol conversion) and a macOS/Linux resident daemon.
 
 CLI (`xfade`) + Tauri GUI, implemented in Rust.
 
@@ -11,7 +11,7 @@ CLI (`xfade`) + Tauri GUI, implemented in Rust.
 ## Features
 
 - **TUI**: bare `xfade` opens a crossfader-style TUI — per-tool tabs, provider health badges, parallel probe-all, and inline edit; falls back to a plain list when stdout is not a terminal.
-- **Provider switching**: add/remove/edit providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider, one-command switch writes each tool's config (settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml), stores keys in the system keyring, auto-backs-up before switching.
+- **Provider switching**: add/remove/edit providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw, one-command switch writes each tool's config (settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml / .cline/data/settings/ / .hermes/config.yaml / .openclaw/openclaw.json), stores keys in the system keyring, auto-backs-up before switching.
 - **Local proxy**: `xfade serve` exposes OpenAI/Anthropic-compatible endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`) with route failover, circuit breaking, token stats, and request logs.
 - **Protocol conversion**: bidirectional Anthropic↔OpenAI conversion (`target_protocol`), decoupling clients from the upstream protocol.
 - **daemon (macOS + Linux)**: launchd/systemd-resident + boot autostart + crash restart; `/__xfade/status` admin endpoint.
@@ -63,7 +63,7 @@ xfade add work --tool claude --base-url https://... --key sk-xxx \
   --haiku-model deepseek/deepseek-v4-flash
 ```
 
-Same for the other tools: `--tool claude-code|codex|open-code|pi|oh-my-pi|aider`.
+Same for the other tools: `--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`.
 
 ## CLI command reference
 

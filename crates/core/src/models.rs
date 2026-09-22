@@ -12,10 +12,12 @@ pub enum ToolKind {
     OhMyPi,
     Aider,
     Cline,
+    Hermes,
+    OpenClaw,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 7] = [
+    pub const ALL: [ToolKind; 9] = [
         ToolKind::ClaudeCode,
         ToolKind::Codex,
         ToolKind::OpenCode,
@@ -23,6 +25,8 @@ impl ToolKind {
         ToolKind::OhMyPi,
         ToolKind::Aider,
         ToolKind::Cline,
+        ToolKind::Hermes,
+        ToolKind::OpenClaw,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -34,6 +38,23 @@ impl ToolKind {
             ToolKind::OhMyPi => "omp",
             ToolKind::Aider => "aider",
             ToolKind::Cline => "cline",
+            ToolKind::Hermes => "hermes",
+            ToolKind::OpenClaw => "openclaw",
+        }
+    }
+
+    /// Human-readable label for UI surfaces (tray menu, pickers).
+    pub fn label(&self) -> &'static str {
+        match self {
+            ToolKind::ClaudeCode => "Claude Code",
+            ToolKind::Codex => "Codex",
+            ToolKind::OpenCode => "OpenCode",
+            ToolKind::Pi => "Pi",
+            ToolKind::OhMyPi => "Oh My Pi",
+            ToolKind::Aider => "Aider",
+            ToolKind::Cline => "Cline",
+            ToolKind::Hermes => "Hermes Agent",
+            ToolKind::OpenClaw => "OpenClaw",
         }
     }
 }
@@ -55,8 +76,10 @@ impl FromStr for ToolKind {
             "omp" | "oh-my-pi" | "ohmy" => Ok(ToolKind::OhMyPi),
             "aider" => Ok(ToolKind::Aider),
             "cline" => Ok(ToolKind::Cline),
+            "hermes" => Ok(ToolKind::Hermes),
+            "openclaw" => Ok(ToolKind::OpenClaw),
             _ => Err(format!(
-                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider|cline)"
+                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider|cline|hermes|openclaw)"
             )),
         }
     }

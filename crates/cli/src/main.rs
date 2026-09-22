@@ -313,6 +313,43 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     if preset.is_official() || is_local_proxy {
                         let mut p = Provider::new(&name, tool, preset.base_url);
                         p.extra = preset.extra;
+                        if is_local_proxy {
+                            // The local-proxy preset carries no model, but OpenClaw
+                            // (and Hermes) bake the model into their config. Fall back
+                            // to the global default model, mirroring `add`.
+                            let mut map = p.extra.as_object().cloned().unwrap_or_default();
+                            if !map.contains_key("model") {
+                                if let Some(m) = &core.config().model {
+                                    map.insert(
+                                        "model".to_string(),
+                                        serde_json::Value::String(m.clone()),
+                                    );
+                                }
+                            }
+                            if !map.is_empty() {
+                                p.extra = serde_json::Value::Object(map);
+                            }
+                            // OpenClaw requires a model to set `agents.defaults.model.primary`;
+                            // without one the switch would fail and leave a half-added provider.
+                            if tool == ToolKind::OpenClaw
+                                && p.extra.get("model").and_then(|m| m.as_str()).is_none()
+                            {
+                                return Err(CoreError::ConfigParse {
+                                    path: "local-proxy".into(),
+                                    msg: format!(
+                                        "OpenClaw needs a model to route through the local proxy.\n\
+                                         First add it with a model:\n\
+                                         \x20 xfade add local-proxy --tool openclaw --base-url {} --key x --set model=<model>\n\
+                                         (or set a global default: xfade config set model <model>)\n\
+                                         Then switch:\n\
+                                         \x20 xfade use local-proxy --tool openclaw",
+                                        p.base_url
+                                            .as_deref()
+                                            .unwrap_or("http://127.0.0.1:24860/v1")
+                                    ),
+                                });
+                            }
+                        }
                         let key = if is_local_proxy {
                             Some("xfade-local-proxy".to_string())
                         } else {
