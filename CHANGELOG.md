@@ -2,6 +2,21 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.8.3 — 2026-09-23
+
+### New
+- **feat(cli)**: TUI visual identity — the `◀ xfade ▶` wordmark and the crossfader track render as a cyan→magenta truecolor gradient (gated on `COLORTERM`; two-tone ANSI fallback on non-truecolor terminals, no color under `NO_COLOR`).
+- **feat(cli)**: open animation — the header gradients fade in while the knob glides from center to the active provider's side; any key press drops the slow glide so mid-intro switches stay snappy.
+- **feat(cli)**: `Ctrl+C` quits the TUI cleanly (raw mode turns SIGINT into a key event that was previously swallowed).
+
+### Fixes
+- **fix(cli)**: terminal resize now repaints immediately, and shrinking below 30×13 shows a "terminal too small" notice instead of a truncated layout.
+- **fix(cli)**: the switch flash (inverted knob, white route) now clears after its 450ms window instead of sticking until the next keypress.
+- **fix(cli)**: the selected row uses reverse video — theme-independent and monochrome-safe.
+
+### Performance
+- **perf(cli)**: idle redraws eliminated — the TUI repaints only on input, probe results, or animation instead of a fixed cadence.
+
 ## v0.8.2 — 2026-09-22
 
 ### New

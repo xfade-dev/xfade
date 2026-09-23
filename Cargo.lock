@@ -5833,7 +5833,7 @@ dependencies = [
 
 [[package]]
 name = "xfade"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -5853,7 +5853,7 @@ dependencies = [
 
 [[package]]
 name = "xfade-core"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "axum",
  "dirs 6.0.0",
@@ -5874,7 +5874,7 @@ dependencies = [
 
 [[package]]
 name = "xfade-gui"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "log",
  "reqwest 0.12.28",
