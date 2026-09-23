@@ -14,6 +14,11 @@ pub const FADER_CLOUD: f32 = 0.8;
 pub const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// How long the fader/status highlight lasts after a successful switch.
 const FLASH_DURATION: Duration = Duration::from_millis(450);
+/// How long the open animation runs: the header gradients fade in while the
+/// knob eases from center to the active provider's side. Long enough to be
+/// clearly visible on launch — the terminal's alt-screen switch would otherwise
+/// mask a shorter intro.
+const INTRO_DURATION: Duration = Duration::from_millis(1200);
 
 /// Outcome of a latency probe against one provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,13 @@ pub struct App {
     pub spinner_tick: usize,
     /// Switch-flash highlight deadline; cleared by [`tick`] once expired.
     pub flash_until: Option<Instant>,
+    /// Open-animation deadline; the header fades in and the knob slides until
+    /// then. Cleared by [`tick`] once finished.
+    pub intro_until: Option<Instant>,
+    /// Set on the first key press; once true the knob always uses the snappy
+    /// switch easing, so provider switches made during the intro window don't
+    /// inherit the slow opening glide.
+    pub user_interacted: bool,
 }
 
 impl App {
@@ -70,10 +82,14 @@ impl App {
             probing: HashSet::new(),
             spinner_tick: 0,
             flash_until: None,
+            intro_until: None,
+            user_interacted: false,
         };
         app.reload(core);
-        // Snap to the target on open; only *changes* animate.
-        app.fader_pos = app.fader_target();
+        // Start centered and fade the header in, so the knob eases to the
+        // active provider's side on open — a brief "xfade resolves the route"
+        // intro instead of snapping straight to the target.
+        app.intro_until = Some(Instant::now() + INTRO_DURATION);
         app
     }
 
@@ -137,10 +153,28 @@ impl App {
         }
     }
 
-    /// True while the fader is mid-slide or a probe is in flight — the event
-    /// loop uses this to shorten its poll timeout for smooth frames.
+    /// True while the fader is mid-slide, a probe is in flight, the intro is
+    /// running, or a switch flash is showing — the event loop uses this to
+    /// shorten its poll timeout and keep repainting until every transient
+    /// (including the flash clearing) has actually been rendered.
     pub fn is_animating(&self) -> bool {
-        (self.fader_pos - self.fader_target()).abs() > 0.005 || !self.probing.is_empty()
+        (self.fader_pos - self.fader_target()).abs() > 0.005
+            || !self.probing.is_empty()
+            || self.intro_until.is_some()
+            || self.flash_until.is_some()
+    }
+
+    /// 0.0 at open → 1.0 once the intro finishes. The header gradients use it
+    /// to fade in from dark; it reads as 1.0 after the intro completes.
+    pub fn intro_progress(&self) -> f32 {
+        match self.intro_until {
+            None => 1.0,
+            Some(until) => {
+                let remaining = until.saturating_duration_since(Instant::now());
+                let elapsed = INTRO_DURATION.saturating_sub(remaining);
+                (elapsed.as_secs_f32() / INTRO_DURATION.as_secs_f32()).clamp(0.0, 1.0)
+            }
+        }
     }
 
     /// Advance all time-based state: fader easing, spinner frame, flash expiry.
@@ -148,8 +182,16 @@ impl App {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
         let target = self.fader_target();
         let delta = target - self.fader_pos;
+        // The opening glide eases more slowly than a mid-session switch, but
+        // only until the user interacts — switches made during the intro
+        // window must stay snappy.
+        let factor = if self.intro_until.is_some() && !self.user_interacted {
+            0.08
+        } else {
+            0.35
+        };
         if delta.abs() > 0.005 {
-            self.fader_pos += delta * 0.35;
+            self.fader_pos += delta * factor;
         } else {
             self.fader_pos = target;
         }
@@ -158,6 +200,12 @@ impl App {
             .is_some_and(|until| Instant::now() >= until)
         {
             self.flash_until = None;
+        }
+        if self
+            .intro_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.intro_until = None;
         }
     }
 
@@ -489,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn fader_snaps_to_cloud_target_on_open_without_animating() {
+    fn open_animates_from_center_with_scheduled_intro() {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir);
         add(
@@ -499,13 +547,23 @@ mod tests {
             Some("http://gw.example:3000"),
         );
         core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
-        let app = App::new(ToolKind::ClaudeCode, &core);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        // The knob starts centered, not snapped to the cloud target, and the
+        // intro fade is scheduled to run.
         assert!(
-            (app.fader_pos - FADER_CLOUD).abs() < 1e-6,
-            "open must snap to cloud target, got {}",
+            (app.fader_pos - 0.5).abs() < 1e-6,
+            "open must start centered, got {}",
             app.fader_pos
         );
-        assert!(!app.is_animating());
+        assert!(app.is_animating(), "open must animate");
+        assert!(app.intro_until.is_some(), "intro must be scheduled");
+        // Re-pin the deadline so a stalled test runner (> INTRO_DURATION
+        // between new() and this line) can't clamp progress to 1.0.
+        app.intro_until = Some(Instant::now() + INTRO_DURATION);
+        assert!(
+            app.intro_progress() < 1.0,
+            "intro must not be complete at open"
+        );
     }
 
     #[test]
@@ -526,6 +584,7 @@ mod tests {
         );
         core.use_provider(ToolKind::ClaudeCode, "cloudy").unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.intro_until = None; // isolate the switch slide from the open intro
         app.next(); // select localy
         app.switch_selected(&core);
         assert!(app.is_animating(), "switch must start a slide");
@@ -543,7 +602,59 @@ mod tests {
             "knob must settle on the local target, got {}",
             app.fader_pos
         );
+        // is_animating also covers the (time-based) switch flash; clear it so
+        // the final assert reflects the fader alone.
+        app.flash_until = None;
         assert!(!app.is_animating());
+    }
+
+    #[test]
+    fn is_animating_includes_active_flash() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        add(&core, ToolKind::ClaudeCode, "b", Some("http://y"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.intro_until = None;
+        app.next();
+        app.switch_selected(&core);
+        assert!(app.flash_until.is_some(), "switch must set a flash");
+        // Simulate the fader having settled while the flash is still active:
+        // the frame loop must keep repainting so the flash actually clears.
+        app.fader_pos = app.fader_target();
+        assert!(
+            app.is_animating(),
+            "an active flash must keep is_animating true"
+        );
+    }
+
+    #[test]
+    fn user_interaction_overrides_slow_intro_easing() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(
+            &core,
+            ToolKind::ClaudeCode,
+            "glm",
+            Some("http://gw.example:3000"),
+        );
+        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        assert!(app.intro_until.is_some(), "intro must be running");
+        // Before interaction: one tick advances the knob by the slow factor.
+        app.fader_pos = 0.5;
+        app.tick();
+        let slow_step = app.fader_pos;
+        // After interaction: the same tick must advance faster, even while
+        // the intro window is still open.
+        app.fader_pos = 0.5;
+        app.user_interacted = true;
+        app.tick();
+        assert!(
+            app.fader_pos > slow_step,
+            "interacted tick must outpace the intro glide: {} vs {slow_step}",
+            app.fader_pos
+        );
     }
 
     #[test]

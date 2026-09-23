@@ -2,12 +2,13 @@
 //! being rendered lives in `app.rs`. Verified with `TestBackend` snapshots.
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use std::sync::OnceLock;
 use xfade_core::store::db::StatsRow;
 use xfade_core::ToolKind;
 
@@ -16,7 +17,19 @@ use crate::tui::app::{App, EditField, ProbeResult};
 /// Stats window shown in the header (e.g. `7d`), parsed by `crate::parse_since`.
 pub const STATS_DAYS: &str = "7d";
 
+/// Minimum terminal size for the full layout. Below this the header tabs and
+/// provider list lose too much to stay usable, so a "too small" notice is
+/// shown instead of a broken list.
+const MIN_WIDTH: u16 = 30;
+const MIN_HEIGHT: u16 = 13;
+
 pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
+    let area = f.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(f, area);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -25,7 +38,7 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
             Constraint::Min(3),
             Constraint::Length(3),
         ])
-        .split(f.area());
+        .split(area);
 
     draw_fader(f, app, stats, chunks[0]);
     if app.is_editing() {
@@ -34,6 +47,19 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
         draw_list(f, app, stats, chunks[1]);
     }
     draw_footer(f, app, chunks[2]);
+}
+
+/// Degraded layout below [`MIN_WIDTH`]×[`MIN_HEIGHT`]: name the requirement
+/// instead of rendering a truncated list.
+fn draw_too_small(f: &mut Frame, area: Rect) {
+    let msg = format!(
+        "terminal too small — need at least {MIN_WIDTH}×{MIN_HEIGHT} (now {}×{})",
+        area.width, area.height
+    );
+    let paragraph = Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
 }
 
 /// Mini tab bar over all tools; the current one is inverted.
@@ -58,12 +84,124 @@ fn tool_tabs(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Cyan → magenta: the crossfade gradient endpoints shared by the wordmark and
+/// the fader track. Used in truecolor mode only — see `GradientMode` for how
+/// other terminals degrade.
+const GRADIENT_FROM: (u8, u8, u8) = (0, 195, 255);
+const GRADIENT_TO: (u8, u8, u8) = (255, 60, 190);
+
+/// How the crossfade gradients render, decided once from the environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GradientMode {
+    /// `NO_COLOR` is set (no-color.org): no fg color — bold text, the knob
+    /// glyph, and position carry the meaning.
+    NoColor,
+    /// No advertised truecolor: a two-tone ANSI cyan/magenta crossfade. The
+    /// intro fade is truecolor-only, so it is skipped in this mode.
+    Ansi,
+    /// `COLORTERM=truecolor|24bit`: the full RGB gradient with intro fade.
+    Truecolor,
+}
+
+/// Decide the gradient mode once per process. `COLORTERM` is the only widely
+/// honored truecolor signal (`crossterm::style::available_color_count` only
+/// detects 256-color via `TERM`, never truecolor).
+fn gradient_mode() -> GradientMode {
+    static MODE: OnceLock<GradientMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        // no-color.org: present and non-empty suppresses color.
+        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        let truecolor = std::env::var("COLORTERM")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit"));
+        detect_gradient_mode(no_color, truecolor)
+    })
+}
+
+fn detect_gradient_mode(no_color: bool, truecolor: bool) -> GradientMode {
+    if no_color {
+        GradientMode::NoColor
+    } else if truecolor {
+        GradientMode::Truecolor
+    } else {
+        GradientMode::Ansi
+    }
+}
+
+/// Color at gradient position `t` (0 = cyan/local end, 1 = magenta/cloud
+/// end), faded toward black by `progress` where the terminal supports it.
+fn gradient_color(mode: GradientMode, t: f32, progress: f32) -> Color {
+    match mode {
+        GradientMode::NoColor => Color::Reset,
+        GradientMode::Ansi => {
+            if t < 0.5 {
+                Color::Cyan
+            } else {
+                Color::Magenta
+            }
+        }
+        GradientMode::Truecolor => {
+            lerp_rgb(dim(GRADIENT_FROM, progress), dim(GRADIENT_TO, progress), t)
+        }
+    }
+}
+
+/// Interpolate between two RGB endpoints (t in 0..=1).
+fn lerp_rgb(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+/// Scale an RGB tuple toward black (0.0 = black, 1.0 = unchanged), used to
+/// fade the header gradients in during the intro.
+fn dim((r, g, b): (u8, u8, u8), f: f32) -> (u8, u8, u8) {
+    let f = f.clamp(0.0, 1.0);
+    (
+        (r as f32 * f) as u8,
+        (g as f32 * f) as u8,
+        (b as f32 * f) as u8,
+    )
+}
+
+/// Header title: a crossfade wordmark — `◀ xfade ▶` with `xfade` rendered as
+/// a cyan→magenta gradient, one span per character, plus the current tool
+/// dimmed after it.
+fn title_line(tool: ToolKind, progress: f32) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled("◀ ", Style::default().fg(Color::Cyan)),
+    ];
+    let mode = gradient_mode();
+    let word = "xfade";
+    let n = word.chars().count();
+    for (i, c) in word.chars().enumerate() {
+        let t = if n <= 1 {
+            0.0
+        } else {
+            i as f32 / (n - 1) as f32
+        };
+        spans.push(Span::styled(
+            c.to_string(),
+            Style::default()
+                .fg(gradient_color(mode, t, progress))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(" ▶", Style::default().fg(Color::Magenta)));
+    spans.push(Span::styled(
+        format!(" · {} ", tool.as_str()),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
+}
+
 /// The crossfader header: local ◀───[ ■ ]───▶ cloud, plus a status line with
 /// route / latency / token usage for the active provider.
 fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     let active = app.active_provider();
     let flash = app.flash_until.is_some();
-    let fader = fader_line(area.width.saturating_sub(2), app.fader_pos, flash);
+    let progress = app.intro_progress();
+    let fader = fader_line(area.width.saturating_sub(2), app.fader_pos, flash, progress);
 
     let status = match active {
         Some(p) => {
@@ -116,42 +254,65 @@ fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" xfade · {} ", app.tool.as_str()));
+        .title(title_line(app.tool, progress));
     let text = Paragraph::new(vec![tool_tabs(app), fader, status]).block(block);
     f.render_widget(text, area);
 }
 
-/// `local ◀──────[ ■ ]──────▶ cloud` with the knob at a continuous `pos`
-/// (0.0 = local end, 1.0 = cloud end). Flash paints the knob white.
-fn fader_line(width: u16, pos: f32, flash: bool) -> Line<'static> {
+/// The crossfader track as a cyan→magenta gradient, one span per cell.
+fn gradient_track(cells: usize, progress: f32) -> Vec<Span<'static>> {
+    let mode = gradient_mode();
+    (0..cells)
+        .map(|i| {
+            let t = if cells <= 1 {
+                0.0
+            } else {
+                i as f32 / (cells - 1) as f32
+            };
+            Span::styled("─", Style::default().fg(gradient_color(mode, t, progress)))
+        })
+        .collect()
+}
+
+/// The knob rides the gradient track in bold white; a switch flash inverts it.
+fn knob_style(flash: bool) -> Style {
+    let mut style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    if flash {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+/// `local ◀─…─■─…─▶ cloud` with the knob at a continuous `pos` (0.0 = local
+/// end, 1.0 = cloud end). The track is a continuous cyan→magenta gradient and
+/// the knob sits on top of it, so the whole line reads as a crossfade.
+fn fader_line(width: u16, pos: f32, flash: bool, progress: f32) -> Line<'static> {
     let label_l = "local ";
     let label_r = " cloud";
     let track = (width as usize).saturating_sub(label_l.len() + label_r.len() + 2);
     let knob = ((pos.clamp(0.0, 1.0)) * track.saturating_sub(1) as f32).round() as usize;
-    let left: String = "─".repeat(knob);
-    let right: String = "─".repeat(track.saturating_sub(knob + 1));
-    let knob_style = if flash {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else if pos < 0.5 {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    };
-    Line::from(vec![
+
+    let mut spans = vec![
         Span::styled(label_l, Style::default().fg(Color::Cyan)),
         Span::raw("◀"),
-        Span::styled(left, Style::default().fg(Color::DarkGray)),
-        Span::styled("■", knob_style),
-        Span::styled(right, Style::default().fg(Color::DarkGray)),
-        Span::raw("▶"),
-        Span::styled(label_r, Style::default().fg(Color::Magenta)),
-    ])
+    ];
+    if track == 0 {
+        // Keep the knob even when there is no room for a track.
+        spans.push(Span::styled("■", knob_style(flash)));
+    } else {
+        for (i, cell) in gradient_track(track, progress).into_iter().enumerate() {
+            if i == knob {
+                spans.push(Span::styled("■", knob_style(flash)));
+            } else {
+                spans.push(cell);
+            }
+        }
+    }
+    spans.push(Span::raw("▶"));
+    spans.push(Span::styled(label_r, Style::default().fg(Color::Magenta)));
+    Line::from(spans)
 }
 
 /// Health color for a measured latency. Single source of truth for tiers —
@@ -211,10 +372,11 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
                 ));
             }
             let line = Line::from(spans);
+            // Selection uses reverse video: the canonical, theme-independent
+            // signal that survives monochrome and color-blindness (a fg-only
+            // color does not). Active providers keep the `*` mark + green fg.
             let style = if i == app.selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().add_modifier(Modifier::REVERSED)
             } else if p.is_active {
                 Style::default().fg(Color::Green)
             } else {
@@ -369,8 +531,8 @@ mod tests {
 
     #[test]
     fn fader_knob_moves_toward_local_end_as_pos_decreases() {
-        let local = fader_line(60, FADER_LOCAL, false);
-        let cloud = fader_line(60, FADER_CLOUD, false);
+        let local = fader_line(60, FADER_LOCAL, false, 1.0);
+        let cloud = fader_line(60, FADER_CLOUD, false, 1.0);
         let pos = |l: &Line| {
             l.spans
                 .iter()
@@ -380,12 +542,12 @@ mod tests {
                 .unwrap()
         };
         assert!(pos(&local) < pos(&cloud));
-        let mid = fader_line(60, 0.5, false);
+        let mid = fader_line(60, 0.5, false, 1.0);
         assert!(pos(&local) < pos(&mid) && pos(&mid) < pos(&cloud));
     }
 
     #[test]
-    fn fader_knob_color_follows_side_and_flash() {
+    fn fader_knob_is_white_and_inverts_on_flash() {
         let knob_style = |l: &Line| {
             l.spans
                 .iter()
@@ -393,17 +555,69 @@ mod tests {
                 .unwrap()
                 .style
         };
+        // The track now carries the side via a gradient plus the knob's
+        // position; the knob itself is always white and inverts on flash.
         assert_eq!(
-            knob_style(&fader_line(60, FADER_LOCAL, false)).fg,
-            Some(Color::Cyan)
-        );
-        assert_eq!(
-            knob_style(&fader_line(60, FADER_CLOUD, false)).fg,
-            Some(Color::Magenta)
-        );
-        assert_eq!(
-            knob_style(&fader_line(60, 0.5, true)).fg,
+            knob_style(&fader_line(60, FADER_LOCAL, false, 1.0)).fg,
             Some(Color::White)
+        );
+        assert_eq!(
+            knob_style(&fader_line(60, FADER_CLOUD, false, 1.0)).fg,
+            Some(Color::White)
+        );
+        let flashed = knob_style(&fader_line(60, 0.5, true, 1.0));
+        assert_eq!(flashed.fg, Some(Color::White));
+        assert!(
+            flashed.add_modifier.contains(Modifier::REVERSED),
+            "flash must invert the knob"
+        );
+    }
+
+    #[test]
+    fn gradient_lerps_between_endpoints() {
+        assert_eq!(
+            lerp_rgb(GRADIENT_FROM, GRADIENT_TO, 0.0),
+            Color::Rgb(0, 195, 255)
+        );
+        assert_eq!(
+            lerp_rgb(GRADIENT_FROM, GRADIENT_TO, 1.0),
+            Color::Rgb(255, 60, 190)
+        );
+        assert_eq!(
+            lerp_rgb((0, 0, 0), (200, 200, 200), 0.5),
+            Color::Rgb(100, 100, 100)
+        );
+    }
+
+    #[test]
+    fn gradient_mode_detection_follows_env_rules() {
+        // NO_COLOR wins over everything.
+        assert_eq!(detect_gradient_mode(true, true), GradientMode::NoColor);
+        assert_eq!(detect_gradient_mode(true, false), GradientMode::NoColor);
+        // COLORTERM=truecolor/24bit enables the RGB gradient.
+        assert_eq!(detect_gradient_mode(false, true), GradientMode::Truecolor);
+        // Otherwise: the ANSI two-tone fallback.
+        assert_eq!(detect_gradient_mode(false, false), GradientMode::Ansi);
+    }
+
+    #[test]
+    fn gradient_color_degrades_gracefully() {
+        // NoColor: terminal default fg — meaning carried by bold + glyphs.
+        assert_eq!(
+            gradient_color(GradientMode::NoColor, 0.0, 1.0),
+            Color::Reset
+        );
+        // Ansi: two-tone crossfade between the label colors.
+        assert_eq!(gradient_color(GradientMode::Ansi, 0.0, 1.0), Color::Cyan);
+        assert_eq!(gradient_color(GradientMode::Ansi, 0.5, 1.0), Color::Magenta);
+        // Truecolor: full gradient, faded toward black by progress.
+        assert_eq!(
+            gradient_color(GradientMode::Truecolor, 0.0, 1.0),
+            lerp_rgb(GRADIENT_FROM, GRADIENT_TO, 0.0)
+        );
+        assert_eq!(
+            gradient_color(GradientMode::Truecolor, 1.0, 0.0),
+            Color::Rgb(0, 0, 0)
         );
     }
 
@@ -412,7 +626,7 @@ mod tests {
         // Track goes to zero below the label+borders width; the knob must
         // still render and nothing may panic.
         for width in [0u16, 5, 10, 11] {
-            let line = fader_line(width, 0.5, false);
+            let line = fader_line(width, 0.5, false, 1.0);
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
                 text.contains('■'),
@@ -543,5 +757,78 @@ mod tests {
         assert_eq!(format_tokens(999), "999");
         assert_eq!(format_tokens(1_234), "1.2k");
         assert_eq!(format_tokens(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn too_small_terminal_shows_guard_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(MIN_WIDTH - 1, MIN_HEIGHT - 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("terminal too small"),
+            "guard message missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn header_title_renders_crossfade_wordmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("◀ xfade ▶"),
+            "crossfade wordmark missing in title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn selected_row_uses_reverse_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("a", ToolKind::ClaudeCode, Some("http://x".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        core.add_provider(
+            Provider::new("b", ToolKind::ClaudeCode, Some("http://y".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let reversed = buffer
+            .content()
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert!(
+            reversed > 0,
+            "selected row must render reverse-video; no REVERSED cell found"
+        );
     }
 }

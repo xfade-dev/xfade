@@ -2,7 +2,7 @@ pub mod app;
 pub mod ui;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,7 +18,8 @@ use app::{probe_latency, probe_target, App};
 /// Run the interactive TUI for a given tool.
 ///
 /// Keys (list mode): j/k or arrows to move, Enter to switch, `t` to probe the
-/// selected provider's latency, `e` to edit it, Tab to cycle tools, q to quit.
+/// selected provider's latency, `e` to edit it, Tab to cycle tools, q or
+/// Ctrl+C to quit.
 ///
 /// Non-TTY degradation: when stdin/stdout is not a terminal (pipes, CI,
 /// redirect), print the plain provider list instead of failing inside
@@ -93,6 +94,9 @@ fn event_loop(
     // Accumulators for the end-of-round summary message.
     let (mut probe_ok, mut probe_fail, mut probe_worst) = (0u32, 0u32, 0u128);
 
+    // Redraw only when state changed or an animation is in flight, so an idle
+    // terminal doesn't repaint at the poll cadence.
+    let mut dirty = true;
     loop {
         let mut drained = false;
         while let Ok((id, ms)) = probe_rx.try_recv() {
@@ -113,25 +117,37 @@ fn event_loop(
         // Per-provider badges carry the detail; the message line only needs a
         // summary once the whole round finishes (results arrive out of order,
         // so per-result messages would just overwrite each other).
-        if drained && app.probing.is_empty() {
-            let n = probe_ok + probe_fail;
-            app.message = Some(if probe_fail == 0 {
-                format!("{probe_ok}/{n} ok · worst {probe_worst}ms")
-            } else if probe_ok == 0 {
-                format!("all {n} unreachable")
-            } else {
-                format!("{probe_ok}/{n} ok · {probe_fail} down · worst {probe_worst}ms")
-            });
-            probe_ok = 0;
-            probe_fail = 0;
-            probe_worst = 0;
+        if drained {
+            dirty = true;
+            if app.probing.is_empty() {
+                let n = probe_ok + probe_fail;
+                app.message = Some(if probe_fail == 0 {
+                    format!("{probe_ok}/{n} ok · worst {probe_worst}ms")
+                } else if probe_ok == 0 {
+                    format!("all {n} unreachable")
+                } else {
+                    format!("{probe_ok}/{n} ok · {probe_fail} down · worst {probe_worst}ms")
+                });
+                probe_ok = 0;
+                probe_fail = 0;
+                probe_worst = 0;
+            }
         }
 
+        // Repaint while the fader/spinner is animating, and on the frame where
+        // it settles so the knob lands exactly on target.
+        let was_animating = app.is_animating();
         app.tick();
+        if was_animating || app.is_animating() {
+            dirty = true;
+        }
 
-        terminal
-            .draw(|f| ui::draw(f, &app, &stats))
-            .map_err(|e| CoreError::Proxy(format!("draw: {e}")))?;
+        if dirty {
+            terminal
+                .draw(|f| ui::draw(f, &app, &stats))
+                .map_err(|e| CoreError::Proxy(format!("draw: {e}")))?;
+            dirty = false;
+        }
 
         // Poll with a timeout so probe results repaint without a keypress.
         // While the fader is sliding or a probe spinner is up, poll fast for
@@ -145,10 +161,26 @@ fn event_loop(
         let Event::Key(key) =
             event::read().map_err(|e| CoreError::Proxy(format!("read event: {e}")))?
         else {
+            // Non-key events (notably Resize) must trigger a repaint at the
+            // new terminal size; otherwise the dirty flag never gets set and
+            // the UI keeps showing the stale layout.
+            dirty = true;
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
+        }
+
+        // Any key press counts as interaction: repaint next frame, and drop
+        // the slow opening glide so mid-intro switches stay snappy.
+        dirty = true;
+        app.user_interacted = true;
+
+        // Ctrl+C must always quit cleanly: raw mode turns SIGINT into a key
+        // event (Char('c') + CONTROL), so it never reaches the default signal
+        // handler on its own.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
         }
 
         if app.is_editing() {
