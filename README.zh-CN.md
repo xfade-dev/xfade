@@ -65,12 +65,26 @@ xfade add work --tool claude --base-url https://... --key sk-xxx \
 
 其余工具同理：`--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`。
 
+### 不切配置的一次性运行
+
+`xfade run` 只通过环境变量注入 provider 来启动工具——不写任何配置文件，
+现有激活状态保持原样：
+
+```bash
+xfade run kimi            # 本次会话用 kimi 启动 claude
+xfade run kimi -- --print # `--` 之后的所有参数原样传给工具
+```
+
+仅支持 env 驱动的工具（claude、aider）；配置文件型工具会提示改用
+`xfade use`。官方 provider 则原样启动工具。
+
 ## CLI 命令速查
 
 ```
 xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
+xfade run <id> [--tool <t>] [-- <args>]  # 环境变量注入一次性启动工具（claude / aider）
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>

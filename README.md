@@ -65,12 +65,27 @@ xfade add work --tool claude --base-url https://... --key sk-xxx \
 
 Same for the other tools: `--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`.
 
+### One-off run without switching
+
+`xfade run` launches the tool with a provider injected through environment
+variables only — no config files are written or touched, so the active setup
+stays exactly as-is:
+
+```bash
+xfade run kimi            # launch claude against kimi for this session only
+xfade run kimi -- --print # everything after `--` goes to the tool itself
+```
+
+Supported for env-driven tools (claude, aider); config-file tools tell you to
+use `xfade use` instead. Official providers launch the tool as-is.
+
 ## CLI command reference
 
 ```
 xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
+xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected via env vars (claude / aider)
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>

@@ -58,6 +58,16 @@ enum Cmd {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
+    /// Run a tool CLI with a provider injected via env vars (claude / aider only, no config changes)
+    Run {
+        /// Provider name (as shown in `xfade ls`)
+        name: String,
+        #[arg(long)]
+        tool: Option<ToolKind>,
+        /// Arguments after `--` are passed to the tool itself
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Show the currently-active provider per tool
     Current,
     /// Edit a provider
@@ -297,6 +307,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             print_table(&list);
             Ok(())
         }
+        Cmd::Run { name, tool, args } => cmd_run(&name, tool, &args),
         Cmd::Use { name, tool } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
@@ -970,6 +981,47 @@ fn cmd_add(
         println!("run `xfade use {name} --tool {tool}` to switch");
     }
     Ok(())
+}
+
+/// `xfade run <name> [--tool t] [-- <args>]`: exec the tool's binary with the
+/// provider injected via environment variables — on-disk configs stay untouched.
+/// Official providers launch the tool as-is (no injection). Env injection is
+/// only supported for tools with an env-based contract (claude / aider);
+/// config-file tools get a clear error pointing at `xfade use`.
+fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), CoreError> {
+    use std::process::Command;
+
+    let core = build_core()?;
+    let tool = resolve_tool(&core, name, tool)?;
+    let p = core
+        .list(Some(tool))?
+        .into_iter()
+        .find(|p| p.id == name)
+        .ok_or_else(|| CoreError::ProviderNotFound(name.into()))?;
+
+    let env = if p.is_official() {
+        Vec::new()
+    } else {
+        let key = core.secrets().get(&p.key_ref)?;
+        xfade_core::run::run_env(&p, Some(&key))?
+    };
+
+    let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
+    let status = Command::new(&bin)
+        .args(args)
+        .envs(env)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("'{bin}' not found in PATH; is {} installed?", tool.label()),
+                ))
+            } else {
+                e.into()
+            }
+        })?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// When use/rm/edit omit --tool: search the whole DB for a provider with that name;

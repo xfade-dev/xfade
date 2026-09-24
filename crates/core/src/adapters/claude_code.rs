@@ -13,6 +13,46 @@ const ENV_DEFAULT_OPUS: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
 const ENV_DEFAULT_SONNET: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
 const ENV_DEFAULT_HAIKU: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
 
+/// Shared claude env contract: given a third-party provider's base_url/model
+/// extras, produce the `ANTHROPIC_*` key/value pairs. Used both by
+/// `apply` (settings.json `env` block) and `xfade run` (process env), so the
+/// two paths can't drift.
+///
+/// Precondition: the provider is third-party with a `base_url` (the official
+/// branch clears the vars instead — see `apply`).
+pub(crate) fn claude_env_pairs(
+    base_url: &str,
+    api_key: Option<&str>,
+    extra: &serde_json::Value,
+) -> Vec<(&'static str, String)> {
+    // Claude Code's SDK appends /v1/messages to ANTHROPIC_BASE_URL,
+    // so a trailing /v1 must not be written (would double to /v1/v1).
+    let mut pairs = vec![
+        (ENV_BASE, client_base_url(base_url, "anthropic-messages")),
+        (ENV_TOKEN, api_key.unwrap_or_default().to_string()),
+    ];
+    // Per-slot model flags map to ANTHROPIC_DEFAULT_*_MODEL. When any
+    // slot is set, don't also write ANTHROPIC_MODEL — it has higher
+    // precedence and would override the per-slot resolution.
+    let mut any_slot = false;
+    for (extra_key, env_key) in [
+        ("opus_model", ENV_DEFAULT_OPUS),
+        ("sonnet_model", ENV_DEFAULT_SONNET),
+        ("haiku_model", ENV_DEFAULT_HAIKU),
+    ] {
+        if let Some(model) = extra.get(extra_key).and_then(|v| v.as_str()) {
+            pairs.push((env_key, model.to_string()));
+            any_slot = true;
+        }
+    }
+    if !any_slot {
+        if let Some(model) = extra.get("model").and_then(|m| m.as_str()) {
+            pairs.push((ENV_MODEL, model.to_string()));
+        }
+    }
+    pairs
+}
+
 pub struct ClaudeCodeAdapter {
     home: PathBuf,
 }
@@ -89,42 +129,19 @@ impl ToolAdapter for ClaudeCodeAdapter {
                     path: "provider".into(),
                     msg: format!("third-party provider '{}' is missing base_url", provider.id),
                 })?;
-            // Claude Code's SDK appends /v1/messages to ANTHROPIC_BASE_URL,
-            // so a trailing /v1 must not be written (would double to /v1/v1).
-            let base_url = client_base_url(base_url, "anthropic-messages");
-            env.insert(ENV_BASE.into(), json!(base_url));
-            env.insert(ENV_TOKEN.into(), json!(api_key.unwrap_or_default()));
-            // Per-slot model flags map to ANTHROPIC_DEFAULT_*_MODEL. When any
-            // slot is set, don't also write ANTHROPIC_MODEL — it has higher
-            // precedence and would override the per-slot resolution.
-            let slots = [
-                ("opus_model", ENV_DEFAULT_OPUS),
-                ("sonnet_model", ENV_DEFAULT_SONNET),
-                ("haiku_model", ENV_DEFAULT_HAIKU),
-            ];
-            let mut any_slot = false;
-            for (extra_key, env_key) in slots {
-                match provider.extra.get(extra_key).and_then(|v| v.as_str()) {
-                    Some(model) => {
-                        env.insert(env_key.into(), json!(model));
-                        any_slot = true;
-                    }
-                    None => {
-                        env.remove(env_key);
-                    }
-                }
+            // Clear all managed keys first: claude_env_pairs emits exactly the
+            // set that should exist, so stale values from a previous provider
+            // (e.g. a per-slot var the new provider doesn't set) must go.
+            for k in [
+                ENV_MODEL,
+                ENV_DEFAULT_OPUS,
+                ENV_DEFAULT_SONNET,
+                ENV_DEFAULT_HAIKU,
+            ] {
+                env.remove(k);
             }
-            if any_slot {
-                env.remove(ENV_MODEL);
-            } else {
-                match provider.extra.get("model").and_then(|m| m.as_str()) {
-                    Some(model) => {
-                        env.insert(ENV_MODEL.into(), json!(model));
-                    }
-                    None => {
-                        env.remove(ENV_MODEL);
-                    }
-                }
+            for (k, v) in claude_env_pairs(base_url, api_key, &provider.extra) {
+                env.insert(k.into(), json!(v));
             }
         }
         self.save(&doc)
