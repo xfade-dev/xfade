@@ -5,6 +5,7 @@ pub mod error;
 pub mod models;
 pub mod presets;
 pub mod proxy;
+pub mod run;
 pub mod service;
 pub mod store;
 

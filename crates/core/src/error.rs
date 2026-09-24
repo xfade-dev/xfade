@@ -35,6 +35,9 @@ pub enum CoreError {
     #[error("toml serialize error: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
 
+    #[error("`xfade run` doesn't support {0} (config-file driven; use `xfade use` instead)")]
+    RunUnsupported(String),
+
     #[error("proxy error: {0}")]
     Proxy(String),
 }
