@@ -23,8 +23,7 @@ CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
 
 ```bash
 # Homebrew（推荐，macOS）
-brew tap xfade-dev/homebrew-xfade
-brew install xfade
+brew install xfade-dev/xfade/xfade
 
 # 或一行安装（macOS / Linux）
 curl -fsSL https://xfade.sh | sh

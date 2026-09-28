@@ -23,8 +23,7 @@ CLI (`xfade`) + Tauri GUI, implemented in Rust.
 
 ```bash
 # Homebrew (recommended, macOS)
-brew tap xfade-dev/homebrew-xfade
-brew install xfade
+brew install xfade-dev/xfade/xfade
 
 # or the one-line installer (macOS / Linux)
 curl -fsSL https://xfade.sh | sh
