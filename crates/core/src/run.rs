@@ -83,7 +83,11 @@ pub fn run_env(provider: &Provider, api_key: Option<&str>) -> Result<Vec<(String
         }
         ToolKind::Aider => {
             // Aider maps every option to an AIDER_-prefixed env var; the
-            // openai-api-* pair targets its OpenAI-compatible client.
+            // openai-api-* pair targets its OpenAI-compatible client. A
+            // provider-less model name is rejected by litellm ("LLM Provider
+            // NOT provided" — verified against aider 0.86.2), so bare names
+            // get the openai/ prefix (stripped again before the request hits
+            // the wire).
             let mut env = vec![
                 (
                     "AIDER_OPENAI_API_KEY".to_string(),
@@ -92,7 +96,12 @@ pub fn run_env(provider: &Provider, api_key: Option<&str>) -> Result<Vec<(String
                 ("AIDER_OPENAI_API_BASE".to_string(), base_url.to_string()),
             ];
             if let Some(m) = provider.extra.get("model").and_then(|v| v.as_str()) {
-                env.push(("AIDER_MODEL".to_string(), m.to_string()));
+                let m = if m.contains('/') {
+                    m.to_string()
+                } else {
+                    format!("openai/{m}")
+                };
+                env.push(("AIDER_MODEL".to_string(), m));
             }
             Ok(env)
         }
@@ -205,7 +214,10 @@ mod tests {
                     "AIDER_OPENAI_API_BASE".to_string(),
                     "https://api.deepseek.com/v1".to_string()
                 ),
-                ("AIDER_MODEL".to_string(), "deepseek-chat".to_string()),
+                (
+                    "AIDER_MODEL".to_string(),
+                    "openai/deepseek-chat".to_string()
+                ),
             ]
         );
     }
@@ -220,6 +232,34 @@ mod tests {
         let env = run_env(&p, Some("sk")).unwrap();
         assert!(!env.iter().any(|(k, _)| k == "AIDER_MODEL"));
         assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn aider_bare_model_gets_openai_prefix() {
+        // aider (litellm) rejects a provider-less model: "LLM Provider NOT
+        // provided". Verified end-to-end against aider 0.86.2.
+        let mut p = Provider::new(
+            "deepseek",
+            ToolKind::Aider,
+            Some("https://api.deepseek.com/v1".into()),
+        );
+        p.extra = json!({"model": "deepseek-chat"});
+        let env = run_env(&p, Some("sk")).unwrap();
+        let model = env.iter().find(|(k, _)| k == "AIDER_MODEL").unwrap();
+        assert_eq!(model.1, "openai/deepseek-chat");
+    }
+
+    #[test]
+    fn aider_prefixed_model_passes_through() {
+        let mut p = Provider::new(
+            "openrouter",
+            ToolKind::Aider,
+            Some("https://openrouter.ai/api/v1".into()),
+        );
+        p.extra = json!({"model": "openai/gpt-5.1"});
+        let env = run_env(&p, Some("sk")).unwrap();
+        let model = env.iter().find(|(k, _)| k == "AIDER_MODEL").unwrap();
+        assert_eq!(model.1, "openai/gpt-5.1");
     }
 
     #[test]
