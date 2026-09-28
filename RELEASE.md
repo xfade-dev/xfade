@@ -27,8 +27,9 @@ git push origin main --tags
 ## Post-release: update the Homebrew formula
 
 1. Download `SHA256SUMS` from the GitHub Release and take the two macOS sha256 values.
-2. In the tap repo `homebrew-xfade`, update `Formula/xfade.rb`: `version` + the two `sha256`.
-3. `git commit -am "v0.7.0" && git push`; users get it via `brew upgrade xfade`.
+2. In the tap repo `homebrew-xfade` (local clone, e.g. `/tmp/homebrew-xfade`, HTTPS read / deploy-key write), update `Formula/xfade.rb`: `version` + the two `sha256`. Also sync the copy in this repo's `homebrew/Formula/`.
+3. `git commit -am "vX.Y.Z" && git push`; users get it via `brew upgrade xfade-dev/xfade/xfade`.
+4. **Post-release verification (do not skip)**: `curl -fsSL https://xfade.sh | sh` into a temp dir and check the version; then `brew update && brew info xfade-dev/xfade/xfade` shows the new version.
 
 ## One-line installer (`xfade.sh`)
 
@@ -40,7 +41,7 @@ https://raw.githubusercontent.com/xfade-dev/xfade/main/scripts/install.sh
 ```
 
 Then users can run `curl -fsSL https://xfade.sh | sh`. Pin a version with
-`XFADE_VERSION=v0.7.0`. The asset names it downloads match the release workflow
+`XFADE_VERSION=vX.Y.Z`. The asset names it downloads match the release workflow
 (`xfade-<arch>-<os>.tar.gz`).
 
 ## GUI sidecar (before local dev/build)
