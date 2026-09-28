@@ -2,6 +2,16 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.8.4 — 2026-09-24
+
+### New
+- **feat(cli)**: `xfade run <id> [--tool <t>] [-- <args>]` — one-off launch of a tool with a provider injected through environment variables only; on-disk configs stay untouched, so the active setup is preserved. Supported for env-driven tools (claude, aider); config-file tools get a clear error pointing at `xfade use`. Official providers launch the tool as-is. Tool args after `--` and the child's exit code are passed through.
+- **docs**: `xfade.sh` one-line installer is now live end-to-end (`curl -fsSL https://xfade.sh | sh` → Cloudflare edge redirect → GitHub raw install.sh), verified by installing v0.8.3 from a clean environment.
+
+### Fixes
+- **fix(cli)**: `xfade run` on Windows resolves npm-style `.cmd`/`.bat` shims via `PATH` + `PATHEXT` (`CreateProcess` only resolves `.exe`), so `claude` installed through npm launches correctly.
+- **fix(core)**: the claude env contract (`ANTHROPIC_BASE_URL` `/v1` handling, per-slot `ANTHROPIC_DEFAULT_*_MODEL` precedence) is now a single shared implementation used by both `xfade use` (settings.json) and `xfade run` (process env) — the two paths can't drift; `use` also clears stale per-slot vars from a previous provider before inserting.
+
 ## v0.8.3 — 2026-09-23
 
 ### New
