@@ -1,5 +1,5 @@
 class Xfade < Formula
-  desc "Route AI providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes / OpenClaw, with local proxy"
+  desc "Route AI providers for AI coding tools, with local proxy"
   homepage "https://xfade.dev"
   version "0.8.4"
   license "MIT OR Apache-2.0"
