@@ -6,6 +6,23 @@ use std::path::{Path, PathBuf};
 
 const OPENAI_COMPAT: &str = "@ai-sdk/openai-compatible";
 
+/// Build the canonical `models` object from provider `extra`.
+///
+/// Accepts `models = { "<model-id>": { ... } }` as-is; accepts
+/// `model = "<id>"` as a shorthand and synthesizes a single-entry object.
+fn models_for_extra(extra: &serde_json::Value) -> Value {
+    extra
+        .get("models")
+        .cloned()
+        .or_else(|| {
+            extra
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(|m| json!({ m: { "name": m } }))
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
 pub struct OpenCodeAdapter {
     home: PathBuf,
 }
@@ -103,23 +120,7 @@ impl ToolAdapter for OpenCodeAdapter {
                     msg: format!("third-party provider '{id}' is missing base_url"),
                 })?;
             // Canonical form: `models` object ({ "<model-id>": { "name": ... } }).
-            // Accept `model = "<id>"` as a shorthand and synthesize that object.
-            let models = provider
-                .extra
-                .get("models")
-                .cloned()
-                .or_else(|| {
-                    provider
-                        .extra
-                        .get("model")
-                        .and_then(|m| m.as_str())
-                        .map(|m| {
-                            let mut obj = serde_json::Map::new();
-                            obj.insert(m.to_string(), json!({ "name": m }));
-                            serde_json::Value::Object(obj)
-                        })
-                })
-                .unwrap_or_else(|| json!({}));
+            let models = models_for_extra(&provider.extra);
             // The openai-compatible SDK appends /chat/completions to baseURL,
             // so a bare host must carry the /v1 suffix.
             let base_url = client_base_url(base_url, "openai-completions");

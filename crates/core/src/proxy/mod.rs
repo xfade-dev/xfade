@@ -720,4 +720,118 @@ mod tests {
             last.error
         );
     }
+
+    // ----- V2 session identity end-to-end -----
+
+    #[tokio::test]
+    async fn session_id_stable_across_turns_and_backfills_handover() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sequence(vec![
+            (
+                200,
+                r#"{"id":"r1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            ),
+            (
+                200,
+                r#"{"id":"r2","choices":[{"index":0,"message":{"role":"assistant","content":"ok2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+            ),
+        ]);
+
+        // Turn 1 of a conversation.
+        let (status, headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sid = headers
+            .iter()
+            .find(|(k, _)| k == "x-xfade-session-id")
+            .expect("session id header on turn 1")
+            .1
+            .clone();
+        assert!(!sid.is_empty());
+
+        // A mid-session model switch (`xfade proxy use --model` records this;
+        // session_id starts NULL).
+        crate::sessions::record_handover(&db, "", Some("old-m"), Some("new-m")).unwrap();
+
+        // Turn 2: same opener, grown history → same session id.
+        let (status, headers2, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"ok"},{"role":"user","content":"and now?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sid2 = headers2
+            .iter()
+            .find(|(k, _)| k == "x-xfade-session-id")
+            .expect("session id header on turn 2")
+            .1
+            .clone();
+        assert_eq!(
+            sid, sid2,
+            "same opener within the sticky window keeps the session"
+        );
+
+        // Both request-log rows carry the session id.
+        let logs = db.recent_request_logs(5).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs
+            .iter()
+            .all(|l| l.session_id.as_deref() == Some(sid.as_str())));
+
+        // The session row folded in both turns.
+        let sessions = db.list_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, sid);
+        assert_eq!(sessions[0].prompt_tokens, 15);
+        assert_eq!(sessions[0].completion_tokens, 5);
+        assert_eq!(sessions[0].status, "ok");
+        assert_eq!(sessions[0].tool, "codex"); // provider yy is registered under codex
+        assert_eq!(sessions[0].provider_id.as_deref(), Some("yy"));
+        assert_eq!(sessions[0].first_prompt.as_deref(), Some("s\nhello"));
+
+        // The mid-session handover got backfilled onto this session.
+        let hs = db.list_handovers(&sid).unwrap();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].from_model.as_deref(), Some("old-m"));
+        assert_eq!(hs[0].to_model.as_deref(), Some("new-m"));
+    }
+
+    #[tokio::test]
+    async fn distinct_conversations_get_distinct_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(
+            200,
+            r#"{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+
+        for opener in ["first question", "a different question"] {
+            let body =
+                format!(r#"{{"model":"m","messages":[{{"role":"user","content":"{opener}"}}]}}"#);
+            let (status, headers, _) =
+                http_post_json_with_headers(&url, "/v1/chat/completions", &body, "Bearer x").await;
+            assert_eq!(status, 200);
+            assert!(headers
+                .iter()
+                .any(|(k, v)| k == "x-xfade-session-id" && !v.is_empty()));
+        }
+        // Two openers → two sessions.
+        assert_eq!(db.list_sessions(10).unwrap().len(), 2);
+    }
 }

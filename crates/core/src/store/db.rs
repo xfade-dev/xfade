@@ -20,6 +20,45 @@ pub struct RequestLog {
     pub completion_tokens: i64,
     pub duration_ms: i64,
     pub error: Option<String>,
+    /// Session this request belongs to (see `crate::sessions`); NULL for
+    /// pre-V2 rows and non-conversation endpoints (model listings).
+    pub session_id: Option<String>,
+}
+
+/// A session row — the aggregated, eviction-isolated counterpart of
+/// `request_logs` (which caps at `MAX_REQUEST_LOG_ROWS`): sessions survive
+/// request-log eviction so the unified session view keeps long history.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionRow {
+    pub id: String,
+    pub tool: String,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// running | ok | error
+    pub status: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// Cost is computed later (V2.5 per-model pricing); the column is
+    /// forward-compatible and stays 0 for now.
+    pub cost_usd_micros: i64,
+    /// Privacy-bounded preview of the conversation opener (truncated by the
+    /// writer). Full prompt text is never stored.
+    pub first_prompt: Option<String>,
+}
+
+/// A model/route switch recorded on the session timeline. `session_id` is
+/// NULL at switch time (a config-level switch has no request context) and is
+/// backfilled by the forward pipeline from the next matching request.
+#[derive(Debug, serde::Serialize)]
+pub struct HandoverRow {
+    pub id: i64,
+    pub tool: String,
+    pub session_id: Option<String>,
+    pub from_model: Option<String>,
+    pub to_model: Option<String>,
+    pub ts: String,
 }
 
 /// Stats aggregation dimension.
@@ -27,6 +66,8 @@ pub struct RequestLog {
 pub enum StatsGroupBy {
     Provider,
     Model,
+    /// Group request logs by their session (`(detached)` when NULL).
+    Session,
 }
 
 /// A single aggregated stats row.
@@ -42,6 +83,11 @@ pub struct StatsRow {
 
 /// Max request log rows to retain (older rows are evicted on each insert once exceeded).
 pub const MAX_REQUEST_LOG_ROWS: usize = 10_000;
+
+/// Sessions older than this are evicted when a new session is inserted.
+pub const SESSION_RETENTION_DAYS: i64 = 90;
+/// Hard cap on session rows (oldest evicted beyond the cap).
+pub const MAX_SESSION_ROWS: i64 = 50_000;
 
 #[derive(Clone)]
 pub struct Database {
@@ -69,7 +115,12 @@ impl Database {
         }
         let conn = Connection::open(path)?;
         // WAL mode: enables concurrent reads and reduces lock contention.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // busy_timeout: the daemon (serve) and CLI (use/sessions) are separate
+        // processes writing to the same SQLite file — without a wait, writers
+        // collide with immediate SQLITE_BUSY errors.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         let db = Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         };
@@ -118,6 +169,31 @@ impl Database {
                 provider_id TEXT PRIMARY KEY,
                 fails INTEGER NOT NULL DEFAULT 0,
                 cooldown_until_secs INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                tool TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL,
+                provider_id TEXT,
+                model TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd_micros INTEGER NOT NULL DEFAULT 0,
+                first_prompt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_fingerprint
+                ON sessions(fingerprint, started_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+            CREATE TABLE IF NOT EXISTS handovers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool TEXT NOT NULL DEFAULT '',
+                session_id TEXT,
+                from_model TEXT,
+                to_model TEXT,
+                ts TEXT NOT NULL
             );",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
@@ -157,6 +233,9 @@ impl Database {
                 "ALTER TABLE request_logs ADD COLUMN tool TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
+        }
+        if !log_cols.contains("session_id") {
+            conn.execute("ALTER TABLE request_logs ADD COLUMN session_id TEXT", [])?;
         }
         Ok(())
     }
@@ -321,8 +400,8 @@ impl Database {
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 log.ts,
                 log.endpoint,
@@ -334,6 +413,7 @@ impl Database {
                 log.completion_tokens,
                 log.duration_ms,
                 log.error,
+                log.session_id,
             ],
         )?;
         // Eviction: retain the most recent MAX_REQUEST_LOG_ROWS rows, deleting the oldest once exceeded.
@@ -364,6 +444,7 @@ impl Database {
         let group_expr = match by {
             StatsGroupBy::Provider => "provider_id",
             StatsGroupBy::Model => "COALESCE(model, '(unknown)')",
+            StatsGroupBy::Session => "COALESCE(session_id, '(detached)')",
         };
         let tool_filter = if tool.is_some() { " AND tool = ?2" } else { "" };
         let sql = format!(
@@ -399,7 +480,7 @@ impl Database {
     pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error
+            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![limit as i64])?;
@@ -416,6 +497,211 @@ impl Database {
                 completion_tokens: row.get(7)?,
                 duration_ms: row.get(8)?,
                 error: row.get(9)?,
+                session_id: row.get(10)?,
+            });
+        }
+        Ok(out)
+    }
+
+    // ── Sessions & handovers ──────────────────────────────────────────────
+
+    /// Find the most recent session whose conversation-opener fingerprint
+    /// matches and that started at/after `cutoff_ts` (RFC3339). Consecutive
+    /// turns of one conversation reuse the session id this way.
+    pub fn find_recent_session_id(
+        &self,
+        fingerprint: &str,
+        cutoff_ts: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions WHERE fingerprint = ?1 AND started_at >= ?2
+             ORDER BY started_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![fingerprint, cutoff_ts])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a new session row, evicting sessions past the retention window
+    /// (and beyond the row cap) — new-session inserts are once per
+    /// conversation, so the cleanup cost is amortized there.
+    pub fn insert_session(
+        &self,
+        id: &str,
+        fingerprint: &str,
+        started_at: &str,
+        first_prompt: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO sessions (id, fingerprint, started_at, first_prompt)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, fingerprint, started_at, first_prompt],
+        )?;
+        let retention_cutoff = (OffsetDateTime::now_utc()
+            - time::Duration::days(SESSION_RETENTION_DAYS))
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+        conn.execute(
+            "DELETE FROM sessions WHERE started_at < ?1",
+            params![retention_cutoff],
+        )?;
+        conn.execute(
+            "DELETE FROM sessions WHERE id IN (
+                SELECT id FROM sessions ORDER BY started_at DESC, id DESC
+                LIMIT -1 OFFSET ?1
+            )",
+            params![MAX_SESSION_ROWS],
+        )?;
+        Ok(())
+    }
+
+    /// Fold one request's outcome into its session: accumulate tokens, refresh
+    /// provider/model/tool (first writer wins for empty fields), set status
+    /// and ended_at. Best-effort caller — errors are the caller's choice.
+    #[allow(clippy::too_many_arguments)] // one flat record per logging site
+    pub fn update_session_progress(
+        &self,
+        session_id: &str,
+        tool: &str,
+        provider_id: &str,
+        model: Option<&str>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        status: &str,
+        ended_at: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET
+                tool = CASE WHEN ?2 != '' THEN ?2 ELSE tool END,
+                provider_id = CASE WHEN ?3 != '' THEN ?3 ELSE provider_id END,
+                model = COALESCE(?4, model),
+                prompt_tokens = prompt_tokens + ?5,
+                completion_tokens = completion_tokens + ?6,
+                status = ?7,
+                ended_at = ?8
+             WHERE id = ?1",
+            params![
+                session_id,
+                tool,
+                provider_id,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                status,
+                ended_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a model/route switch on the session timeline. `session_id` is
+    /// NULL at switch time (config-level switches have no request context);
+    /// the forward pipeline backfills it from the next matching request.
+    pub fn insert_handover(
+        &self,
+        tool: &str,
+        from_model: Option<&str>,
+        to_model: Option<&str>,
+        ts: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO handovers (tool, session_id, from_model, to_model, ts)
+             VALUES (?1, NULL, ?2, ?3, ?4)",
+            params![tool, from_model, to_model, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Attach `session_id` to the most recent not-yet-attributed handover
+    /// within the time window (RFC3339 `cutoff_ts`).
+    pub fn backfill_handover_session(&self, session_id: &str, cutoff_ts: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE handovers SET session_id = ?1
+             WHERE session_id IS NULL AND ts >= ?2
+               AND id = (SELECT id FROM handovers
+                         WHERE session_id IS NULL AND ts >= ?2
+                         ORDER BY id DESC LIMIT 1)",
+            params![session_id, cutoff_ts],
+        )?;
+        Ok(())
+    }
+
+    /// List sessions, newest first.
+    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, provider_id, model, started_at, ended_at, status,
+                    prompt_tokens, completion_tokens, cost_usd_micros, first_prompt
+             FROM sessions ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(SessionRow {
+                id: row.get(0)?,
+                tool: row.get(1)?,
+                provider_id: row.get(2)?,
+                model: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                status: row.get(6)?,
+                prompt_tokens: row.get(7)?,
+                completion_tokens: row.get(8)?,
+                cost_usd_micros: row.get(9)?,
+                first_prompt: row.get(10)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch one session by id.
+    pub fn get_session(&self, id: &str) -> Result<Option<SessionRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, provider_id, model, started_at, ended_at, status,
+                    prompt_tokens, completion_tokens, cost_usd_micros, first_prompt
+             FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(SessionRow {
+                id: row.get(0)?,
+                tool: row.get(1)?,
+                provider_id: row.get(2)?,
+                model: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                status: row.get(6)?,
+                prompt_tokens: row.get(7)?,
+                completion_tokens: row.get(8)?,
+                cost_usd_micros: row.get(9)?,
+                first_prompt: row.get(10)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Handovers attributed to one session, oldest first.
+    pub fn list_handovers(&self, session_id: &str) -> Result<Vec<HandoverRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, session_id, from_model, to_model, ts
+             FROM handovers WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(HandoverRow {
+                id: row.get(0)?,
+                tool: row.get(1)?,
+                session_id: row.get(2)?,
+                from_model: row.get(3)?,
+                to_model: row.get(4)?,
+                ts: row.get(5)?,
             });
         }
         Ok(out)
@@ -661,6 +947,7 @@ mod tests {
             completion_tokens: 1,
             duration_ms: 5,
             error: None,
+            session_id: None,
         })
         .unwrap();
         let rows = db
@@ -688,6 +975,7 @@ mod tests {
             completion_tokens: 50,
             duration_ms: 800,
             error: None,
+            session_id: None,
         })
         .unwrap();
         db.insert_request_log(&RequestLog {
@@ -701,6 +989,7 @@ mod tests {
             completion_tokens: 0,
             duration_ms: 120,
             error: Some("rate limited".into()),
+            session_id: None,
         })
         .unwrap();
         // F5: status=0 (upstream connection failure) should count as errors
@@ -715,6 +1004,7 @@ mod tests {
             completion_tokens: 0,
             duration_ms: 50,
             error: Some("connection refused".into()),
+            session_id: None,
         })
         .unwrap();
         let rows = db
@@ -745,6 +1035,7 @@ mod tests {
                 completion_tokens: 0,
                 duration_ms: 100,
                 error: None,
+                session_id: None,
             })
             .unwrap();
         };
@@ -800,6 +1091,7 @@ mod tests {
             completion_tokens: 2,
             duration_ms: 10,
             error: None,
+            session_id: None,
         };
         let v: serde_json::Value = serde_json::to_value(&log).unwrap();
         assert_eq!(v["endpoint"], "chat");
@@ -818,5 +1110,182 @@ mod tests {
             serde_json::to_string(&StatsGroupBy::Provider).unwrap(),
             "\"Provider\""
         );
+    }
+
+    // ── sessions & handovers ─────────────────────────────────────────────
+
+    #[test]
+    fn session_sticky_lookup_and_progress() {
+        let db = Database::open_memory().unwrap();
+        // Nothing yet.
+        assert!(db
+            .find_recent_session_id("fp1", "2026-10-09T10:00:00Z")
+            .unwrap()
+            .is_none());
+        db.insert_session("s1", "fp1", "2026-10-09T10:00:00Z", Some("hello world"))
+            .unwrap();
+        // Lookup takes cutoff = now - 30min: a session started at 10:00 is
+        // visible while "now" <= 10:30.
+        assert_eq!(
+            db.find_recent_session_id("fp1", "2026-10-09T09:45:00Z")
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+        assert_eq!(
+            db.find_recent_session_id("fp1", "2026-10-09T10:00:00Z")
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+        // …outside the window it does not (a fresh session is created).
+        assert!(db
+            .find_recent_session_id("fp1", "2026-10-09T10:00:01Z")
+            .unwrap()
+            .is_none());
+        // Different fingerprint never matches.
+        assert!(db
+            .find_recent_session_id("fp2", "2026-10-09T10:30:00Z")
+            .unwrap()
+            .is_none());
+
+        // Progress folding: accumulate tokens, first writer wins fields.
+        db.update_session_progress(
+            "s1",
+            "claude",
+            "kimi",
+            Some("kimi-k2.5"),
+            100,
+            50,
+            "ok",
+            "2026-10-09T10:01:00Z",
+        )
+        .unwrap();
+        db.update_session_progress(
+            "s1",
+            "claude",
+            "kimi",
+            None,
+            10,
+            5,
+            "error",
+            "2026-10-09T10:02:00Z",
+        )
+        .unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.tool, "claude");
+        assert_eq!(s.provider_id.as_deref(), Some("kimi"));
+        assert_eq!(s.model.as_deref(), Some("kimi-k2.5")); // COALESCE keeps it
+        assert_eq!(s.prompt_tokens, 110);
+        assert_eq!(s.completion_tokens, 55);
+        assert_eq!(s.status, "error");
+        assert_eq!(s.first_prompt.as_deref(), Some("hello world"));
+
+        // Empty tool/provider must not clobber filled fields.
+        db.update_session_progress("s1", "", "", None, 0, 0, "ok", "2026-10-09T10:03:00Z")
+            .unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.tool, "claude");
+        assert_eq!(s.provider_id.as_deref(), Some("kimi"));
+
+        // Listing is newest first.
+        db.insert_session("s2", "fp9", "2026-10-09T11:00:00Z", None)
+            .unwrap();
+        let list = db.list_sessions(10).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "s2");
+    }
+
+    #[test]
+    fn handover_record_and_backfill() {
+        let db = Database::open_memory().unwrap();
+        db.insert_handover("claude", Some("kimi"), Some("glm"), "2026-10-09T10:00:00Z")
+            .unwrap();
+        // Backfill attaches the most recent unattributed handover in window.
+        db.backfill_handover_session("s9", "2026-10-09T09:59:00Z")
+            .unwrap();
+        let hs = db.list_handovers("s9").unwrap();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].from_model.as_deref(), Some("kimi"));
+        assert_eq!(hs[0].to_model.as_deref(), Some("glm"));
+        assert_eq!(hs[0].session_id.as_deref(), Some("s9"));
+
+        // A second handover is attributed to the next session, not the old one.
+        db.insert_handover(
+            "claude",
+            Some("glm"),
+            Some("deepseek"),
+            "2026-10-09T10:05:00Z",
+        )
+        .unwrap();
+        db.backfill_handover_session("s10", "2026-10-09T10:04:00Z")
+            .unwrap();
+        assert_eq!(db.list_handovers("s9").unwrap().len(), 1);
+        let hs = db.list_handovers("s10").unwrap();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].to_model.as_deref(), Some("deepseek"));
+
+        // Backfill with a cutoff after the handover leaves it unattributed.
+        db.insert_handover("claude", Some("a"), Some("b"), "2026-10-09T12:00:00Z")
+            .unwrap();
+        db.backfill_handover_session("s11", "2026-10-09T13:00:00Z")
+            .unwrap();
+        assert!(db.list_handovers("s11").unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_log_carries_session_id() {
+        let db = Database::open_memory().unwrap();
+        db.insert_request_log(&RequestLog {
+            ts: "2026-10-09T10:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: None,
+            provider_id: "yy".into(),
+            tool: "claude".into(),
+            status: 200,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            duration_ms: 7,
+            error: None,
+            session_id: Some("s1".into()),
+        })
+        .unwrap();
+        let logs = db.recent_request_logs(5).unwrap();
+        assert_eq!(logs[0].session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn stats_group_by_session() {
+        let db = Database::open_memory().unwrap();
+        for (i, sid) in ["s1", "s1", "s2", "detached-none"].iter().enumerate() {
+            let session_id = if *sid == "detached-none" {
+                None
+            } else {
+                Some(sid.to_string())
+            };
+            db.insert_request_log(&RequestLog {
+                ts: "2026-10-09T10:00:00Z".into(),
+                endpoint: "chat".into(),
+                model: None,
+                provider_id: "yy".into(),
+                tool: "claude".into(),
+                status: 200,
+                prompt_tokens: i as i64 + 1,
+                completion_tokens: 0,
+                duration_ms: 10,
+                error: None,
+                session_id,
+            })
+            .unwrap();
+        }
+        let rows = db
+            .stats_since("2026-01-01T00:00:00Z", StatsGroupBy::Session, None)
+            .unwrap();
+        // s1 (2 requests), s2, (detached)
+        assert_eq!(rows.len(), 3);
+        let s1 = rows.iter().find(|r| r.group == "s1").unwrap();
+        assert_eq!(s1.requests, 2);
+        assert_eq!(s1.prompt_tokens, 3); // 1 + 2
+        assert!(rows.iter().any(|r| r.group == "(detached)"));
     }
 }

@@ -2,6 +2,14 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### New
+- **feat(cli)**: instant-launch subcommands — `xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]`. The tool name is the subcommand (a shorthand for `xfade run`); the provider is resolved on the spot, unregistered presets auto-create (third-party presets may use the global API key), `--model` without a name reverse-looks-up a matching preset/provider, and `name --base-url --key` registers an ad-hoc provider. All one-off overrides are never persisted and never touch the tool's config. Subcommands exist for all 9 tools; env injection is verified for **claude and aider only** — codex 0.155.0 / opencode 1.18.31 / pi 0.87.0 were real-machine tested and ignore env overrides for custom providers, so those subcommands point at `xfade use`.
+- **feat(core)**: session identity for proxied conversations — the opener (system + first user turn) is hashed into a fingerprint; requests within a 30-minute sticky window reuse the same session id (`X-Xfade-Session-Id` response header). No prompt text is stored (only a truncated opener preview). New `sessions` / `handovers` tables (eviction-isolated from the 10k request-log cap) plus `PRAGMA busy_timeout` for cross-process writes.
+- **feat(cli)**: unified session view — `xfade sessions` lists conversations (tool/provider/tokens/status), `xfade sessions show <id>` shows one session plus its model-switch timeline, `xfade stats --by session` aggregates per session. Model switches via `xfade use` and `xfade proxy use --model` land on the timeline and are backfilled from the next matching request.
+- **feat(core)**: `xfade run` with an official provider + `--model` (via the instant syntax) now injects the model-class env var instead of silently dropping the override.
+
 ## v0.8.4 — 2026-09-24
 
 ### New

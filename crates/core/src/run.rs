@@ -59,11 +59,29 @@ pub fn resolve_command(bin: &str) -> String {
 
 /// Environment variables to inject for launching `provider`'s tool.
 ///
-/// Official providers (no `base_url`) launch without injection (empty env):
-/// the tool falls back to its own login/auth state.
+/// Official providers (no `base_url`) launch without endpoint injection
+/// (empty env): the tool falls back to its own login/auth state. An explicit
+/// model override (the run layer clones the provider with `extra.model` set)
+/// is still honored: the model-class env var is injected so the override
+/// cannot be silently dropped.
 pub fn run_env(provider: &Provider, api_key: Option<&str>) -> Result<Vec<(String, String)>> {
     if provider.is_official() {
-        return Ok(Vec::new());
+        let model = provider.extra.get("model").and_then(|v| v.as_str());
+        return Ok(match (provider.tool, model) {
+            (ToolKind::ClaudeCode, Some(m)) => {
+                vec![("ANTHROPIC_MODEL".to_string(), m.to_string())]
+            }
+            // Same litellm provider-prefix rule as the third-party branch.
+            (ToolKind::Aider, Some(m)) => {
+                let m = if m.contains('/') {
+                    m.to_string()
+                } else {
+                    format!("openai/{m}")
+                };
+                vec![("AIDER_MODEL".to_string(), m)]
+            }
+            _ => Vec::new(),
+        });
     }
     let base_url = provider
         .base_url
@@ -186,14 +204,46 @@ mod tests {
     }
 
     #[test]
+    fn claude_official_with_model_injects_model_only() {
+        // `xfade claude official --model <m>`: endpoint/key stay the tool's
+        // own login state, but the model choice must reach it.
+        let mut p = Provider::new("official", ToolKind::ClaudeCode, None);
+        p.extra = json!({"model": "claude-opus-4-6"});
+        let env = run_env(&p, None).unwrap();
+        assert_eq!(
+            env,
+            vec![("ANTHROPIC_MODEL".to_string(), "claude-opus-4-6".to_string())]
+        );
+    }
+
+    #[test]
+    fn aider_official_with_model_injects_prefixed_model_only() {
+        let mut p = Provider::new("official", ToolKind::Aider, None);
+        p.extra = json!({"model": "gpt-5.1"});
+        let env = run_env(&p, None).unwrap();
+        assert_eq!(
+            env,
+            vec![("AIDER_MODEL".to_string(), "openai/gpt-5.1".to_string())]
+        );
+    }
+
+    #[test]
+    fn official_other_tools_ignore_model_extra() {
+        // Config-file tools have no env contract; official + model extra is
+        // not expressible via env (the CLI layer refuses the override there).
+        let mut p = Provider::new("official", ToolKind::Codex, None);
+        p.extra = json!({"model": "some-model"});
+        assert!(run_env(&p, None).unwrap().is_empty());
+    }
+
+    #[test]
     fn claude_third_party_requires_base_url() {
         let p = Provider::new("broken", ToolKind::ClaudeCode, None);
         let mut p = p;
         p.base_url = None;
         // A third-party provider without base_url cannot be expressed as env;
-        // model-only overrides on an official provider are not a thing either.
-        // (is_official() is exactly base_url.is_none(), so this maps to the
-        // official branch — assert the contract: official => empty env.)
+        // base_url.is_none() maps to the official branch. Official without a
+        // model override => empty env (with one, the model var is injected).
         assert!(run_env(&p, None).unwrap().is_empty());
     }
 

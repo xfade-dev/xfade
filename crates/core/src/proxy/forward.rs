@@ -63,16 +63,6 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn extract_model(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("model")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string())
-        })
-}
-
 /// If this is a chat completion request that asked for streaming but did not
 /// already specify `stream_options`, inject `{"stream_options":{"include_usage":true}}`
 /// and return the rewritten body. Otherwise return `None` (use the original body).
@@ -155,10 +145,13 @@ fn is_stream_response(resp: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
-/// Log a request to the database. Best-effort: errors are swallowed (proxy
-/// must not fail a successful forward because logging failed).
+/// Log a request to the database and fold its outcome into the session
+/// (token accumulation + handover attribution). Best-effort: errors are
+/// swallowed (the proxy must not fail a successful forward because logging
+/// failed).
 fn log_request(
     svc: &ProxyService,
+    session_id: Option<&str>,
     endpoint: &str,
     model: &Option<String>,
     provider_id: &str,
@@ -179,7 +172,18 @@ fn log_request(
         completion_tokens: usage.completion_tokens,
         duration_ms,
         error,
+        session_id: session_id.map(|s| s.to_string()),
     });
+    crate::sessions::record_outcome(
+        svc.core.db(),
+        session_id,
+        tool,
+        provider_id,
+        model.as_deref(),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        status != 0 && status < 400,
+    );
 }
 
 // ── Forward pipeline stages ────────────────────────────────────────────────
@@ -276,6 +280,7 @@ fn prepare_bodies(
 /// Callers (the failover loop) guarantee a success/redirection status.
 async fn handle_success(
     svc: &ProxyService,
+    session_id: Option<&str>,
     route_id: &str,
     tool: &str,
     resp: reqwest::Response,
@@ -292,6 +297,7 @@ async fn handle_success(
     if streaming {
         handle_success_streaming(
             svc,
+            session_id,
             route_id,
             tool,
             resp,
@@ -304,6 +310,7 @@ async fn handle_success(
     } else {
         handle_success_non_streaming(
             svc,
+            session_id,
             route_id,
             tool,
             resp,
@@ -320,6 +327,7 @@ async fn handle_success(
 /// Handle successful streaming response.
 fn handle_success_streaming(
     svc: &ProxyService,
+    session_id: Option<&str>,
     route_id: &str,
     tool: &str,
     resp: reqwest::Response,
@@ -344,6 +352,7 @@ fn handle_success_streaming(
     let tool_owned = tool.to_string();
     let endpoint_owned = endpoint.to_string();
     let model_owned = model.clone();
+    let session_owned = session_id.map(|s| s.to_string());
     let db = svc.core.db().clone();
 
     let body = if convert_path {
@@ -370,6 +379,7 @@ fn handle_success_streaming(
             model_owned,
             provider_id_owned,
             tool_owned,
+            session_owned,
             status,
             start,
         )
@@ -381,6 +391,7 @@ fn handle_success_streaming(
             model_owned,
             provider_id_owned,
             tool_owned,
+            session_owned,
             status,
             start,
         )
@@ -407,6 +418,7 @@ fn body_looks_like_json(bytes: &[u8]) -> bool {
 /// Handle successful non-streaming response.
 async fn handle_success_non_streaming(
     svc: &ProxyService,
+    session_id: Option<&str>,
     route_id: &str,
     tool: &str,
     resp: reqwest::Response,
@@ -429,6 +441,7 @@ async fn handle_success_non_streaming(
             let duration_ms = start.elapsed().as_millis() as i64;
             log_request(
                 svc,
+                session_id,
                 endpoint,
                 &model,
                 route_id,
@@ -461,6 +474,7 @@ async fn handle_success_non_streaming(
         );
         log_request(
             svc,
+            session_id,
             endpoint,
             &model,
             route_id,
@@ -487,6 +501,7 @@ async fn handle_success_non_streaming(
                 let usage = Usage::from_json(&anthropic_bytes);
                 log_request(
                     svc,
+                    session_id,
                     endpoint,
                     &model,
                     route_id,
@@ -505,6 +520,7 @@ async fn handle_success_non_streaming(
             Err(e) => {
                 log_request(
                     svc,
+                    session_id,
                     endpoint,
                     &model,
                     route_id,
@@ -525,6 +541,7 @@ async fn handle_success_non_streaming(
     let usage = Usage::from_json(&bytes);
     log_request(
         svc,
+        session_id,
         endpoint,
         &model,
         route_id,
@@ -545,6 +562,7 @@ async fn handle_success_non_streaming(
 /// for failover continuation).
 async fn handle_upstream_error(
     svc: &ProxyService,
+    session_id: Option<&str>,
     route_id: &str,
     tool: &str,
     resp: reqwest::Response,
@@ -560,6 +578,7 @@ async fn handle_upstream_error(
         let usage = Usage::from_json(&bytes);
         log_request(
             svc,
+            session_id,
             endpoint,
             model,
             route_id,
@@ -583,6 +602,7 @@ async fn handle_upstream_error(
     let usage = Usage::from_json(&bytes);
     log_request(
         svc,
+        session_id,
         endpoint,
         model,
         route_id,
@@ -598,10 +618,19 @@ async fn handle_upstream_error(
         .unwrap()
 }
 
+/// Fold a pipeline-level failure (no routes, bad conversion, all routes
+/// exhausted) into the session so it doesn't stay "running" forever.
+fn session_failed(svc: &ProxyService, session_id: Option<&str>) {
+    if let Some(sid) = session_id {
+        crate::sessions::record_outcome(svc.core.db(), Some(sid), "", "", None, 0, 0, false);
+    }
+}
+
 /// Execute the failover loop: try each route in order, skipping open circuits.
 /// Returns the final response (success or last error).
 async fn failover_loop(
     svc: &ProxyService,
+    session_id: Option<&str>,
     method: &str,
     routes: &[String],
     provider_map: &std::collections::HashMap<String, &crate::models::Provider>,
@@ -661,6 +690,7 @@ async fn failover_loop(
                 if status.is_success() || status.is_redirection() {
                     return handle_success(
                         svc,
+                        session_id,
                         route_id,
                         provider.tool.as_str(),
                         resp,
@@ -675,6 +705,7 @@ async fn failover_loop(
                 if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                     let _resp = handle_upstream_error(
                         svc,
+                        session_id,
                         route_id,
                         provider.tool.as_str(),
                         resp,
@@ -689,6 +720,7 @@ async fn failover_loop(
                 // Other 4xx: passthrough, stop failover.
                 return handle_upstream_error(
                     svc,
+                    session_id,
                     route_id,
                     provider.tool.as_str(),
                     resp,
@@ -702,6 +734,7 @@ async fn failover_loop(
                 let duration_ms = start.elapsed().as_millis() as i64;
                 log_request(
                     svc,
+                    session_id,
                     endpoint,
                     &model,
                     route_id,
@@ -717,6 +750,8 @@ async fn failover_loop(
             }
         }
     }
+
+    session_failed(svc, session_id);
 
     match last_err {
         Some((status, text)) => Response::builder()
@@ -739,6 +774,7 @@ async fn forward_with_failover(
     headers: &HeaderMap,
     body: &[u8],
     model: Option<String>,
+    session_id: Option<&str>,
 ) -> Response {
     let start = Instant::now();
 
@@ -751,7 +787,10 @@ async fn forward_with_failover(
         provider_map,
     } = match resolve_routes(svc, &providers) {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(resp) => {
+            session_failed(svc, session_id);
+            return *resp;
+        }
     };
 
     // Stage 2: prepare request bodies (conversion + stream_options injection).
@@ -761,7 +800,10 @@ async fn forward_with_failover(
         convert_path,
     } = match prepare_bodies(endpoint, &target_protocol, body, model_override.as_deref()) {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(resp) => {
+            session_failed(svc, session_id);
+            return *resp;
+        }
     };
 
     let req_model = model.clone().unwrap_or_default();
@@ -769,6 +811,7 @@ async fn forward_with_failover(
     // Stage 3: execute failover loop across routes.
     failover_loop(
         svc,
+        session_id,
         method,
         &routes,
         &provider_map,
@@ -896,6 +939,7 @@ fn make_tapped_streaming_body<S>(
     model: Option<String>,
     provider_id: String,
     tool: String,
+    session_id: Option<String>,
     status: StatusCode,
     start: Instant,
 ) -> Body
@@ -927,6 +971,7 @@ where
         model,
         provider_id,
         tool,
+        session_id,
         db,
         status,
         start,
@@ -944,6 +989,7 @@ fn make_converted_tapped_streaming_body<S>(
     model: Option<String>,
     provider_id: String,
     tool: String,
+    session_id: Option<String>,
     status: StatusCode,
     start: Instant,
 ) -> Body
@@ -968,6 +1014,7 @@ where
         model,
         provider_id,
         tool,
+        session_id,
         db,
         status,
         start,
@@ -986,6 +1033,7 @@ struct TailLogStream {
     model: Option<String>,
     provider_id: String,
     tool: String,
+    session_id: Option<String>,
     db: crate::store::db::Database,
     status: StatusCode,
     start: Instant,
@@ -997,6 +1045,7 @@ impl TailLogStream {
         let tail_bytes = self.tail.lock().unwrap().clone();
         let usage = Usage::from_sse_tail(&tail_bytes);
         let duration_ms = self.start.elapsed().as_millis() as i64;
+        let status_ok = error.is_none();
         let _ = self.db.insert_request_log(&RequestLog {
             ts: now_rfc3339(),
             endpoint: self.endpoint.clone(),
@@ -1008,7 +1057,18 @@ impl TailLogStream {
             completion_tokens: usage.completion_tokens,
             duration_ms,
             error,
+            session_id: self.session_id.clone(),
         });
+        crate::sessions::record_outcome(
+            &self.db,
+            self.session_id.as_deref(),
+            &self.tool,
+            &self.provider_id,
+            self.model.as_deref(),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            status_ok,
+        );
     }
 }
 
@@ -1049,13 +1109,44 @@ pub async fn handle(
     body: Bytes,
 ) -> Response {
     let endpoint = endpoint_from_path(uri.path());
-    let model = extract_model(&body);
-    forward_with_failover(&svc, "POST", endpoint, &headers, &body, model).await
+    // Parse the body once; model extraction and the session engine share it.
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()))
+        .map(|s| s.to_string());
+    // Conversation identity: hash the opener (system + first user turn) and
+    // reuse the session when the fingerprint matches one started recently.
+    let session_id = parsed.as_ref().and_then(|v| {
+        let opener = crate::sessions::opener_text(v, endpoint);
+        if opener.is_empty() {
+            return None;
+        }
+        let fp = crate::sessions::fingerprint(&opener, endpoint);
+        crate::sessions::resolve_session(svc.core.db(), &fp, &opener)
+    });
+    let mut resp = forward_with_failover(
+        &svc,
+        "POST",
+        endpoint,
+        &headers,
+        &body,
+        model,
+        session_id.as_deref(),
+    )
+    .await;
+    // Surface the session id so clients/tools can correlate requests.
+    if let Some(sid) = &session_id {
+        if let Ok(value) = axum::http::HeaderValue::from_str(sid) {
+            resp.headers_mut().insert("x-xfade-session-id", value);
+        }
+    }
+    resp
 }
 
 pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
     let endpoint = "models";
-    forward_with_failover(&svc, "GET", endpoint, &headers, &[], None).await
+    forward_with_failover(&svc, "GET", endpoint, &headers, &[], None, None).await
 }
 
 #[cfg(test)]

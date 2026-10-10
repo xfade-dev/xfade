@@ -596,3 +596,235 @@ fn per_slot_flag_on_non_claude_fails() {
         .failure()
         .stderr(predicate::str::contains("only valid for `--tool claude`"));
 }
+
+// --- instant-launch subcommands (`xfade claude ...`) -----------------------
+//
+// Any test that reaches the exec step sets PATH to the (binary-less) fake
+// HOME, so spawning the tool fails deterministically with the mapped
+// "not found in PATH" error instead of launching a real CLI.
+
+#[test]
+fn instant_config_file_tool_points_to_use() {
+    let home = tempfile::tempdir().unwrap();
+    for tool in [
+        "codex", "opencode", "pi", "omp", "cline", "hermes", "openclaw",
+    ] {
+        xfade(home.path())
+            .args([tool])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("use `xfade use` instead"));
+    }
+    // The `omp` variant also answers its `oh-my-pi` alias.
+    xfade(home.path())
+        .args(["oh-my-pi"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("use `xfade use` instead"));
+    // Refused before any side effects: nothing persisted.
+    xfade(home.path())
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn instant_named_preset_autocreates_and_launches() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args(["claude", "kimi", "--key", "sk-1"])
+        .assert()
+        .failure() // exec fails: no `claude` binary in the fake PATH
+        .stdout(predicate::str::contains(
+            "auto-created claude/kimi from preset",
+        ))
+        .stderr(predicate::str::contains("not found in PATH"));
+    // The provider persisted for future runs.
+    xfade(home.path())
+        .args(["ls", "--tool", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kimi"));
+}
+
+#[test]
+fn instant_registered_provider_launches_without_recreate() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args([
+            "add",
+            "--tool",
+            "claude",
+            "kimi",
+            "--base-url",
+            "https://api.moonshot.cn/anthropic",
+            "--key",
+            "sk-1",
+            "--set",
+            "model=kimi-k2.5",
+        ])
+        .assert()
+        .success();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args(["claude", "kimi"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("auto-created").not())
+        .stderr(predicate::str::contains("not found in PATH"));
+}
+
+#[test]
+fn instant_model_reverse_lookup_autocreates() {
+    // No name: `--model kimi-k2.5` prefix-matches the `kimi` preset uniquely.
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args(["claude", "--model", "kimi-k2.5", "--key", "sk-1"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "auto-created claude/kimi from preset",
+        ))
+        .stderr(predicate::str::contains("not found in PATH"));
+}
+
+#[test]
+fn instant_model_no_match_errors() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["claude", "--model", "totally-unknown-model"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no provider or preset matches model",
+        ));
+}
+
+#[test]
+fn instant_third_party_preset_needs_key() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["claude", "kimi"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs an API key"));
+    // No half-add: the preset wasn't persisted without a key.
+    xfade(home.path())
+        .args(["ls", "--tool", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kimi").not());
+}
+
+#[test]
+fn instant_global_key_satisfies_third_party_preset() {
+    // Unlike `use` (which demands an explicit add), a launch may fall back to
+    // the global key: it never writes the tool config, so a bad key only
+    // fails this one request.
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["config", "set", "api_key", "sk-global"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args(["claude", "kimi"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "auto-created claude/kimi from preset",
+        ))
+        .stderr(predicate::str::contains("not found in PATH"));
+}
+
+#[test]
+fn instant_adhoc_base_url_creates() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args([
+            "claude",
+            "my-gw",
+            "--base-url",
+            "https://gw.example/anthropic",
+            "--key",
+            "sk-1",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("auto-created claude/my-gw"))
+        .stderr(predicate::str::contains("not found in PATH"));
+    xfade(home.path())
+        .args(["ls", "--tool", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("my-gw"));
+}
+
+#[test]
+fn instant_adhoc_base_url_requires_key() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["claude", "my-gw", "--base-url", "https://gw.example"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs an API key"));
+}
+
+#[test]
+fn instant_base_url_flip_official_requires_key() {
+    // --base-url flips the official provider to third-party; a key becomes
+    // mandatory instead of silently launching unauthenticated.
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["claude", "official", "--base-url", "https://gw.example"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no API key"));
+}
+
+#[test]
+fn instant_bare_launch_official_when_no_active() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .env("PATH", home.path())
+        .args(["claude"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("auto-created").not())
+        .stderr(predicate::str::contains("not found in PATH"));
+}
+
+// --- unified session view ---------------------------------------------------
+
+#[test]
+fn sessions_empty_and_show_not_found() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["sessions"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no sessions yet"));
+    xfade(home.path())
+        .args(["sessions", "show", "s-nonexistent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn stats_by_session_accepted() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["stats", "--by", "session"])
+        .assert()
+        .success();
+    // Unknown dimension is rejected by the value parser.
+    xfade(home.path())
+        .args(["stats", "--by", "bogus"])
+        .assert()
+        .failure();
+}

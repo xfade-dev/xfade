@@ -78,6 +78,46 @@ xfade run kimi -- --print # everything after `--` goes to the tool itself
 Supported for env-driven tools (claude, aider); config-file tools tell you to
 use `xfade use` instead. Official providers launch the tool as-is.
 
+### Instant launch: `xfade <tool>`
+
+The tool name itself is a subcommand — a shorthand for `xfade run` with the
+provider, model, endpoint and key resolved on the spot (unregistered presets
+are auto-created; nothing is ever written into the tool's own config):
+
+```bash
+xfade claude kimi                          # launch Claude Code on the kimi preset (auto-created)
+xfade claude --model kimi-k2.5             # no name: the model reverse-looks-up a matching preset/provider
+xfade claude my-gw --base-url https://gw --key sk-xxx   # ad-hoc endpoint, auto-registered
+xfade claude -- --print                    # everything after `--` goes to the tool
+xfade aider deepseek --model deepseek-chat
+```
+
+Notes:
+
+- Key precedence: `--key` → the provider's stored key → the global `api_key`.
+- `--model` / `--base-url` are one-off overrides and are never persisted.
+- Env injection works for **claude** and **aider** — verified against codex
+  0.155.0 / opencode 1.18.31 / pi 0.87.0, which all ignore env overrides for
+  custom providers, so those subcommands (and omp/cline/hermes/openclaw)
+  point at `xfade use` instead.
+
+## Session view
+
+Requests flowing through `xfade serve` get a conversation identity: the
+opener (system + first user turn) is hashed into a fingerprint, and
+consecutive turns within 30 minutes reuse the same session — no prompt text
+is ever stored (only a truncated opener preview). Model switches made by
+`xfade use` or `xfade proxy use --model` land on the session timeline and are
+backfilled from the next matching request:
+
+```bash
+xfade sessions                 # list recent sessions (tool / provider / tokens / status)
+xfade sessions show <id>       # one session + its model-switch timeline
+xfade stats --by session       # request/token aggregates per session
+```
+
+Every proxied response also carries an `X-Xfade-Session-Id` header.
+
 ## CLI command reference
 
 ```
@@ -85,6 +125,8 @@ xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
 xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected via env vars (claude / aider)
+xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
+                                        # instant launch: claude/aider fully work; other tools point at `use`
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
@@ -93,6 +135,7 @@ xfade import --tool <t>            # import from the tool's existing config
 xfade backup ls|restore --tool <t>
 xfade completion <shell>
 xfade tui [--tool <t>]             # interactive crossfader TUI (default: bare `xfade`)
+xfade sessions [show <id>]         # unified session view (conversations seen by the proxy)
 xfade config [set <k> <v>]         # view/set global config (secrets backend, shared base_url/model/api)
 xfade self-update                  # update to the latest GitHub release
 ```
@@ -104,7 +147,7 @@ xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # run in foregr
 xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
 xfade proxy status
 xfade proxy clear
-xfade stats                  # aggregate by provider/model
+xfade stats [--by provider|model|session]   # aggregate request stats
 ```
 
 ### daemon (macOS + Linux)

@@ -77,6 +77,43 @@ xfade run kimi -- --print # `--` 之后的所有参数原样传给工具
 仅支持 env 驱动的工具（claude、aider）；配置文件型工具会提示改用
 `xfade use`。官方 provider 则原样启动工具。
 
+### 即时启动：`xfade <工具名>`
+
+工具名本身就是子命令——`xfade run` 的语法糖，provider/model/端点/密钥
+现场解析（未注册的 preset 自动创建；绝不写工具自身配置）：
+
+```bash
+xfade claude kimi                          # 用 kimi preset 启动 Claude Code（自动落库）
+xfade claude --model kimi-k2.5             # 省略 name：按模型名反查匹配的 preset/provider
+xfade claude my-gw --base-url https://gw --key sk-xxx   # 临时端点，自动注册
+xfade claude -- --print                    # `--` 之后原样传给工具
+xfade aider deepseek --model deepseek-chat
+```
+
+说明：
+
+- 密钥优先级：`--key` → provider 已存密钥 → 全局 `api_key`。
+- `--model` / `--base-url` 是一次性覆盖，绝不落库。
+- env 注入只对 **claude** 和 **aider** 生效——已对 codex 0.155.0 /
+  opencode 1.18.31 / pi 0.87.0 真机验证，它们对自定义 provider 均忽略
+  env 覆盖，因此这些子命令（含 omp/cline/hermes/openclaw）会指引
+  `xfade use`。
+
+## 会话视图
+
+流经 `xfade serve` 的请求会获得会话身份：开场白（system + 第一轮 user）
+哈希成指纹，30 分钟内的连续请求复用同一会话——不存任何 prompt 原文
+（只有截断的开场白预览）。`xfade use` 或 `xfade proxy use --model` 造成的
+模型切换会落到会话时间线，由下一个匹配请求回填：
+
+```bash
+xfade sessions                 # 最近会话列表（工具/provider/token/状态）
+xfade sessions show <id>       # 单个会话详情 + 模型切换时间线
+xfade stats --by session       # 按会话聚合请求/token
+```
+
+所有被代理的响应都带 `X-Xfade-Session-Id` 响应头。
+
 ## CLI 命令速查
 
 ```
@@ -84,6 +121,8 @@ xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
 xfade run <id> [--tool <t>] [-- <args>]  # 环境变量注入一次性启动工具（claude / aider）
+xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
+                                        # 即时启动：claude/aider 完整可用；其余工具指引 `use`
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
@@ -92,6 +131,7 @@ xfade import --tool <t>            # 从工具现有配置导入
 xfade backup ls|restore --tool <t>
 xfade completion <shell>
 xfade tui [--tool <t>]             # 交互式 crossfader TUI（默认：裸 `xfade`）
+xfade sessions [show <id>]         # 统一会话视图（代理看到的会话）
 xfade config [set <k> <v>]         # 查看/设置全局配置（secrets 后端、共享 base_url/model/api）
 xfade self-update                  # 自更新到最新 GitHub Release
 ```
@@ -103,7 +143,7 @@ xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # 前台运行
 xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
 xfade proxy status
 xfade proxy clear
-xfade stats                  # 按 provider/model 聚合
+xfade stats [--by provider|model|session]   # 请求统计聚合
 ```
 
 ### daemon（macOS + Linux）

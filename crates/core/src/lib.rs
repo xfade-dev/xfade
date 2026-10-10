@@ -7,6 +7,7 @@ pub mod presets;
 pub mod proxy;
 pub mod run;
 pub mod service;
+pub mod sessions;
 pub mod store;
 
 pub use error::{CoreError, Result};

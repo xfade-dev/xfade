@@ -246,6 +246,7 @@ impl Core {
     /// Switch provider: backup → write tool config → mark active.
     pub fn use_provider(&self, tool: ToolKind, id: &str) -> Result<()> {
         self.ensure_imported(tool)?;
+        let previous = self.current(tool)?;
         let p = self
             .db
             .get(tool, id)?
@@ -266,7 +267,21 @@ impl Core {
         let p = self.patch_official_removal(tool, p)?;
         let p = self.patch_original_capture(tool, p)?;
         adapter.apply(&p, key.as_deref())?;
-        self.db.set_active(tool, id)
+        self.db.set_active(tool, id)?;
+        // Session timeline: record the config-level switch. The handover row's
+        // session_id stays NULL — the proxy pipeline backfills it from the next
+        // matching request (see sessions::record_outcome). Best-effort.
+        let from = previous.as_ref().map(switch_label);
+        let to = switch_label(&p);
+        if from.as_deref() != Some(to.as_str()) {
+            let _ = crate::sessions::record_handover(
+                &self.db,
+                tool.as_str(),
+                from.as_deref(),
+                Some(&to),
+            );
+        }
+        Ok(())
     }
 
     /// When switching OpenCode back to official, write the current active custom
@@ -409,6 +424,15 @@ impl Core {
 
 /// Extract every `_original_*` key from a provider's `extra` (or a
 /// `capture_original_state` payload). Returns None when there are none.
+/// Timeline label for a switch: the provider's model when known, else its id.
+fn switch_label(p: &Provider) -> String {
+    p.extra
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(&p.id)
+        .to_string()
+}
+
 fn original_state_keys(
     extra: &serde_json::Value,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {

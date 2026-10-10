@@ -235,6 +235,33 @@ pub async fn http_post_json(url: &str, path: &str, body: &str, auth: &str) -> (u
     (status, text)
 }
 
+/// Like `http_post_json`, but also returns the response headers (lowercased
+/// names). Used by the session-identity end-to-end test.
+pub async fn http_post_json_with_headers(
+    url: &str,
+    path: &str,
+    body: &str,
+    auth: &str,
+) -> (u16, Vec<(String, String)>, String) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}{path}"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", auth)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let text = resp.text().await.unwrap();
+    (status, headers, text)
+}
+
 /// Like `http_post_json` but tolerates mid-stream body errors (returns
 /// whatever bytes were received before the error). Used by the
 /// interrupted-stream regression test.

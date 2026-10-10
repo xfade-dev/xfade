@@ -58,7 +58,7 @@ enum Cmd {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
-    /// Run a tool CLI with a provider injected via env vars (claude / aider only, no config changes)
+    /// Run a tool CLI with a provider injected via env vars (claude / aider only, no config changes; shorthand: `xfade claude <name>`)
     Run {
         /// Provider name (as shown in `xfade ls`)
         name: String,
@@ -136,8 +136,13 @@ enum Cmd {
     Stats {
         #[arg(long, default_value = "7d")]
         since: String,
-        #[arg(long, value_parser = ["provider", "model"])]
+        #[arg(long, value_parser = ["provider", "model", "session"])]
         by: Option<String>,
+    },
+    /// Unified session view: conversations seen by the local gateway
+    Sessions {
+        #[command(subcommand)]
+        cmd: Option<SessionsCmd>,
     },
     /// Update xfade to the latest GitHub release
     SelfUpdate,
@@ -146,6 +151,47 @@ enum Cmd {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
+    /// Launch Claude Code with a provider injected via env (instant `run`)
+    Claude(RunOpts),
+    /// Launch Codex — config-file tool, instant launch unsupported (see `xfade use`)
+    Codex(RunOpts),
+    /// Launch OpenCode — config-file tool, instant launch unsupported (see `xfade use`)
+    #[command(name = "opencode")]
+    OpenCode(RunOpts),
+    /// Launch Pi — config-file tool, instant launch unsupported (see `xfade use`)
+    Pi(RunOpts),
+    /// Launch Oh My Pi — config-file tool, instant launch unsupported (see `xfade use`)
+    #[command(name = "omp", alias = "oh-my-pi")]
+    OhMyPi(RunOpts),
+    /// Launch Aider with a provider injected via env (instant `run`)
+    Aider(RunOpts),
+    /// Launch Cline — config-file tool, instant launch unsupported (see `xfade use`)
+    Cline(RunOpts),
+    /// Launch Hermes Agent — config-file tool, instant launch unsupported (see `xfade use`)
+    Hermes(RunOpts),
+    /// Launch OpenClaw — config-file tool, instant launch unsupported (see `xfade use`)
+    #[command(name = "openclaw")]
+    OpenClaw(RunOpts),
+}
+
+/// Instant-launch options for the per-tool subcommands:
+/// `xfade <tool> [name] [--model m] [--base-url u] [--key k] [-- <args>]`.
+#[derive(clap::Args)]
+struct RunOpts {
+    /// Provider or preset name; omit to launch the tool's active provider
+    name: Option<String>,
+    /// One-off model override (resolved to a provider/preset when NAME is omitted)
+    #[arg(long)]
+    model: Option<String>,
+    /// One-off endpoint override (flips an official provider to third-party)
+    #[arg(long)]
+    base_url: Option<String>,
+    /// API key (stored key first, then the global key)
+    #[arg(long)]
+    key: Option<String>,
+    /// Arguments after `--` are passed to the tool itself
+    #[arg(last = true)]
+    args: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -189,6 +235,12 @@ enum ServeCmd {
     Stop,
     /// Query daemon status
     Status,
+}
+
+#[derive(Subcommand)]
+enum SessionsCmd {
+    /// Show one session's details and its model-switch timeline
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -308,6 +360,15 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             Ok(())
         }
         Cmd::Run { name, tool, args } => cmd_run(&name, tool, &args),
+        Cmd::Claude(o) => cmd_run_instant(ToolKind::ClaudeCode, o),
+        Cmd::Codex(o) => cmd_run_instant(ToolKind::Codex, o),
+        Cmd::OpenCode(o) => cmd_run_instant(ToolKind::OpenCode, o),
+        Cmd::Pi(o) => cmd_run_instant(ToolKind::Pi, o),
+        Cmd::OhMyPi(o) => cmd_run_instant(ToolKind::OhMyPi, o),
+        Cmd::Aider(o) => cmd_run_instant(ToolKind::Aider, o),
+        Cmd::Cline(o) => cmd_run_instant(ToolKind::Cline, o),
+        Cmd::Hermes(o) => cmd_run_instant(ToolKind::Hermes, o),
+        Cmd::OpenClaw(o) => cmd_run_instant(ToolKind::OpenClaw, o),
         Cmd::Use { name, tool } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
@@ -642,7 +703,25 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         )));
                     }
                 }
+                let prev = core.db().get_routes().ok().flatten();
                 core.db().set_routes(&names, model.as_deref(), &target)?;
+                // Session timeline: mid-flight model switches land here
+                // (`proxy use --model`), not in `xfade use` — the gateway picks
+                // them up on the very next request without a client restart.
+                // The handover's session_id is backfilled by the proxy from
+                // the next matching request. Best-effort.
+                let from = prev
+                    .as_ref()
+                    .and_then(|(r, m, _)| m.clone().or_else(|| r.first().cloned()));
+                let to = model.clone().or_else(|| names.first().cloned());
+                if from != to {
+                    let _ = xfade_core::sessions::record_handover(
+                        core.db(),
+                        "",
+                        from.as_deref(),
+                        to.as_deref(),
+                    );
+                }
                 let main = &names[0];
                 let backups: Vec<&str> = names.iter().skip(1).map(|s| s.as_str()).collect();
                 if backups.is_empty() {
@@ -691,6 +770,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             let since_ts = parse_since(&since)?;
             let group_by = match by.as_deref() {
                 Some("model") => StatsGroupBy::Model,
+                Some("session") => StatsGroupBy::Session,
                 _ => StatsGroupBy::Provider,
             };
             let core = build_core()?;
@@ -712,6 +792,75 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
+        Cmd::Sessions { cmd } => match cmd {
+            None => {
+                let core = build_core()?;
+                let rows = core.db().list_sessions(50)?;
+                if rows.is_empty() {
+                    println!(
+                        "no sessions yet (they appear once requests flow through `xfade serve`)"
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "{:<26} {:<8} {:<10} {:<16} {:>8} {:<8} started",
+                    "session", "tool", "provider", "model", "tokens", "status"
+                );
+                for r in &rows {
+                    let tokens = r.prompt_tokens + r.completion_tokens;
+                    println!(
+                        "{:<26} {:<8} {:<10} {:<16} {:>8} {:<8} {}",
+                        r.id,
+                        r.tool,
+                        r.provider_id.as_deref().unwrap_or("-"),
+                        r.model.as_deref().unwrap_or("-"),
+                        tokens,
+                        r.status,
+                        r.started_at
+                    );
+                }
+                Ok(())
+            }
+            Some(SessionsCmd::Show { id }) => {
+                let core = build_core()?;
+                let s = core
+                    .db()
+                    .get_session(&id)?
+                    .ok_or_else(|| CoreError::ConfigParse {
+                        path: "sessions".into(),
+                        msg: format!("session '{id}' not found (see `xfade sessions`)"),
+                    })?;
+                println!("session:  {}", s.id);
+                println!("tool:     {}", s.tool);
+                println!("provider: {}", s.provider_id.as_deref().unwrap_or("-"));
+                println!("model:    {}", s.model.as_deref().unwrap_or("-"));
+                println!("status:   {}", s.status);
+                println!("started:  {}", s.started_at);
+                if let Some(e) = &s.ended_at {
+                    println!("ended:    {e}");
+                }
+                println!(
+                    "tokens:   {} prompt + {} completion",
+                    s.prompt_tokens, s.completion_tokens
+                );
+                if let Some(p) = &s.first_prompt {
+                    println!("opener:   {p}");
+                }
+                let hs = core.db().list_handovers(&s.id)?;
+                if !hs.is_empty() {
+                    println!("model switches:");
+                    for h in &hs {
+                        println!(
+                            "  {}  {} -> {}",
+                            h.ts,
+                            h.from_model.as_deref().unwrap_or("-"),
+                            h.to_model.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
         Cmd::SelfUpdate => self_update(),
         Cmd::Tui { tool } => {
             let core = build_core()?;
@@ -1024,6 +1173,215 @@ fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), Co
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// `xfade <tool> [name] [--model m] ...`: instant-launch flavor of `run` —
+/// the tool name is the subcommand, provider/model/key are resolved on the
+/// spot (auto-created from a preset or `--base-url` when unregistered) and
+/// the tool's on-disk config is never touched. Env injection covers tools
+/// with an env contract only (claude / aider — verified 2026-10-09 that
+/// codex/opencode/pi ignore env overrides); other tools get a `xfade use` hint.
+fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
+    use std::process::Command;
+
+    if !matches!(tool, ToolKind::ClaudeCode | ToolKind::Aider) {
+        return Err(CoreError::ConfigParse {
+            path: "run".into(),
+            msg: format!(
+                "instant launch doesn't support {} (config-file driven; use `xfade use` instead)",
+                tool.label()
+            ),
+        });
+    }
+    let core = build_core()?;
+    let mut p = resolve_instant_provider(&core, tool, &opts)?;
+
+    // One-off overrides on the clone: never persisted, never written to the
+    // tool's own config.
+    if let Some(m) = &opts.model {
+        let mut map = p.extra.as_object().cloned().unwrap_or_default();
+        map.insert("model".to_string(), serde_json::Value::String(m.clone()));
+        p.extra = serde_json::Value::Object(map);
+    }
+    if let Some(u) = &opts.base_url {
+        p.base_url = Some(u.clone());
+    }
+
+    // Key precedence: --key > the provider's stored secret > the global key.
+    // A --base-url override that flips an official provider to third-party
+    // requires a key.
+    let key = match &opts.key {
+        Some(k) => Some(k.clone()),
+        None if p.is_official() => None,
+        None => core
+            .secrets()
+            .get(&p.key_ref)
+            .ok()
+            .or_else(|| core.global_api_key()),
+    };
+    if !p.is_official() && key.is_none() {
+        return Err(CoreError::MissingApiKey(format!(
+            "provider '{}/{}' has no API key; pass --key or set a global key (`xfade config set api_key <sk-...>`)",
+            tool, p.id
+        )));
+    }
+
+    let env = xfade_core::run::run_env(&p, key.as_deref())?;
+    let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
+    let status = Command::new(&bin)
+        .args(&opts.args)
+        .envs(env)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("'{bin}' not found in PATH; is {} installed?", tool.label()),
+                ))
+            } else {
+                e.into()
+            }
+        })?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Resolve the provider for an instant launch. Order:
+/// 1. NAME given → registered provider, else preset (auto-created; third-party
+///    presets may use the global key, unlike `use`), else `--base-url` ad-hoc
+///    creation, else not-found.
+/// 2. NAME omitted, `--model` given → reverse lookup over registered
+///    providers + presets (id or extra.model, case-insensitive prefix);
+///    exactly one hit adopts it, zero/ambiguous error out.
+/// 3. Both omitted → the tool's active provider, else a bare official launch.
+fn resolve_instant_provider(
+    core: &Core,
+    tool: ToolKind,
+    opts: &RunOpts,
+) -> Result<Provider, CoreError> {
+    let registered = core.list(Some(tool))?;
+    let name = match &opts.name {
+        Some(n) => n.clone(),
+        None => match &opts.model {
+            None => {
+                return Ok(core
+                    .current(tool)?
+                    .unwrap_or_else(|| Provider::new("official", tool, None)));
+            }
+            Some(m) => match reverse_lookup(&registered, tool, m)? {
+                Some(n) => n,
+                None => {
+                    return Err(CoreError::ProviderNotFound(format!(
+                        "no provider or preset matches model '{m}'; pass a name or --base-url"
+                    )));
+                }
+            },
+        },
+    };
+
+    if let Some(p) = registered.iter().find(|p| p.id == name) {
+        return Ok(p.clone());
+    }
+    if let Some(preset) = presets_for(tool).into_iter().find(|p| p.id == name) {
+        let is_local_proxy = name == "local-proxy";
+        let preset_official = preset.is_official();
+        let mut p = Provider::new(&name, tool, preset.base_url);
+        p.extra = preset.extra;
+        // Key: official needs none; local-proxy uses the fixed proxy token;
+        // third-party: --key or the global key. Unlike `use` (which refuses to
+        // auto-create third-party presets — a placeholder written into the
+        // tool config breaks its auth), a launch never writes the tool config,
+        // so a bad key just fails this one request.
+        let key = if preset_official {
+            None
+        } else if is_local_proxy {
+            Some("xfade-local-proxy".to_string())
+        } else {
+            match &opts.key {
+                Some(k) => Some(k.clone()),
+                None => core.global_api_key(),
+            }
+        };
+        if !p.is_official() && key.is_none() {
+            return Err(CoreError::MissingApiKey(format!(
+                "'{name}' is a third-party preset and needs an API key: pass --key, set a global \
+                 key (`xfade config set api_key <sk-...>`), or add it first \
+                 (`xfade add {name} --tool {tool} --base-url <url> --key <sk-...>`)"
+            )));
+        }
+        core.add_provider(p.clone(), key.as_deref())?;
+        println!("auto-created {tool}/{name} from preset");
+        return Ok(p);
+    }
+    if let Some(url) = &opts.base_url {
+        let key = match &opts.key {
+            Some(k) => Some(k.clone()),
+            None => core.global_api_key(),
+        };
+        if key.is_none() {
+            return Err(CoreError::MissingApiKey(format!(
+                "creating '{name}' with --base-url needs an API key: pass --key or set a global key"
+            )));
+        }
+        let p = Provider::new(&name, tool, Some(url.clone()));
+        core.add_provider(p.clone(), key.as_deref())?;
+        println!("auto-created {tool}/{name}");
+        return Ok(p);
+    }
+    Err(CoreError::ProviderNotFound(format!(
+        "{name} (run `xfade ls` / `xfade presets` to list, or create ad hoc with --base-url)"
+    )))
+}
+
+/// Reverse lookup for `xfade <tool> --model <m>` without a name: candidates are
+/// registered providers and presets whose `id` or `extra.model` equals or
+/// (case-insensitively) prefixes the model. Exactly one candidate adopts it.
+fn reverse_lookup(
+    registered: &[Provider],
+    tool: ToolKind,
+    model: &str,
+) -> Result<Option<String>, CoreError> {
+    let m = model.to_ascii_lowercase();
+    let mut hits: Vec<String> = Vec::new();
+    for p in registered {
+        if model_hit(&p.id, p.extra.get("model").and_then(|v| v.as_str()), &m)
+            && !hits.contains(&p.id)
+        {
+            hits.push(p.id.clone());
+        }
+    }
+    for preset in presets_for(tool) {
+        if !hits.contains(&preset.id)
+            && model_hit(
+                &preset.id,
+                preset.extra.get("model").and_then(|v| v.as_str()),
+                &m,
+            )
+        {
+            hits.push(preset.id.clone());
+        }
+    }
+    match hits.len() {
+        0 => Ok(None),
+        1 => Ok(Some(hits.remove(0))),
+        _ => Err(CoreError::ConfigParse {
+            path: String::new(),
+            msg: format!("model '{model}' is ambiguous between {hits:?}; pass an explicit name"),
+        }),
+    }
+}
+
+fn model_hit(id: &str, extra_model: Option<&str>, lower_model: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    if id == lower_model || lower_model.starts_with(&id) {
+        return true;
+    }
+    match extra_model {
+        Some(em) => {
+            let em = em.to_ascii_lowercase();
+            em == lower_model || lower_model.starts_with(&em)
+        }
+        None => false,
+    }
+}
+
 /// When use/rm/edit omit --tool: search the whole DB for a provider with that name;
 /// one match → use it; multiple → error prompting for --tool; zero → ProviderNotFound.
 fn resolve_tool(core: &Core, name: &str, tool: Option<ToolKind>) -> Result<ToolKind, CoreError> {
@@ -1056,5 +1414,73 @@ fn print_table(list: &[Provider]) {
             p.id,
             p.base_url.as_deref().unwrap_or("(official)")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prov(id: &str, model: Option<&str>) -> Provider {
+        let mut p = Provider::new(id, ToolKind::ClaudeCode, Some("https://gw".into()));
+        if let Some(m) = model {
+            p.extra = serde_json::json!({ "model": m });
+        }
+        p
+    }
+
+    #[test]
+    fn reverse_lookup_matches_id_prefix_and_extra_model() {
+        let registered = vec![
+            prov("kimi", Some("kimi-k2.5")),
+            prov("gw2", Some("openai/gpt-5.1")),
+        ];
+        // id prefix: "kimi" prefixes "kimi-k2.5"
+        assert_eq!(
+            reverse_lookup(&registered, ToolKind::ClaudeCode, "kimi-k2.5")
+                .unwrap()
+                .as_deref(),
+            Some("kimi")
+        );
+        // exact extra.model match
+        assert_eq!(
+            reverse_lookup(&registered, ToolKind::ClaudeCode, "openai/gpt-5.1")
+                .unwrap()
+                .as_deref(),
+            Some("gw2")
+        );
+        // nothing matches
+        assert_eq!(
+            reverse_lookup(&registered, ToolKind::ClaudeCode, "nope").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reverse_lookup_ambiguous_errors() {
+        // "kimi-k2.5" prefix-matches both ids → ambiguity, not a silent pick.
+        let registered = vec![prov("kimi", None), prov("kimi-k2", None)];
+        let err = reverse_lookup(&registered, ToolKind::ClaudeCode, "kimi-k2.5").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn reverse_lookup_registered_wins_over_same_id_preset() {
+        // The preset table also has a "kimi" entry; the registered hit must
+        // dedupe it instead of reporting ambiguity.
+        let registered = vec![prov("kimi", None)];
+        assert_eq!(
+            reverse_lookup(&registered, ToolKind::ClaudeCode, "kimi-k2.5")
+                .unwrap()
+                .as_deref(),
+            Some("kimi")
+        );
+    }
+
+    #[test]
+    fn model_hit_is_case_insensitive() {
+        assert!(model_hit("Kimi", None, "kimi-k2.5"));
+        assert!(model_hit("x", Some("Moonshot-K2"), "moonshot-k2"));
+        assert!(!model_hit("kimi", None, "gpt-5.1"));
     }
 }
