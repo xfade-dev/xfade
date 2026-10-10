@@ -147,8 +147,29 @@ xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # run in foregr
 xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
 xfade proxy status
 xfade proxy clear
+xfade proxy smart on|off              # Smart Fader toggle (off by default)
 xfade stats [--by provider|model|session]   # aggregate request stats
 ```
+
+### Smart Fader (intent-aware routing)
+
+Off by default — enable with `xfade proxy smart on`; every request pays zero extra cost while off.
+
+When on, the proxy classifies each request's last user message (pure keyword rules, no model calls) and re-orders your configured routes across tiers:
+
+| Intent | Examples | Order |
+|---|---|---|
+| Light — error triage, tests, lint/format, small refactors | "why does this fail", "write a test", "run clippy" | local first, cloud fallback |
+| Heavy — big refactors, architecture | "restructure the module", "design the API" | cloud first, local fallback |
+| Unknown | anything unmatched | configured order (unchanged) |
+
+Details:
+
+- **Tier detection**: explicit `extra.tier = "local" | "cloud"` on a provider wins; otherwise loopback base_urls (`127.0.0.1`/`localhost`/`[::1]` — Ollama, LM Studio, MLX servers) are local, everything else cloud.
+- **In-bucket ordering**: within a tier, providers are ordered by recent health (error rate, then latency) from a 30s-TTL stats snapshot — no per-request GROUP BY. Providers without stats keep their configured position relative to each other.
+- **Circuit breakers and failover behave exactly as with the fader off**: open circuits are skipped before bucketing, and a failing primary still fails over through the list.
+- Model overrides now also apply on the chat→chat passthrough path (local runtimes): the `model` field is rewritten per route.
+- Project analysis (language fingerprint + git pulse, cached in the `repo_maps` table) ships as an enrichment signal for future features — phase-2 classification itself only reads the prompt text, and nothing consumes the analyzer yet.
 
 ### daemon (macOS + Linux)
 

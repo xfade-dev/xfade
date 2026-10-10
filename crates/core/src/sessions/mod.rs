@@ -108,7 +108,7 @@ pub fn opener_text(body: &serde_json::Value, endpoint: &str) -> String {
 
 /// Content can be a plain string or an array of typed blocks
 /// (`[{"type":"text","text":"…"}]`); both forms collapse to their text.
-fn content_text(v: &serde_json::Value) -> String {
+pub(crate) fn content_text(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(items) => items

@@ -217,6 +217,12 @@ impl Database {
                 [],
             )?;
         }
+        if !existing_cols.contains("smart_enabled") {
+            conn.execute(
+                "ALTER TABLE proxy_state ADD COLUMN smart_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // Same pattern for request_logs: pre-tool-column databases get a
         // default of '' (those rows only show up in unfiltered stats views).
         let mut stmt = conn.prepare("PRAGMA table_info(request_logs)")?;
@@ -237,6 +243,15 @@ impl Database {
         if !log_cols.contains("session_id") {
             conn.execute("ALTER TABLE request_logs ADD COLUMN session_id TEXT", [])?;
         }
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS repo_maps (
+                root_path TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                map_json TEXT NOT NULL,
+                generated_at TEXT NOT NULL
+            );",
+            [],
+        )?;
         Ok(())
     }
 
@@ -395,6 +410,71 @@ impl Database {
         self.conn()
             .execute("DELETE FROM proxy_state WHERE id = 1", [])?;
         Ok(())
+    }
+
+    /// Whether the Smart Fader (intent-based tiered routing) is enabled.
+    /// Read on every request so `xfade proxy smart on/off` takes effect on
+    /// a running daemon immediately.
+    pub fn smart_enabled(&self) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT smart_enabled FROM proxy_state WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, i64>(0)? != 0),
+            None => Ok(false),
+        }
+    }
+
+    pub fn set_smart_enabled(&self, on: bool) -> Result<()> {
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|e| CoreError::ConfigParse {
+                path: "time".into(),
+                msg: e.to_string(),
+            })?;
+        // Full upsert: proxy_state has NOT NULL columns without defaults
+        // (routes, updated_at), so a partial INSERT OR IGNORE would be
+        // silently swallowed by the conflict clause.
+        self.conn().execute(
+            "INSERT INTO proxy_state (id, routes, model_override, target_protocol, updated_at, smart_enabled)
+             VALUES (1, '[]', NULL, 'chat', ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET smart_enabled = excluded.smart_enabled",
+            params![now, on as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Cache a repo map (analyzer fingerprint + payload) keyed by root path.
+    pub fn save_repo_map(&self, root_path: &str, fingerprint: &str, map_json: &str) -> Result<()> {
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|e| CoreError::ConfigParse {
+                path: "time".into(),
+                msg: e.to_string(),
+            })?;
+        self.conn().execute(
+            "INSERT INTO repo_maps (root_path, fingerprint, map_json, generated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root_path) DO UPDATE SET
+                fingerprint = excluded.fingerprint,
+                map_json = excluded.map_json,
+                generated_at = excluded.generated_at",
+            params![root_path, fingerprint, map_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a cached repo map: (fingerprint, map_json).
+    pub fn get_repo_map(&self, root_path: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT fingerprint, map_json FROM repo_maps WHERE root_path = ?1")?;
+        let mut rows = stmt.query(params![root_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
     }
 
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
@@ -799,6 +879,38 @@ mod tests {
         assert_eq!(got.base_url, p.base_url);
         assert_eq!(got.key_ref, p.key_ref);
         assert!(db.get(ToolKind::ClaudeCode, "kimi").unwrap().is_none());
+    }
+
+    #[test]
+    fn smart_enabled_defaults_off_and_roundtrips() {
+        let db = Database::open_memory().unwrap();
+        assert!(!db.smart_enabled().unwrap());
+        db.set_smart_enabled(true).unwrap();
+        assert!(db.smart_enabled().unwrap());
+        db.set_smart_enabled(false).unwrap();
+        assert!(!db.smart_enabled().unwrap());
+    }
+
+    #[test]
+    fn repo_maps_upsert_and_get() {
+        let db = Database::open_memory().unwrap();
+        assert!(db.get_repo_map("/proj").unwrap().is_none());
+
+        db.save_repo_map("/proj", "fp1", r#"{"lang":"rust"}"#)
+            .unwrap();
+        let (fp, map) = db.get_repo_map("/proj").unwrap().unwrap();
+        assert_eq!(fp, "fp1");
+        assert_eq!(map, r#"{"lang":"rust"}"#);
+
+        // Same root overwrites (cache semantics).
+        db.save_repo_map("/proj", "fp2", r#"{"lang":"go"}"#)
+            .unwrap();
+        let (fp, _) = db.get_repo_map("/proj").unwrap().unwrap();
+        assert_eq!(fp, "fp2");
+
+        // Distinct roots coexist.
+        db.save_repo_map("/other", "fp3", "{}").unwrap();
+        assert!(db.get_repo_map("/other").unwrap().is_some());
     }
 
     #[test]

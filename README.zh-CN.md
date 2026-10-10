@@ -143,8 +143,29 @@ xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # 前台运行
 xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
 xfade proxy status
 xfade proxy clear
+xfade proxy smart on|off              # Smart Fader 开关（默认关闭）
 xfade stats [--by provider|model|session]   # 请求统计聚合
 ```
+
+### Smart Fader（意图路由）
+
+默认关闭——`xfade proxy smart on` 显式开启；关闭时所有请求零额外开销。
+
+开启后，代理对每个请求的最后一条 user 消息做意图分类（纯关键词规则，零模型调用），并按层（tier）重排已配置的路由：
+
+| 意图 | 示例 | 顺序 |
+|---|---|---|
+| 轻量——报错分诊、写测试、lint/format、小重构 | "为什么编译失败"、"写个测试"、"跑下 clippy" | 本地优先，云端回退 |
+| 重量——大重构、架构设计 | "重构整个模块"、"设计这个 API" | 云端优先，本地回退 |
+| 未匹配 | 其他 | 配置顺序（不变） |
+
+要点：
+
+- **层判定**：provider 显式 `extra.tier = "local" | "cloud"` 优先；否则按 base_url 启发式——回环地址（`127.0.0.1`/`localhost`/`[::1]`，即 Ollama、LM Studio、MLX 服务）算本地，其余算云端。
+- **层内排序**：按近期健康度（错误率、再延迟）排序，数据来自 30s TTL 的统计快照——不会每请求跑 GROUP BY。无统计的 provider 彼此保持配置顺序。
+- **熔断与 failover 行为与关闭时完全一致**：熔断项分桶前剔除，主路由失败依旧沿列表回退。
+- model override 现在同样作用于 chat→chat passthrough 路径（本地运行时）：按路由改写 `model` 字段。
+- 项目分析（语言指纹 + git pulse，缓存在 `repo_maps` 表）已作为未来功能的增强信号交付——阶段2 的分类本身只读 prompt 文本，目前尚无消费方。
 
 ### daemon（macOS + Linux）
 

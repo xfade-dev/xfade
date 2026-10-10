@@ -16,6 +16,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 
 pub const FAIL_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 60;
@@ -47,6 +48,34 @@ pub struct ProxyService {
     pub auth_token: Option<String>,
     pub host: String,
     pub port: u16,
+    /// Static-order planner (Smart Fader off).
+    pub default_router: Arc<dyn crate::router::Router>,
+    /// Intent-aware tiered planner (Smart Fader on).
+    pub smart_router: Arc<dyn crate::router::Router>,
+    /// TTL snapshot of per-provider health (error rate / latency) so the
+    /// Smart Fader doesn't run a GROUP BY on every request.
+    health_cache: Mutex<HealthSnapshot>,
+}
+
+/// Window for health aggregation and how long a snapshot stays fresh.
+const HEALTH_WINDOW_SECS: i64 = 3600;
+const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct HealthSnapshot {
+    refreshed_at: Option<std::time::Instant>,
+    signals: HashMap<String, crate::router::HealthSignal>,
+}
+
+impl HealthSnapshot {
+    fn get(&self, id: &str) -> Option<crate::router::HealthSignal> {
+        self.signals.get(id).copied()
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.refreshed_at
+            .is_some_and(|at| at.elapsed() < HEALTH_TTL)
+    }
 }
 
 impl ProxyService {
@@ -66,7 +95,61 @@ impl ProxyService {
             auth_token: None,
             host: "127.0.0.1".to_string(),
             port: 0,
+            default_router: Arc::new(crate::router::DefaultRouter),
+            smart_router: Arc::new(crate::router::SmartRouter::default()),
+            health_cache: Mutex::new(HealthSnapshot::default()),
         }
+    }
+
+    /// Pick the active router: re-read from the DB on every request so
+    /// `xfade proxy smart on/off` reaches a running daemon immediately.
+    /// Read failure falls back to the static router (fail-safe).
+    fn active_router(&self) -> &dyn crate::router::Router {
+        if self.core.db().smart_enabled().unwrap_or(false) {
+            &*self.smart_router
+        } else {
+            &*self.default_router
+        }
+    }
+
+    /// Provider health for within-bucket ordering. Served from a 30s TTL
+    /// snapshot so per-request cost is a map lookup, not a GROUP BY.
+    fn health_signal(&self, id: &str) -> Option<crate::router::HealthSignal> {
+        {
+            let snap = self.health_cache.lock().unwrap();
+            if snap.is_fresh() {
+                return snap.get(id);
+            }
+        }
+        // Expired (or first call): refresh from request_logs. Best-effort —
+        // on stats failure keep the stale snapshot rather than failing the
+        // request path.
+        let since = OffsetDateTime::now_utc()
+            .checked_sub(time::Duration::seconds(HEALTH_WINDOW_SECS))
+            .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        if let Ok(rows) = self
+            .core
+            .db()
+            .stats_since(&since, crate::store::db::StatsGroupBy::Provider, None)
+        {
+            let mut snap = self.health_cache.lock().unwrap();
+            snap.signals = rows
+                .into_iter()
+                .filter(|r| r.requests > 0)
+                .map(|r| {
+                    (
+                        r.group,
+                        crate::router::HealthSignal {
+                            error_rate: r.errors as f64 / r.requests as f64,
+                            avg_ms: r.avg_duration_ms,
+                        },
+                    )
+                })
+                .collect();
+            snap.refreshed_at = Some(std::time::Instant::now());
+        }
+        self.health_cache.lock().unwrap().get(id)
     }
 
     pub fn with_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
@@ -189,6 +272,292 @@ mod tests {
         let url = spawn_service(ProxyService::new(core)).await;
         let (status, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(status, 503);
+    }
+
+    #[tokio::test]
+    async fn passthrough_model_override_rewrites_model_field() {
+        // chat → chat passthrough with a model_override must rewrite the
+        // `model` field of the forwarded body. Local runtimes (MLX/Ollama)
+        // are chat passthrough targets — dropping the override there would
+        // silently route to the wrong local model.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["yy".into()], Some("qwen3-coder"), "chat")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"gpt-x","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let seen = up.last_request().await;
+        assert!(
+            seen.body.contains("\"model\":\"qwen3-coder\""),
+            "model field not rewritten: {}",
+            seen.body
+        );
+        assert!(!seen.body.contains("gpt-x"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_without_override_keeps_model_field() {
+        // No model_override: the client's model must reach the upstream
+        // untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"gpt-x","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let seen = up.last_request().await;
+        assert!(seen.body.contains("\"model\":\"gpt-x\""));
+    }
+
+    #[tokio::test]
+    async fn smart_fader_routes_light_intent_local_first() {
+        // Smart Fader on: an error-triage prompt must go to the local
+        // (loopback) upstream even though the cloud provider is configured
+        // first. Both mocks bind 127.0.0.1; tier separation comes from an
+        // explicit `extra.tier` on the cloud provider.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        // Loopback URL → tier local via the base_url heuristic.
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"}); // explicit cloud
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["cloud".into(), "local".into()], None, "chat")
+            .unwrap();
+        core.db().set_smart_enabled(true).unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        local.respond_with(200, "{}");
+        cloud.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(local.call_count().await, 1);
+        assert_eq!(cloud.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn smart_fader_off_keeps_configured_order() {
+        // Smart Fader off (default): same setup, but the light-intent prompt
+        // must hit the cloud provider first — the configured order wins.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"});
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["cloud".into(), "local".into()], None, "chat")
+            .unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        local.respond_with(200, "{}");
+        cloud.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(cloud.call_count().await, 1);
+        assert_eq!(local.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn smart_fader_routes_heavy_intent_cloud_first() {
+        // Smart Fader on: a big-refactor prompt must go to the cloud
+        // provider even though the local provider is configured first.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"});
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["local".into(), "cloud".into()], None, "chat")
+            .unwrap();
+        core.db().set_smart_enabled(true).unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        local.respond_with(200, "{}");
+        cloud.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"restructure the whole proxy module into layers"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(cloud.call_count().await, 1);
+        assert_eq!(local.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn smart_fader_light_intent_local_500_fails_over_to_cloud() {
+        // Smart Fader on, light intent: local is primary but returns 500 —
+        // the failover loop must continue into the cloud bucket and the
+        // request must succeed there.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"});
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["cloud".into(), "local".into()], None, "chat")
+            .unwrap();
+        core.db().set_smart_enabled(true).unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        local.respond_with(500, r#"{"error":"local model overloaded"}"#);
+        cloud.respond_with(200, r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#);
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(local.call_count().await, 1);
+        assert_eq!(cloud.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn smart_fader_circuit_open_local_falls_to_cloud_without_call() {
+        // Smart Fader on, light intent, local circuit open after repeated
+        // failures: the planner skips local entirely (no upstream call),
+        // cloud serves the request.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"});
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["cloud".into(), "local".into()], None, "chat")
+            .unwrap();
+        core.db().set_smart_enabled(true).unwrap();
+
+        let svc = ProxyService::new(core);
+        // Blow the circuit: FAIL_THRESHOLD (3) consecutive failures.
+        for _ in 0..super::FAIL_THRESHOLD {
+            svc.record_failure("local");
+        }
+        assert!(svc.circuit_open("local"));
+
+        let url = spawn_service(svc).await;
+        cloud.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(local.call_count().await, 0, "circuit-open local must not be called");
+        assert_eq!(cloud.call_count().await, 1);
     }
 
     #[tokio::test]

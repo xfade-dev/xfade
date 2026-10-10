@@ -82,6 +82,50 @@ fn maybe_inject_stream_options(endpoint: &str, body: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&v).ok()
 }
 
+/// Transform a passthrough body in a single parse: inject
+/// `stream_options` for streaming chat requests (usage extraction) and
+/// rewrite the top-level `model` field when the route carries a model
+/// override. Returns `None` when the body needs no change, so the original
+/// bytes are forwarded untouched.
+///
+/// The model rewrite is what makes model overrides work on the
+/// chat→chat passthrough path (local MLX/Ollama runtimes) — the convert
+/// path applies overrides during protocol conversion, passthrough needs
+/// this shallow rewrite.
+fn transform_passthrough_body(
+    endpoint: &str,
+    body: &[u8],
+    model_override: Option<&str>,
+) -> Option<Vec<u8>> {
+    if endpoint != "chat" && model_override.is_none() {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut changed = false;
+
+    if endpoint == "chat" {
+        let is_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        if is_stream && v.get("stream_options").is_none() {
+            v["stream_options"] = serde_json::json!({"include_usage": true});
+            changed = true;
+        }
+    }
+
+    if let Some(m) = model_override {
+        // Only rewrite when the body already carries a model field: a
+        // model-less body (unusual for chat APIs) is forwarded as-is.
+        if v.get("model").is_some() && v.get("model").and_then(|x| x.as_str()) != Some(m) {
+            v["model"] = serde_json::Value::String(m.to_string());
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&v).ok()
+}
+
 /// Build the outgoing reqwest request (without sending) for a given upstream.
 fn build_upstream_request(
     client: &reqwest::Client,
@@ -143,6 +187,36 @@ fn is_stream_response(resp: &reqwest::Response) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false)
+}
+
+/// Text of the last user message, for intent classification.
+///
+/// chat/messages take the last `role=="user"` entry of `messages`;
+/// responses takes the last user item of `input`. Content may be a plain
+/// string or an array of typed blocks. Huge prompts are truncated to keep
+/// classification cheap.
+fn extract_prompt_text(body: &serde_json::Value, endpoint: &str) -> String {
+    let messages = match endpoint {
+        "responses" => body.get("input").and_then(|i| i.as_array()),
+        // chat + messages share the `messages[].content` shape.
+        _ => body.get("messages").and_then(|m| m.as_array()),
+    };
+    let last_user = messages
+        .and_then(|msgs| {
+            msgs.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+        .and_then(|m| m.get("content"));
+    match last_user {
+        Some(c) => {
+            let text = crate::sessions::content_text(c);
+            // Cap at 4KB: keyword classification only needs the ask itself,
+            // and multi-MB contexts (agentic transcripts) must not pay for it.
+            text.chars().take(4096).collect()
+        }
+        None => String::new(),
+    }
 }
 
 /// Log a request to the database and fold its outcome into the session
@@ -266,8 +340,9 @@ fn prepare_bodies(
         None
     };
 
-    // Passthrough body with optional stream_options injection.
-    let passthrough_body: Option<Vec<u8>> = maybe_inject_stream_options(endpoint, body);
+    // Passthrough body: stream_options injection + shallow model rewrite
+    // (single parse).
+    let passthrough_body: Option<Vec<u8>> = transform_passthrough_body(endpoint, body, model_override);
 
     Ok(PreparedBodies {
         converted_body,
@@ -632,21 +707,20 @@ async fn failover_loop(
     svc: &ProxyService,
     session_id: Option<&str>,
     method: &str,
-    routes: &[String],
+    entries: &[crate::router::decision::RouteEntry],
     provider_map: &std::collections::HashMap<String, &crate::models::Provider>,
     endpoint: &str,
+    target_protocol: &str,
     model: Option<String>,
     headers: &HeaderMap,
-    conv_body: Option<Vec<u8>>,
-    passthru_body: Option<Vec<u8>>,
     original_body: &[u8],
-    convert_path: bool,
     req_model: &str,
     start: Instant,
 ) -> Response {
     let mut last_err: Option<(StatusCode, String)> = None;
 
-    for route_id in routes {
+    for entry in entries {
+        let route_id = entry.route_id.as_str();
         if svc.circuit_open(route_id) {
             continue;
         }
@@ -665,6 +739,27 @@ async fn failover_loop(
             None
         } else {
             svc.core.secrets().get(&provider.key_ref).ok()
+        };
+
+        // Per-route body preparation: each entry may carry its own model
+        // override (Smart Fader per-tier models). The convert path is fixed
+        // by (endpoint, target_protocol) — only the override differs — so
+        // re-preparing per entry is cheap.
+        let PreparedBodies {
+            converted_body: conv_body,
+            passthrough_body: passthru_body,
+            convert_path,
+        } = match prepare_bodies(
+            endpoint,
+            target_protocol,
+            original_body,
+            entry.model_override.as_deref(),
+        ) {
+            Ok(r) => r,
+            Err(resp) => {
+                session_failed(svc, session_id);
+                return *resp;
+            }
         };
 
         let out_body: &[u8] = if convert_path {
@@ -773,6 +868,7 @@ async fn forward_with_failover(
     endpoint: &str,
     headers: &HeaderMap,
     body: &[u8],
+    parsed: Option<&serde_json::Value>,
     model: Option<String>,
     session_id: Option<&str>,
 ) -> Response {
@@ -793,35 +889,52 @@ async fn forward_with_failover(
         }
     };
 
-    // Stage 2: prepare request bodies (conversion + stream_options injection).
-    let PreparedBodies {
-        converted_body: conv_body,
-        passthrough_body: passthru_body,
-        convert_path,
-    } = match prepare_bodies(endpoint, &target_protocol, body, model_override.as_deref()) {
-        Ok(r) => r,
-        Err(resp) => {
-            session_failed(svc, session_id);
-            return *resp;
-        }
+    // Stage 2: plan the route entries — Stage 0 for the Smart Fader:
+    // extract the last user message and let the active router classify the
+    // intent and order the tiers (static order while the Smart Fader is
+    // off). Providers listed in the route config but no longer registered
+    // are dropped here, same as the old in-loop skip.
+    let route_providers: Vec<&crate::models::Provider> = routes
+        .iter()
+        .filter_map(|id| provider_map.get(id).copied())
+        .collect();
+    let prompt_text = parsed.map_or(String::new(), |v| extract_prompt_text(v, endpoint));
+    let classify_ctx = crate::router::classifier::ClassifyCtx {
+        endpoint,
+        model: model.as_deref(),
+        prompt: &prompt_text,
     };
+    let route_set: Vec<crate::models::Provider> =
+        route_providers.into_iter().cloned().collect();
+    let plan = svc.active_router().plan(
+        &classify_ctx,
+        &route_set,
+        model_override.as_deref(),
+        &|id: &str| svc.circuit_open(id),
+        &|id: &str| svc.health_signal(id),
+    );
+    if plan.entries.is_empty() {
+        session_failed(svc, session_id);
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body("no usable provider".into())
+            .unwrap();
+    }
 
     let req_model = model.clone().unwrap_or_default();
 
-    // Stage 3: execute failover loop across routes.
+    // Stage 3: execute failover loop across the planned entries.
     failover_loop(
         svc,
         session_id,
         method,
-        &routes,
+        &plan.entries,
         &provider_map,
         endpoint,
+        &target_protocol,
         model,
         headers,
-        conv_body,
-        passthru_body,
         body,
-        convert_path,
         &req_model,
         start,
     )
@@ -1131,6 +1244,7 @@ pub async fn handle(
         endpoint,
         &headers,
         &body,
+        parsed.as_ref(),
         model,
         session_id.as_deref(),
     )
@@ -1146,13 +1260,90 @@ pub async fn handle(
 
 pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
     let endpoint = "models";
-    forward_with_failover(&svc, "GET", endpoint, &headers, &[], None, None).await
+    forward_with_failover(&svc, "GET", endpoint, &headers, &[], None, None, None).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::{stream, StreamExt};
+
+    #[test]
+    fn extract_prompt_text_chat_takes_last_user_turn() {
+        let body: serde_json::Value = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "you are terse"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "why does this fail to compile?"}
+            ]
+        });
+        assert_eq!(
+            extract_prompt_text(&body, "chat"),
+            "why does this fail to compile?"
+        );
+    }
+
+    #[test]
+    fn extract_prompt_text_chat_collapses_content_blocks() {
+        let body: serde_json::Value = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "text", "text": "part two"}
+                ]}
+            ]
+        });
+        assert_eq!(extract_prompt_text(&body, "chat"), "part one\npart two");
+    }
+
+    #[test]
+    fn extract_prompt_text_messages_endpoint() {
+        let body: serde_json::Value = serde_json::json!({
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"}
+            ]
+        });
+        assert_eq!(extract_prompt_text(&body, "messages"), "q2");
+    }
+
+    #[test]
+    fn extract_prompt_text_responses_endpoint() {
+        let body: serde_json::Value = serde_json::json!({
+            "instructions": "be brief",
+            "input": [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "new question"}
+                ]}
+            ]
+        });
+        assert_eq!(extract_prompt_text(&body, "responses"), "new question");
+    }
+
+    #[test]
+    fn extract_prompt_text_no_user_turn_is_empty() {
+        let body: serde_json::Value =
+            serde_json::json!({"messages": [{"role": "assistant", "content": "hi"}]});
+        assert_eq!(extract_prompt_text(&body, "chat"), "");
+        assert_eq!(extract_prompt_text(&serde_json::json!({}), "chat"), "");
+    }
+
+    #[test]
+    fn extract_prompt_text_truncates_huge_prompts() {
+        let huge = "x".repeat(10_000);
+        let body: serde_json::Value = serde_json::json!({
+            "messages": [{"role": "user", "content": huge}]
+        });
+        let got = extract_prompt_text(&body, "chat");
+        assert_eq!(got.len(), 4096);
+    }
 
     #[test]
     fn is_empty_choices_line_matches_empty_array() {

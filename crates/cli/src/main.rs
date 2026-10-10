@@ -216,6 +216,11 @@ enum ProxyCmd {
     Status,
     /// Clear routes
     Clear,
+    /// Toggle the Smart Fader (intent-aware local/cloud tiered routing)
+    Smart {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -756,6 +761,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         println!("target: {target_protocol}");
                     }
                 }
+                let smart = if core.db().smart_enabled()? { "on" } else { "off" };
+                println!("smart fader: {smart}");
                 println!("note: circuit status is only visible inside the serve process (a fresh CLI process sees empty circuits)");
                 Ok(())
             }
@@ -763,6 +770,17 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 let core = build_core()?;
                 core.db().clear_routes()?;
                 println!("routes cleared");
+                Ok(())
+            }
+            ProxyCmd::Smart { state } => {
+                let core = build_core()?;
+                let on = state == "on";
+                core.db().set_smart_enabled(on)?;
+                if on {
+                    println!("smart fader: on — light intents (error triage, tests, checks, small refactors) go local-first; heavy intents (big refactors, architecture) go cloud-first");
+                } else {
+                    println!("smart fader: off — static route order");
+                }
                 Ok(())
             }
         },
