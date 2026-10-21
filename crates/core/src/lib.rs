@@ -1,14 +1,14 @@
 pub mod adapters;
+pub mod analyzer;
 pub mod backup;
 pub mod daemon;
 pub mod error;
-pub mod analyzer;
 pub mod launch;
 pub mod models;
 pub mod presets;
 pub mod proxy;
-pub mod run;
 pub mod router;
+pub mod run;
 pub mod service;
 pub mod sessions;
 pub mod store;

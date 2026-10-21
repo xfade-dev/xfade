@@ -57,9 +57,7 @@ impl LaunchPlan {
 /// (already checked by the caller for third-party providers).
 pub fn launch_plan(provider: &Provider, api_key: Option<&str>) -> Result<LaunchPlan> {
     match provider.tool {
-        ToolKind::ClaudeCode | ToolKind::Aider => {
-            Ok(LaunchPlan::Env(run_env(provider, api_key)?))
-        }
+        ToolKind::ClaudeCode | ToolKind::Aider => Ok(LaunchPlan::Env(run_env(provider, api_key)?)),
         ToolKind::Codex => codex_plan(provider, api_key),
         ToolKind::OpenCode => opencode_plan(provider, api_key),
         tool => Err(CoreError::RunUnsupported(tool.label().to_string())),
@@ -85,7 +83,9 @@ fn toml_string(s: &str) -> String {
 /// A TOML key path segment: bare when possible, quoted otherwise (a provider
 /// id containing `.` would otherwise split into nested tables).
 fn toml_key(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         s.to_string()
     } else {
         toml_string(s)
@@ -314,7 +314,10 @@ mod tests {
         let p = codex_provider("official", None, json!({"model": "gpt-5.1"}));
         let plan = launch_plan(&p, None).unwrap();
         assert!(plan.env().is_empty());
-        assert_eq!(plan.args_prefix(), &["-c".to_string(), "model=\"gpt-5.1\"".to_string()]);
+        assert_eq!(
+            plan.args_prefix(),
+            &["-c".to_string(), "model=\"gpt-5.1\"".to_string()]
+        );
     }
 
     #[test]

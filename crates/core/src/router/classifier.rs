@@ -57,39 +57,86 @@ const RULES: &[(Intent, &[&str])] = &[
     (
         Intent::WriteTest,
         &[
-            "write test", "write a test", "write tests", "unit test", "add test",
-            "add a test", "test for", "tests for",
+            "write test",
+            "write a test",
+            "write tests",
+            "unit test",
+            "add test",
+            "add a test",
+            "test for",
+            "tests for",
         ],
     ),
     (
         Intent::ExplainError,
         &[
-            "why", "explain", "traceback", "panick", "stack trace", "what happened",
-            "what's wrong", "whats wrong", "help me understand", "doesn't work",
-            "does not work", "not working", "build fails", "build failed",
-            "compile error", "failing",
+            "why",
+            "explain",
+            "traceback",
+            "panick",
+            "stack trace",
+            "what happened",
+            "what's wrong",
+            "whats wrong",
+            "help me understand",
+            "doesn't work",
+            "does not work",
+            "not working",
+            "build fails",
+            "build failed",
+            "compile error",
+            "failing",
         ],
     ),
     (
         Intent::StaticCheck,
         &[
-            "lint", "clippy", "eslint", "ruff", "unused import", "type check",
-            "typecheck", "format", "reformat",
+            "lint",
+            "clippy",
+            "eslint",
+            "ruff",
+            "unused import",
+            "type check",
+            "typecheck",
+            "format",
+            "reformat",
         ],
     ),
     (
         Intent::BigRefactor,
-        &["restructure", "migrate", "rewrite", "overhaul", "large refactor", "big refactor"],
+        &[
+            "restructure",
+            "migrate",
+            "rewrite",
+            "overhaul",
+            "large refactor",
+            "big refactor",
+        ],
     ),
     (
         Intent::SmallRefactor,
-        &["rename", "extract function", "extract this block", "refactor", "simplify", "inline", "clean up"],
+        &[
+            "rename",
+            "extract function",
+            "extract this block",
+            "refactor",
+            "simplify",
+            "inline",
+            "clean up",
+        ],
     ),
     (
         Intent::Architecture,
         &[
-            "design", "architecture", "trade-off", "tradeoff", "compare approaches",
-            "should we use", "should i use", "pros and cons", "evaluate",
+            "design",
+            "architecture",
+            "trade-off",
+            "tradeoff",
+            "compare approaches",
+            "should we use",
+            "should i use",
+            "pros and cons",
+            "evaluate",
         ],
     ),
 ];
@@ -132,9 +179,15 @@ mod tests {
 
     #[test]
     fn error_triage_prompts() {
-        assert_eq!(classify("why does this fail to compile?"), Intent::ExplainError);
+        assert_eq!(
+            classify("why does this fail to compile?"),
+            Intent::ExplainError
+        );
         assert_eq!(classify("explain this traceback"), Intent::ExplainError);
-        assert_eq!(classify("thread 'main' panicked, what happened"), Intent::ExplainError);
+        assert_eq!(
+            classify("thread 'main' panicked, what happened"),
+            Intent::ExplainError
+        );
         assert_eq!(
             classify("the build fails with a weird error, help me understand"),
             Intent::ExplainError
@@ -143,21 +196,36 @@ mod tests {
 
     #[test]
     fn test_writing_prompts() {
-        assert_eq!(classify("write a test for this function"), Intent::WriteTest);
+        assert_eq!(
+            classify("write a test for this function"),
+            Intent::WriteTest
+        );
         assert_eq!(classify("add unit tests for the parser"), Intent::WriteTest);
     }
 
     #[test]
     fn static_check_prompts() {
-        assert_eq!(classify("run clippy and fix the warnings"), Intent::StaticCheck);
-        assert_eq!(classify("fix the lint errors in main.rs"), Intent::StaticCheck);
+        assert_eq!(
+            classify("run clippy and fix the warnings"),
+            Intent::StaticCheck
+        );
+        assert_eq!(
+            classify("fix the lint errors in main.rs"),
+            Intent::StaticCheck
+        );
         assert_eq!(classify("remove the unused imports"), Intent::StaticCheck);
     }
 
     #[test]
     fn small_refactor_prompts() {
-        assert_eq!(classify("rename this variable to something clearer"), Intent::SmallRefactor);
-        assert_eq!(classify("extract this block into a helper function"), Intent::SmallRefactor);
+        assert_eq!(
+            classify("rename this variable to something clearer"),
+            Intent::SmallRefactor
+        );
+        assert_eq!(
+            classify("extract this block into a helper function"),
+            Intent::SmallRefactor
+        );
         assert_eq!(classify("refactor this function"), Intent::SmallRefactor);
     }
 
@@ -167,7 +235,10 @@ mod tests {
             classify("restructure the whole proxy module into layers"),
             Intent::BigRefactor
         );
-        assert_eq!(classify("migrate the config layer to a new schema"), Intent::BigRefactor);
+        assert_eq!(
+            classify("migrate the config layer to a new schema"),
+            Intent::BigRefactor
+        );
         assert_eq!(classify("rewrite the storage engine"), Intent::BigRefactor);
     }
 
@@ -217,7 +288,10 @@ mod tests {
             classify("the thread panicked at runtime"),
             Intent::ExplainError
         );
-        assert_eq!(classify("it keeps panicking on startup"), Intent::ExplainError);
+        assert_eq!(
+            classify("it keeps panicking on startup"),
+            Intent::ExplainError
+        );
     }
 
     #[test]

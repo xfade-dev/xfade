@@ -270,7 +270,11 @@ mod tests {
     use serde_json::json;
 
     fn provider(id: &str, base_url: Option<&str>, extra: serde_json::Value) -> Provider {
-        let mut p = Provider::new(id, crate::models::ToolKind::OpenCode, base_url.map(String::from));
+        let mut p = Provider::new(
+            id,
+            crate::models::ToolKind::OpenCode,
+            base_url.map(String::from),
+        );
         p.extra = extra;
         p
     }
@@ -325,8 +329,14 @@ mod tests {
         let routes = vec![local("l-sick"), local("l-healthy"), cloud("c")];
         let health = |id: &str| -> Option<HealthSignal> {
             match id {
-                "l-sick" => Some(HealthSignal { error_rate: 0.5, avg_ms: 800 }),
-                "l-healthy" => Some(HealthSignal { error_rate: 0.0, avg_ms: 100 }),
+                "l-sick" => Some(HealthSignal {
+                    error_rate: 0.5,
+                    avg_ms: 800,
+                }),
+                "l-healthy" => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 100,
+                }),
                 _ => None,
             }
         };
@@ -339,8 +349,14 @@ mod tests {
         let routes = vec![local("l-slow"), local("l-fast")];
         let health = |id: &str| -> Option<HealthSignal> {
             match id {
-                "l-slow" => Some(HealthSignal { error_rate: 0.0, avg_ms: 900 }),
-                "l-fast" => Some(HealthSignal { error_rate: 0.0, avg_ms: 120 }),
+                "l-slow" => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 900,
+                }),
+                "l-fast" => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 120,
+                }),
                 _ => None,
             }
         };
@@ -360,11 +376,22 @@ mod tests {
     #[test]
     fn health_sorts_each_bucket_independently() {
         // Both buckets get health-ordered; light intent keeps local-first.
-        let routes = vec![local("l-sick"), local("l-ok"), cloud("c-sick"), cloud("c-ok")];
+        let routes = vec![
+            local("l-sick"),
+            local("l-ok"),
+            cloud("c-sick"),
+            cloud("c-ok"),
+        ];
         let health = |id: &str| -> Option<HealthSignal> {
             match id {
-                "l-sick" | "c-sick" => Some(HealthSignal { error_rate: 0.9, avg_ms: 500 }),
-                _ => Some(HealthSignal { error_rate: 0.0, avg_ms: 50 }),
+                "l-sick" | "c-sick" => Some(HealthSignal {
+                    error_rate: 0.9,
+                    avg_ms: 500,
+                }),
+                _ => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 50,
+                }),
             }
         };
         let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &health);
@@ -378,8 +405,14 @@ mod tests {
         let routes = vec![local("l-sick"), local("l-healthy")];
         let health = |id: &str| -> Option<HealthSignal> {
             match id {
-                "l-sick" => Some(HealthSignal { error_rate: 0.9, avg_ms: 500 }),
-                _ => Some(HealthSignal { error_rate: 0.0, avg_ms: 50 }),
+                "l-sick" => Some(HealthSignal {
+                    error_rate: 0.9,
+                    avg_ms: 500,
+                }),
+                _ => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 50,
+                }),
             }
         };
         let plan = plan_routes(&ctx("hello"), &refs(&routes), None, &none_open, &health);
@@ -396,8 +429,14 @@ mod tests {
         let routes = vec![local("l-new"), local("l-known-bad"), local("l-known-ok")];
         let health = |id: &str| -> Option<HealthSignal> {
             match id {
-                "l-known-bad" => Some(HealthSignal { error_rate: 0.4, avg_ms: 300 }),
-                "l-known-ok" => Some(HealthSignal { error_rate: 0.0, avg_ms: 90 }),
+                "l-known-bad" => Some(HealthSignal {
+                    error_rate: 0.4,
+                    avg_ms: 300,
+                }),
+                "l-known-ok" => Some(HealthSignal {
+                    error_rate: 0.0,
+                    avg_ms: 90,
+                }),
                 _ => None,
             }
         };
@@ -407,7 +446,11 @@ mod tests {
 
     #[test]
     fn tier_reads_extra_before_heuristic() {
-        let explicit = provider("mlx", Some("https://api.example.com/v1"), json!({"tier": "local"}));
+        let explicit = provider(
+            "mlx",
+            Some("https://api.example.com/v1"),
+            json!({"tier": "local"}),
+        );
         assert_eq!(provider_tier(&explicit), Tier::Local);
 
         let loopback = provider("ollama", Some("http://127.0.0.1:11434/v1"), json!({}));
@@ -459,7 +502,7 @@ mod tests {
     fn default_router_carries_model_override_and_skips_open_circuits() {
         let routes = vec![cloud("a"), cloud("b")];
         let open = |id: &str| id == "a";
-        let plan = DefaultRouter.plan(&ctx("hi"), &refs(&routes), Some("m-x"),&open, &no_health);
+        let plan = DefaultRouter.plan(&ctx("hi"), &refs(&routes), Some("m-x"), &open, &no_health);
         assert_eq!(ids(&plan), vec!["b"]);
         assert_eq!(plan.entries[0].model_override.as_deref(), Some("m-x"));
     }
@@ -483,7 +526,13 @@ mod tests {
     #[test]
     fn unknown_intent_keeps_static_order() {
         let routes = vec![cloud("a"), local("b")];
-        let plan = plan_routes(&ctx("hello there"), &refs(&routes), None, &none_open, &no_health);
+        let plan = plan_routes(
+            &ctx("hello there"),
+            &refs(&routes),
+            None,
+            &none_open,
+            &no_health,
+        );
         assert_eq!(ids(&plan), vec!["a", "b"]);
         assert_eq!(plan.intent, Intent::Unknown);
     }
@@ -500,7 +549,7 @@ mod tests {
     fn open_circuits_are_skipped_before_bucketing() {
         let routes = vec![local("l1"), local("l2"), cloud("c1")];
         let open = |id: &str| id == "l1";
-        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None,&open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &open, &no_health);
         assert_eq!(ids(&plan), vec!["l2", "c1"]);
     }
 

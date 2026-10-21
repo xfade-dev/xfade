@@ -9,6 +9,4 @@ pub mod classifier;
 pub mod decision;
 
 pub use classifier::{ClassifyCtx, Intent, IntentClassifier, KeywordClassifier};
-pub use decision::{
-    DefaultRouter, HealthSignal, RouteEntry, RoutePlan, Router, SmartRouter, Tier,
-};
+pub use decision::{DefaultRouter, HealthSignal, RouteEntry, RoutePlan, Router, SmartRouter, Tier};

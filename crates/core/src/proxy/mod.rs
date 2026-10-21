@@ -126,12 +126,15 @@ impl ProxyService {
         // request path.
         let since = OffsetDateTime::now_utc()
             .checked_sub(time::Duration::seconds(HEALTH_WINDOW_SECS))
-            .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+            .and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-        if let Ok(rows) = self
-            .core
-            .db()
-            .stats_since(&since, crate::store::db::StatsGroupBy::Provider, None)
+        if let Ok(rows) =
+            self.core
+                .db()
+                .stats_since(&since, crate::store::db::StatsGroupBy::Provider, None)
         {
             let mut snap = self.health_cache.lock().unwrap();
             snap.signals = rows
@@ -496,7 +499,10 @@ mod tests {
 
         let url = spawn_service(ProxyService::new(core)).await;
         local.respond_with(500, r#"{"error":"local model overloaded"}"#);
-        cloud.respond_with(200, r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#);
+        cloud.respond_with(
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        );
         let (status, body) = http_post_json(
             &url,
             "/v1/chat/completions",
@@ -556,7 +562,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(local.call_count().await, 0, "circuit-open local must not be called");
+        assert_eq!(
+            local.call_count().await,
+            0,
+            "circuit-open local must not be called"
+        );
         assert_eq!(cloud.call_count().await, 1);
     }
 
@@ -595,8 +605,7 @@ mod tests {
         cloud.respond_with(200, "{}");
         local.respond_with(200, "{}");
 
-        let light =
-            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#;
+        let light = r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#;
 
         // OFF: configured order wins → cloud serves the light prompt.
         let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
@@ -608,15 +617,27 @@ mod tests {
         handle.db().set_smart_enabled(true).unwrap();
         let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
         assert_eq!(status, 200);
-        assert_eq!(local.call_count().await, 1, "smart on must reroute without restart");
-        assert_eq!(cloud.call_count().await, 1, "no extra cloud call after flip");
+        assert_eq!(
+            local.call_count().await,
+            1,
+            "smart on must reroute without restart"
+        );
+        assert_eq!(
+            cloud.call_count().await,
+            1,
+            "no extra cloud call after flip"
+        );
 
         // Flip back OFF: configured order wins again.
         handle.db().set_smart_enabled(false).unwrap();
         let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
         assert_eq!(status, 200);
         assert_eq!(cloud.call_count().await, 2);
-        assert_eq!(local.call_count().await, 1, "smart off must restore static order");
+        assert_eq!(
+            local.call_count().await,
+            1,
+            "smart off must restore static order"
+        );
     }
 
     #[tokio::test]

@@ -435,8 +435,7 @@ impl Database {
     /// a running daemon immediately.
     pub fn smart_enabled(&self) -> Result<bool> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT smart_enabled FROM proxy_state WHERE id = 1")?;
+        let mut stmt = conn.prepare("SELECT smart_enabled FROM proxy_state WHERE id = 1")?;
         let mut rows = stmt.query([])?;
         match rows.next()? {
             Some(row) => Ok(row.get::<_, i64>(0)? != 0),
@@ -445,12 +444,13 @@ impl Database {
     }
 
     pub fn set_smart_enabled(&self, on: bool) -> Result<()> {
-        let now = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .map_err(|e| CoreError::ConfigParse {
-                path: "time".into(),
-                msg: e.to_string(),
-            })?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
         // Full upsert: proxy_state has NOT NULL columns without defaults
         // (routes, updated_at), so a partial INSERT OR IGNORE would be
         // silently swallowed by the conflict clause.
@@ -465,19 +465,16 @@ impl Database {
 
     /// Cache a repo map (analyzer fingerprint + payload) keyed by root path.
     pub fn save_repo_map(&self, root_path: &str, fingerprint: &str, map_json: &str) -> Result<()> {
-        let now = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .map_err(|e| CoreError::ConfigParse {
-                path: "time".into(),
-                msg: e.to_string(),
-            })?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
         self.conn().execute(
-            "INSERT INTO repo_maps (root_path, fingerprint, map_json, generated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(root_path) DO UPDATE SET
-                fingerprint = excluded.fingerprint,
-                map_json = excluded.map_json,
-                generated_at = excluded.generated_at",
+            "INSERT OR REPLACE INTO repo_maps (root_path, fingerprint, map_json, generated_at)
+             VALUES (?1, ?2, ?3, ?4)",
             params![root_path, fingerprint, map_json, now],
         )?;
         Ok(())
@@ -486,9 +483,23 @@ impl Database {
     /// Fetch a cached repo map: (fingerprint, map_json).
     pub fn get_repo_map(&self, root_path: &str) -> Result<Option<(String, String)>> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT fingerprint, map_json FROM repo_maps WHERE root_path = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT fingerprint, map_json FROM repo_maps WHERE root_path = ?1")?;
         let mut rows = stmt.query(params![root_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// The most recently *written* repo map: (root_path, map_json). Ordered
+    /// by rowid (INSERT OR REPLACE re-allocates it), so re-saving a root
+    /// makes it the latest regardless of timestamp granularity.
+    pub fn latest_repo_map(&self) -> Result<Option<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT root_path, map_json FROM repo_maps ORDER BY rowid DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
         match rows.next()? {
             Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
             None => Ok(None),
@@ -944,6 +955,22 @@ mod tests {
         // Distinct roots coexist.
         db.save_repo_map("/other", "fp3", "{}").unwrap();
         assert!(db.get_repo_map("/other").unwrap().is_some());
+    }
+
+    #[test]
+    fn latest_repo_map_returns_most_recently_written() {
+        let db = Database::open_memory().unwrap();
+        assert!(db.latest_repo_map().unwrap().is_none());
+        db.save_repo_map("/a", "fp1", r#"{"lang":"rust"}"#).unwrap();
+        db.save_repo_map("/b", "fp2", r#"{"lang":"go"}"#).unwrap();
+        let (root, _) = db.latest_repo_map().unwrap().unwrap();
+        assert_eq!(root, "/b");
+        // Re-saving /a makes it the latest again (rowid ordering, immune to
+        // same-second timestamp ties).
+        db.save_repo_map("/a", "fp3", r#"{"lang":"rust"}"#).unwrap();
+        let (root, map) = db.latest_repo_map().unwrap().unwrap();
+        assert_eq!(root, "/a");
+        assert_eq!(map, r#"{"lang":"rust"}"#);
     }
 
     #[test]

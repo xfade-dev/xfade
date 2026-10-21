@@ -692,6 +692,26 @@ fn instant_registered_provider_launches_without_recreate() {
 }
 
 #[test]
+fn project_prints_analyzer_fingerprint() {
+    let home = tempfile::tempdir().unwrap();
+    // The test process cwd is inside the xfade repo (Cargo.toml + git).
+    xfade(home.path())
+        .args(["project"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("root:"))
+        .stdout(predicate::str::contains("lang: rust"))
+        .stdout(predicate::str::contains("branch:"));
+    // The analysis was cached into repo_maps (a second consumer of it is
+    // `xfade proxy status`).
+    xfade(home.path())
+        .args(["proxy", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("project:"));
+}
+
+#[test]
 fn instant_model_reverse_lookup_autocreates() {
     // No name: `--model kimi-k2.5` prefix-matches the `kimi` preset uniquely.
     let home = tempfile::tempdir().unwrap();

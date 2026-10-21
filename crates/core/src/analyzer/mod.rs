@@ -3,9 +3,13 @@
 //! Phase 2 scope is deliberately scanner-free: the fingerprint reads
 //! manifest files as plain strings (<10ms, no tree-sitter), and git pulse
 //! shells out to `git` for branch/head/recent-commit info. The result is a
-//! cacheable `RepoMap` used as an enrichment signal (future: Handover
-//! context, LlmClassifier features) — phase-one Smart Fader classification
-//! does not depend on it.
+//! cacheable `RepoMap`.
+//!
+//! Consumers: `xfade project` (user-facing inspection of the cwd), `xfade
+//! serve` startup warmup (keeps the repo_maps cache fresh cross-process,
+//! surfaced by `xfade proxy status`). Smart Fader classification does not
+//! depend on it; deeper uses (Handover context, LlmClassifier features)
+//! are V2.1.
 
 pub mod fingerprint;
 pub mod git_pulse;
@@ -80,7 +84,11 @@ pub fn analyze(root: &Path, db: &Database) -> RepoMap {
                         })
                         .unwrap_or_default();
                     git_pulse::GitPulse {
-                        branch: g.get("branch").and_then(|b| b.as_str()).unwrap_or("").into(),
+                        branch: g
+                            .get("branch")
+                            .and_then(|b| b.as_str())
+                            .unwrap_or("")
+                            .into(),
                         head: g.get("head").and_then(|h| h.as_str()).unwrap_or("").into(),
                         recent_subjects: recent,
                     }
@@ -103,7 +111,11 @@ pub fn analyze(root: &Path, db: &Database) -> RepoMap {
         lang,
         git: git_pulse::git_pulse(root),
     };
-    let _ = db.save_repo_map(&map.root, &fp, &map.to_json());
+    // Skip caching signal-free maps (a bare $HOME would otherwise fill the
+    // table with noise rows); re-scanning them costs <10ms anyway.
+    if map.lang.is_some() || map.git.is_some() {
+        let _ = db.save_repo_map(&map.root, &fp, &map.to_json());
+    }
     map
 }
 
@@ -144,5 +156,10 @@ mod tests {
         let m = analyze(dir.path(), &db);
         assert_eq!(m.lang, None);
         assert!(m.git.is_none());
+        // Signal-free roots are not cached (no noise rows for bare dirs).
+        assert!(db
+            .get_repo_map(&dir.path().display().to_string())
+            .unwrap()
+            .is_none());
     }
 }

@@ -144,6 +144,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<SessionsCmd>,
     },
+    /// Show the analyzer's fingerprint of the current project (language / git pulse)
+    Project,
     /// Update xfade to the latest GitHub release
     SelfUpdate,
     /// Interactive TUI for switching providers
@@ -153,9 +155,9 @@ enum Cmd {
     },
     /// Launch Claude Code with a provider injected via env (instant `run`)
     Claude(RunOpts),
-    /// Launch Codex — config-file tool, instant launch unsupported (see `xfade use`)
+    /// Launch Codex — config overrides via `-c` + key via env (instant `run`)
     Codex(RunOpts),
-    /// Launch OpenCode — config-file tool, instant launch unsupported (see `xfade use`)
+    /// Launch OpenCode — inline OPENCODE_CONFIG_CONTENT (instant `run`)
     #[command(name = "opencode")]
     OpenCode(RunOpts),
     /// Launch Pi — config-file tool, instant launch unsupported (see `xfade use`)
@@ -613,6 +615,20 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         } => match cmd {
             None => {
                 let core = build_core()?;
+                // Warm the repo_maps cache with the daemon's cwd so
+                // `xfade proxy status` can show the served project. Signal-
+                // free directories are not cached (analyze() skips them).
+                if let Ok(cwd) = std::env::current_dir() {
+                    let map = xfade_core::analyzer::analyze(&cwd, core.db());
+                    if map.lang.is_some() || map.git.is_some() {
+                        eprintln!(
+                            "[xfade] project: {} (lang {}, branch {})",
+                            map.root,
+                            map.lang.unwrap_or("?"),
+                            map.git.as_ref().map(|g| g.branch.as_str()).unwrap_or("-")
+                        );
+                    }
+                }
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
                 rt.block_on(async {
@@ -761,8 +777,18 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         println!("target: {target_protocol}");
                     }
                 }
-                let smart = if core.db().smart_enabled()? { "on" } else { "off" };
+                let smart = if core.db().smart_enabled()? {
+                    "on"
+                } else {
+                    "off"
+                };
                 println!("smart fader: {smart}");
+                if let Some((root, map_json)) = core.db().latest_repo_map()? {
+                    let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
+                    let lang = v["lang"].as_str().unwrap_or("?");
+                    let branch = v["git"]["branch"].as_str().unwrap_or("-");
+                    println!("project: {root} (lang {lang}, branch {branch})");
+                }
                 println!("note: circuit status is only visible inside the serve process (a fresh CLI process sees empty circuits)");
                 Ok(())
             }
@@ -879,6 +905,24 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 Ok(())
             }
         },
+        Cmd::Project => {
+            let core = build_core()?;
+            let cwd = std::env::current_dir()?;
+            let map = xfade_core::analyzer::analyze(&cwd, core.db());
+            println!("root: {}", map.root);
+            println!("lang: {}", map.lang.unwrap_or("(unknown)"));
+            match &map.git {
+                Some(g) => {
+                    println!("branch: {}", g.branch);
+                    println!("head: {}", g.head);
+                    for s in &g.recent_subjects {
+                        println!("  recent: {s}");
+                    }
+                }
+                None => println!("git: (not a repo)"),
+            }
+            Ok(())
+        }
         Cmd::SelfUpdate => self_update(),
         Cmd::Tui { tool } => {
             let core = build_core()?;

@@ -32,8 +32,7 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 pub fn git_pulse(root: &Path) -> Option<GitPulse> {
     // rev-parse inside a repo always succeeds; outside it fails.
     git(root, &["rev-parse", "--git-dir"])?;
-    let branch = git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_else(|| "HEAD".into());
+    let branch = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "HEAD".into());
     let head = git(root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     let recent_subjects = git(root, &["log", "-n", "5", "--pretty=%s"])
         .map(|s| s.lines().map(String::from).collect())
@@ -94,6 +93,8 @@ mod tests {
         assert!(!pulse.head.is_empty());
         assert!(!pulse.recent_subjects.is_empty());
         assert_eq!(pulse.recent_subjects[0], "second commit");
-        assert!(pulse.recent_subjects.contains(&"initial commit".to_string()));
+        assert!(pulse
+            .recent_subjects
+            .contains(&"initial commit".to_string()));
     }
 }
