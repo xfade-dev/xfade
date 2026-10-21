@@ -606,9 +606,9 @@ fn per_slot_flag_on_non_claude_fails() {
 #[test]
 fn instant_config_file_tool_points_to_use() {
     let home = tempfile::tempdir().unwrap();
-    for tool in [
-        "codex", "opencode", "pi", "omp", "cline", "hermes", "openclaw",
-    ] {
+    // codex/opencode have a verified injection contract (launch.rs) and pass
+    // this gate; the remaining config-file tools are still refused.
+    for tool in ["pi", "omp", "cline", "hermes", "openclaw"] {
         xfade(home.path())
             .args([tool])
             .assert()
@@ -627,6 +627,21 @@ fn instant_config_file_tool_points_to_use() {
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn instant_codex_opencode_pass_the_support_gate() {
+    // codex/opencode are no longer refused by the tool gate: an unknown name
+    // fails at provider resolution, not with the `use` hint. (Never reaches
+    // exec, so no real binary is spawned.)
+    let home = tempfile::tempdir().unwrap();
+    for tool in ["codex", "opencode"] {
+        xfade(home.path())
+            .args([tool, "no-such-provider"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("use `xfade use` instead").not());
+    }
 }
 
 #[test]

@@ -90,16 +90,20 @@ xfade claude --model kimi-k2.5             # no name: the model reverse-looks-up
 xfade claude my-gw --base-url https://gw --key sk-xxx   # ad-hoc endpoint, auto-registered
 xfade claude -- --print                    # everything after `--` goes to the tool
 xfade aider deepseek --model deepseek-chat
+xfade codex glm --model glm-5-2-260617     # -c config overrides + key via env (no files touched)
+xfade opencode glm -- run "fix the bug"    # inline OPENCODE_CONFIG_CONTENT (no files touched)
 ```
 
 Notes:
 
 - Key precedence: `--key` → the provider's stored key → the global `api_key`.
 - `--model` / `--base-url` are one-off overrides and are never persisted.
-- Env injection works for **claude** and **aider** — verified against codex
-  0.155.0 / opencode 1.18.31 / pi 0.87.0, which all ignore env overrides for
-  custom providers, so those subcommands (and omp/cline/hermes/openclaw)
-  point at `xfade use` instead.
+- Injection works for **claude** and **aider** (env), **codex** (`-c`
+  overrides + `XFADE_CODEX_KEY` referenced via `env_key`) and **opencode**
+  (inline `OPENCODE_CONFIG_CONTENT`) — codex/opencode verified 2026-10-22
+  against codex-cli 0.155.0 / opencode 1.18.31 (real config homes stay
+  untouched). pi ignores env overrides for custom providers, so pi (and
+  omp/cline/hermes/openclaw) point at `xfade use` instead.
 
 ## Session view
 
@@ -124,9 +128,9 @@ Every proxied response also carries an `X-Xfade-Session-Id` header.
 xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
-xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected via env vars (claude / aider)
+xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected (claude / aider / codex / opencode)
 xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
-                                        # instant launch: claude/aider fully work; other tools point at `use`
+                                        # instant launch: claude/aider/codex/opencode work; other tools point at `use`
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>

@@ -88,16 +88,20 @@ xfade claude --model kimi-k2.5             # 省略 name：按模型名反查匹
 xfade claude my-gw --base-url https://gw --key sk-xxx   # 临时端点，自动注册
 xfade claude -- --print                    # `--` 之后原样传给工具
 xfade aider deepseek --model deepseek-chat
+xfade codex glm --model glm-5-2-260617     # -c 配置覆盖 + 密钥走 env（零文件写入）
+xfade opencode glm -- run "fix the bug"    # 内联 OPENCODE_CONFIG_CONTENT（零文件写入）
 ```
 
 说明：
 
 - 密钥优先级：`--key` → provider 已存密钥 → 全局 `api_key`。
 - `--model` / `--base-url` 是一次性覆盖，绝不落库。
-- env 注入只对 **claude** 和 **aider** 生效——已对 codex 0.155.0 /
-  opencode 1.18.31 / pi 0.87.0 真机验证，它们对自定义 provider 均忽略
-  env 覆盖，因此这些子命令（含 omp/cline/hermes/openclaw）会指引
-  `xfade use`。
+- 注入覆盖 **claude** 和 **aider**（env）、**codex**（`-c` 覆盖 +
+  `env_key` 引用 `XFADE_CODEX_KEY`）和 **opencode**（内联
+  `OPENCODE_CONFIG_CONTENT`）——codex/opencode 已于 2026-10-22 对
+  codex-cli 0.155.0 / opencode 1.18.31 真机验证（真实配置目录零触碰）。
+  pi 对自定义 provider 忽略 env 覆盖，因此 pi（含
+  omp/cline/hermes/openclaw）会指引 `xfade use`。
 
 ## 会话视图
 
@@ -120,9 +124,9 @@ xfade stats --by session       # 按会话聚合请求/token
 xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade ls [--tool <t>]
 xfade use <id> --tool <t>
-xfade run <id> [--tool <t>] [-- <args>]  # 环境变量注入一次性启动工具（claude / aider）
+xfade run <id> [--tool <t>] [-- <args>]  # 注入一次性启动工具（claude / aider / codex / opencode）
 xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
-                                        # 即时启动：claude/aider 完整可用；其余工具指引 `use`
+                                        # 即时启动：claude/aider/codex/opencode 可用；其余工具指引 `use`
 xfade current --tool <t>
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>

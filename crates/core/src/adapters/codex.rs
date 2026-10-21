@@ -245,7 +245,7 @@ impl ToolAdapter for CodexAdapter {
 
 /// Scan the config for provider ids whose `model_providers.*.wire_api == "chat"` (deprecated value).
 /// Newer Codex validates the whole file and refuses to start if any section contains chat.
-fn find_legacy_wire_api(cfg: &toml::Value) -> Vec<String> {
+pub(crate) fn find_legacy_wire_api(cfg: &toml::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(provs) = cfg.get("model_providers").and_then(|v| v.as_table()) {
         for (pid, p) in provs {

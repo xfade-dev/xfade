@@ -1151,10 +1151,10 @@ fn cmd_add(
 }
 
 /// `xfade run <name> [--tool t] [-- <args>]`: exec the tool's binary with the
-/// provider injected via environment variables — on-disk configs stay untouched.
-/// Official providers launch the tool as-is (no injection). Env injection is
-/// only supported for tools with an env-based contract (claude / aider);
-/// config-file tools get a clear error pointing at `xfade use`.
+/// provider injected — env for claude/aider, `-c` overrides for codex, an
+/// inline `OPENCODE_CONFIG_CONTENT` for opencode; on-disk configs stay
+/// untouched. Official providers launch the tool as-is (no injection).
+/// Tools without a verified injection contract get a `xfade use` hint.
 fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), CoreError> {
     use std::process::Command;
 
@@ -1166,17 +1166,19 @@ fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), Co
         .find(|p| p.id == name)
         .ok_or_else(|| CoreError::ProviderNotFound(name.into()))?;
 
-    let env = if p.is_official() {
-        Vec::new()
+    let key = if p.is_official() {
+        None
     } else {
-        let key = core.secrets().get(&p.key_ref)?;
-        xfade_core::run::run_env(&p, Some(&key))?
+        Some(core.secrets().get(&p.key_ref)?)
     };
+    let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
+    warn_legacy_wire_api(tool);
 
     let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
     let status = Command::new(&bin)
+        .args(plan.args_prefix())
         .args(args)
-        .envs(env)
+        .envs(plan.env().to_vec())
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -1191,16 +1193,34 @@ fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), Co
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Newer Codex refuses to start when any ~/.codex/config.toml provider still
+/// uses wire_api="chat" (whole-file validation) — warn even though our own
+/// injection never writes that value.
+fn warn_legacy_wire_api(tool: ToolKind) {
+    if tool != ToolKind::Codex {
+        return;
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(w) = xfade_core::launch::codex_legacy_wire_api_warning(&home) {
+            eprintln!("[xfade] warning: {w}");
+        }
+    }
+}
+
 /// `xfade <tool> [name] [--model m] ...`: instant-launch flavor of `run` —
 /// the tool name is the subcommand, provider/model/key are resolved on the
 /// spot (auto-created from a preset or `--base-url` when unregistered) and
-/// the tool's on-disk config is never touched. Env injection covers tools
-/// with an env contract only (claude / aider — verified 2026-10-09 that
-/// codex/opencode/pi ignore env overrides); other tools get a `xfade use` hint.
+/// the tool's on-disk config is never touched. Injection covers claude /
+/// aider (env), codex (`-c` overrides + env key) and opencode (inline
+/// `OPENCODE_CONFIG_CONTENT`) — codex/opencode verified 2026-10-22 against
+/// codex-cli 0.155.0 / opencode 1.18.31; other tools get a `xfade use` hint.
 fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
     use std::process::Command;
 
-    if !matches!(tool, ToolKind::ClaudeCode | ToolKind::Aider) {
+    if !matches!(
+        tool,
+        ToolKind::ClaudeCode | ToolKind::Aider | ToolKind::Codex | ToolKind::OpenCode
+    ) {
         return Err(CoreError::ConfigParse {
             path: "run".into(),
             msg: format!(
@@ -1242,11 +1262,13 @@ fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
         )));
     }
 
-    let env = xfade_core::run::run_env(&p, key.as_deref())?;
+    let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
+    warn_legacy_wire_api(tool);
     let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
     let status = Command::new(&bin)
+        .args(plan.args_prefix())
         .args(&opts.args)
-        .envs(env)
+        .envs(plan.env().to_vec())
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

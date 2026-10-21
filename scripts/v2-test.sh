@@ -10,7 +10,8 @@
 #   6. passthrough model 改写（proxy use --model）
 #   7. auth 替换（sink 收到 provider 的 key，不是客户端的）
 #   8. proxy clear → 503；且 clear 不重置 smart 开关（db.rs 修复的 CLI 级验证）
-#   9. 即时语法回归：config-file 工具（codex 等）拒绝 instant launch 并指引 `use`
+#   9. 即时语法注入层：codex/opencode 经 -c / OPENCODE_CONFIG_CONTENT 真可用
+#      （本机无二进制则 skip）；pi 拒绝并指引 `use`
 #  10. 真实上游双链路（可选）：XFADE_TEST_BASEURL + XFADE_TEST_KEY 设置后启用
 #
 # 凭据一律走环境变量，不进本脚本、不进 git。
@@ -68,13 +69,41 @@ trap cleanup EXIT
 # ---------- 测试 sink ----------
 # 每个请求把 {path, auth, body} 追加为 JSON 行到日志；响应模式由 mode 文件
 # 内容决定（200/400/500），改文件即可动态注入故障，无需重启 sink。
+# 200 模式下按请求形态应答：/responses 路径或非空 stream 标志 → SSE 流
+# （真实客户端 codex/opencode 都是流式，非 SSE 响应会让它们静默无限重试）；
+# 否则返回普通 JSON（curl 探针路径）。
 cat > "$WORK/sink.py" <<'PY'
-import json, sys, os
+import json, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port, log, modef = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 
+def chat_chunks(model):
+    return [
+        {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":int(time.time()),"model":model,
+         "choices":[{"index":0,"delta":{"role":"assistant","content":"sink-ok"},"finish_reason":None}]},
+        {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":int(time.time()),"model":model,
+         "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+         "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}},
+    ]
+
+def resp_events(model):
+    rid = "resp-s1"
+    item = {"id":"msg-s1","type":"message","status":"completed","role":"assistant",
+            "content":[{"type":"output_text","text":"sink-ok"}]}
+    resp = {"id":rid,"object":"response","created_at":int(time.time()),"status":"completed",
+            "model":model,"output":[item],
+            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}
+    return [
+        ("response.created", {"type":"response.created","response":{"id":rid,"object":"response","created_at":int(time.time()),"status":"in_progress","model":model,"output":[]}}),
+        ("response.output_item.added", {"type":"response.output_item.added","output_index":0,"item":{"id":"msg-s1","type":"message","status":"in_progress","role":"assistant","content":[]}}),
+        ("response.output_text.delta", {"type":"response.output_text.delta","item_id":"msg-s1","output_index":0,"content_index":0,"delta":"sink-ok"}),
+        ("response.output_item.done", {"type":"response.output_item.done","output_index":0,"item":item}),
+        ("response.completed", {"type":"response.completed","response":resp}),
+    ]
+
 class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0)
@@ -88,13 +117,28 @@ class H(BaseHTTPRequestHandler):
         except FileNotFoundError:
             mode = "200"
         if mode == "200":
-            payload = json.dumps({
-                "id": "sink-1", "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "sink-ok"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-            }).encode()
+            try:
+                req = json.loads(body)
+            except Exception:
+                req = {}
+            model = req.get("model", "sink-model")
+            if "/responses" in self.path:
+                payload = b"".join(("event: %s\ndata: %s\n\n" % (ev, json.dumps(d))).encode()
+                                   for ev, d in resp_events(model))
+                ctype = "text/event-stream"
+            elif req.get("stream"):
+                payload = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n"
+                                   for c in chat_chunks(model)) + b"data: [DONE]\n\n"
+                ctype = "text/event-stream"
+            else:
+                payload = json.dumps({
+                    "id": "sink-1", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "sink-ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }).encode()
+                ctype = "application/json"
             self.send_response(200)
-            self.send_header("content-type", "application/json")
+            self.send_header("content-type", ctype)
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -229,16 +273,43 @@ else
 fi
 "$XFADE_BIN" proxy smart off >/dev/null
 
-# ---------- 8. 即时语法回归 ----------
-sect "8. 即时语法：config-file 工具拒绝 instant launch 并指引 use"
-for t in codex opencode pi; do
-  out=$("$XFADE_BIN" "$t" nonexistent-provider 2>&1) && rc=0 || rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'use'; then
-    ok "$t instant launch 被拒绝且指引 use"
-  else
-    bad "$t instant launch 行为异常 (rc=$rc out=$out)"
-  fi
-done
+# ---------- 8. 即时语法注入层 ----------
+sect "8. 即时语法：codex/opencode 真可用（注入层），pi 拒绝并指引 use"
+out=$("$XFADE_BIN" pi nonexistent-provider 2>&1) && rc=0 || rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'use'; then
+  ok "pi instant launch 被拒绝且指引 use"
+else
+  bad "pi instant launch 行为异常 (rc=$rc out=$out)"
+fi
+
+# codex/opencode 注入层 e2e（条件：本机装有对应二进制）。
+# 注入只碰 env/-c 覆盖，真实配置目录零写入；sink 走 SSE 才算真链路。
+"$XFADE_BIN" add probe-cx --tool codex --base-url "http://127.0.0.1:$PORT_CLOUD" \
+  --key k-cloud --set model=test-model >/dev/null
+"$XFADE_BIN" add probe-oc --tool opencode --base-url "http://127.0.0.1:$PORT_CLOUD" \
+  --key k-cloud --set model=test-model >/dev/null
+
+if command -v codex >/dev/null; then
+  before=$(n_cloud)
+  out=$("$XFADE_BIN" codex probe-cx -- exec 'say hi' 2>&1) && rc=0 || rc=$?
+  assert_eq "$rc" 0 "xfade codex instant 退出码 0"
+  printf '%s' "$out" | grep -q 'sink-ok' && ok "codex 收到 sink 流式回复" || bad "codex 输出异常: $out"
+  resp_auth=$(grep '/v1/responses' "$LOG_CLOUD" | tail -1 | jq -r '.auth')
+  assert_eq "$resp_auth" "Bearer k-cloud" "codex 请求带 provider key 打到 /v1/responses"
+  [ "$(n_cloud)" -gt "$before" ] && ok "codex 请求落到了注入的端点" || bad "codex 未请求注入端点"
+else
+  echo "  skip: 本机无 codex 二进制"
+fi
+
+if command -v opencode >/dev/null; then
+  out=$("$XFADE_BIN" opencode probe-oc -- run 'say hi' 2>&1) && rc=0 || rc=$?
+  assert_eq "$rc" 0 "xfade opencode instant 退出码 0"
+  printf '%s' "$out" | grep -q 'sink-ok' && ok "opencode 收到 sink 流式回复" || bad "opencode 输出异常: $out"
+  oc_auth=$(grep '/v1/chat/completions' "$LOG_CLOUD" | tail -1 | jq -r '.auth')
+  assert_eq "$oc_auth" "Bearer k-cloud" "opencode 请求带 provider key 打到 /v1/chat/completions"
+else
+  echo "  skip: 本机无 opencode 二进制"
+fi
 
 # ---------- 9. 真实上游双链路（可选） ----------
 if [ -n "${XFADE_TEST_BASEURL:-}" ] && [ -n "${XFADE_TEST_KEY:-}" ]; then

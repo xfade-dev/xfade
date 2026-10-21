@@ -4,13 +4,13 @@ use crate::models::{Provider, ToolKind};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-const OPENAI_COMPAT: &str = "@ai-sdk/openai-compatible";
+pub(crate) const OPENAI_COMPAT: &str = "@ai-sdk/openai-compatible";
 
 /// Build the canonical `models` object from provider `extra`.
 ///
 /// Accepts `models = { "<model-id>": { ... } }` as-is; accepts
 /// `model = "<id>"` as a shorthand and synthesizes a single-entry object.
-fn models_for_extra(extra: &serde_json::Value) -> Value {
+pub(crate) fn models_for_extra(extra: &serde_json::Value) -> Value {
     extra
         .get("models")
         .cloned()
