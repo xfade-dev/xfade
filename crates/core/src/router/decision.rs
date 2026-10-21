@@ -48,10 +48,16 @@ pub struct RoutePlan {
 /// `xfade proxy use`); `open` reports whether a provider's circuit breaker
 /// is currently open (open routes are skipped).
 pub trait Router: Send + Sync {
+    /// Whether this router classifies requests. When false, callers skip
+    /// prompt extraction entirely — the static path stays zero-overhead.
+    fn is_smart(&self) -> bool {
+        false
+    }
+
     fn plan(
         &self,
         ctx: &ClassifyCtx<'_>,
-        routes: &[Provider],
+        routes: &[&Provider],
         model_override: Option<&str>,
         open: &dyn Fn(&str) -> bool,
         health: &dyn Fn(&str) -> Option<HealthSignal>,
@@ -65,7 +71,7 @@ impl Router for DefaultRouter {
     fn plan(
         &self,
         _ctx: &ClassifyCtx<'_>,
-        routes: &[Provider],
+        routes: &[&Provider],
         model_override: Option<&str>,
         open: &dyn Fn(&str) -> bool,
         _health: &dyn Fn(&str) -> Option<HealthSignal>,
@@ -97,14 +103,26 @@ pub fn provider_tier(p: &Provider) -> Tier {
         };
     }
     match p.base_url.as_deref() {
-        // Loopback heuristic: bare-host local runtimes (Ollama, LM Studio,
-        // MLX servers). These markers can only appear in the authority
-        // component of an http(s) URL, never later in the path.
-        Some(u) if u.contains("127.0.0.1") || u.contains("localhost") || u.contains("[::1]") => {
-            Tier::Local
-        }
+        Some(u) if is_loopback_url(u) => Tier::Local,
         _ => Tier::Cloud,
     }
+}
+
+/// Loopback heuristic: bare-host local runtimes (Ollama, LM Studio, MLX
+/// servers). The marker must be the URL *host* — a `127.0.0.1.evil.com`
+/// host or a `127.0.0.1` path segment is not loopback.
+fn is_loopback_url(u: &str) -> bool {
+    // Strip an optional scheme, then keep only the authority component.
+    let after_scheme = u.split_once("://").map(|(_, rest)| rest).unwrap_or(u);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any userinfo, then split host from port (bracketed IPv6 first).
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// Light intents run local-first; heavy intents run cloud-first; unknown
@@ -119,12 +137,12 @@ fn light(intent: Intent) -> bool {
 /// Pure tier-bucket planning for a known intent.
 pub fn plan_for_intent(
     intent: Intent,
-    routes: &[Provider],
+    routes: &[&Provider],
     model_override: Option<&str>,
     open: &dyn Fn(&str) -> bool,
     health: &dyn Fn(&str) -> Option<HealthSignal>,
 ) -> RoutePlan {
-    let usable: Vec<&Provider> = routes.iter().filter(|p| !open(&p.id)).collect();
+    let usable: Vec<&Provider> = routes.iter().copied().filter(|p| !open(&p.id)).collect();
     let entry_for = |p: &Provider| RouteEntry {
         route_id: p.id.clone(),
         model_override: model_override.map(String::from),
@@ -206,7 +224,7 @@ pub fn plan_for_intent(
 /// Classify the request (keyword rules) and plan the tier buckets for it.
 pub fn plan_routes(
     ctx: &ClassifyCtx<'_>,
-    routes: &[Provider],
+    routes: &[&Provider],
     model_override: Option<&str>,
     open: &dyn Fn(&str) -> bool,
     health: &dyn Fn(&str) -> Option<HealthSignal>,
@@ -229,10 +247,14 @@ impl Default for SmartRouter {
 }
 
 impl Router for SmartRouter {
+    fn is_smart(&self) -> bool {
+        true
+    }
+
     fn plan(
         &self,
         ctx: &ClassifyCtx<'_>,
-        routes: &[Provider],
+        routes: &[&Provider],
         model_override: Option<&str>,
         open: &dyn Fn(&str) -> bool,
         health: &dyn Fn(&str) -> Option<HealthSignal>,
@@ -277,12 +299,24 @@ mod tests {
         false
     }
 
+    fn refs(routes: &[Provider]) -> Vec<&Provider> {
+        routes.iter().collect()
+    }
+
     fn no_health(_: &str) -> Option<HealthSignal> {
         None
     }
 
     const LIGHT: &str = "why does this fail to compile?";
     const HEAVY: &str = "restructure the whole proxy module into layers";
+
+    #[test]
+    fn routers_advertise_smartness() {
+        // forward.rs skips prompt extraction entirely when the active
+        // router is not smart, so the flag must be correct on both.
+        assert!(!DefaultRouter.is_smart());
+        assert!(SmartRouter::default().is_smart());
+    }
 
     #[test]
     fn health_orders_bucket_healthy_first() {
@@ -296,7 +330,7 @@ mod tests {
                 _ => None,
             }
         };
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &health);
         assert_eq!(ids(&plan), vec!["l-healthy", "l-sick", "c"]);
     }
 
@@ -310,7 +344,7 @@ mod tests {
                 _ => None,
             }
         };
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &health);
         assert_eq!(ids(&plan), vec!["l-fast", "l-slow"]);
     }
 
@@ -319,7 +353,7 @@ mod tests {
         // No stats for anyone: bucketing still applies, within-bucket order
         // stays as configured.
         let routes = vec![local("l2"), local("l1"), cloud("c")];
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["l2", "l1", "c"]);
     }
 
@@ -333,7 +367,7 @@ mod tests {
                 _ => Some(HealthSignal { error_rate: 0.0, avg_ms: 50 }),
             }
         };
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &health);
         assert_eq!(ids(&plan), vec!["l-ok", "l-sick", "c-ok", "c-sick"]);
     }
 
@@ -348,7 +382,7 @@ mod tests {
                 _ => Some(HealthSignal { error_rate: 0.0, avg_ms: 50 }),
             }
         };
-        let plan = plan_routes(&ctx("hello"), &routes, None, &none_open, &health);
+        let plan = plan_routes(&ctx("hello"), &refs(&routes), None, &none_open, &health);
         assert_eq!(ids(&plan), vec!["l-sick", "l-healthy"]);
     }
 
@@ -367,7 +401,7 @@ mod tests {
                 _ => None,
             }
         };
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &health);
         assert_eq!(ids(&plan), vec!["l-known-ok", "l-known-bad", "l-new"]);
     }
 
@@ -390,9 +424,34 @@ mod tests {
     }
 
     #[test]
+    fn tier_loopback_markers_must_be_the_host() {
+        // A lookalike host is not loopback: the marker must equal the URL
+        // host, not merely appear somewhere in the string.
+        let subdomain = provider("evil", Some("http://127.0.0.1.evil.com/v1"), json!({}));
+        assert_eq!(provider_tier(&subdomain), Tier::Cloud);
+
+        let suffix = provider("evil2", Some("https://localhost.evil.com/v1"), json!({}));
+        assert_eq!(provider_tier(&suffix), Tier::Cloud);
+
+        // Markers in the path/query don't count either.
+        let in_path = provider("p", Some("https://api.example.com/127.0.0.1/v1"), json!({}));
+        assert_eq!(provider_tier(&in_path), Tier::Cloud);
+
+        // Genuine loopback forms still classify local.
+        let ipv6 = provider("v6", Some("http://[::1]:8080/v1"), json!({}));
+        assert_eq!(provider_tier(&ipv6), Tier::Local);
+
+        let bare = provider("bare", Some("127.0.0.1:11434"), json!({}));
+        assert_eq!(provider_tier(&bare), Tier::Local);
+
+        let userinfo = provider("u", Some("http://user@localhost:1234/v1"), json!({}));
+        assert_eq!(provider_tier(&userinfo), Tier::Local);
+    }
+
+    #[test]
     fn default_router_preserves_configured_order() {
         let routes = vec![cloud("a"), local("b"), cloud("c")];
-        let plan = DefaultRouter.plan(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = DefaultRouter.plan(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["a", "b", "c"]);
     }
 
@@ -400,7 +459,7 @@ mod tests {
     fn default_router_carries_model_override_and_skips_open_circuits() {
         let routes = vec![cloud("a"), cloud("b")];
         let open = |id: &str| id == "a";
-        let plan = DefaultRouter.plan(&ctx("hi"), &routes, Some("m-x"),&open, &no_health);
+        let plan = DefaultRouter.plan(&ctx("hi"), &refs(&routes), Some("m-x"),&open, &no_health);
         assert_eq!(ids(&plan), vec!["b"]);
         assert_eq!(plan.entries[0].model_override.as_deref(), Some("m-x"));
     }
@@ -408,7 +467,7 @@ mod tests {
     #[test]
     fn light_intent_prefers_local_then_cloud() {
         let routes = vec![cloud("a"), local("b"), cloud("c"), local("d")];
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["b", "d", "a", "c"]);
         assert_eq!(plan.intent, Intent::ExplainError);
     }
@@ -416,7 +475,7 @@ mod tests {
     #[test]
     fn heavy_intent_prefers_cloud_then_local() {
         let routes = vec![local("b"), cloud("a"), local("d"), cloud("c")];
-        let plan = plan_routes(&ctx(HEAVY), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx(HEAVY), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["a", "c", "b", "d"]);
         assert_eq!(plan.intent, Intent::BigRefactor);
     }
@@ -424,7 +483,7 @@ mod tests {
     #[test]
     fn unknown_intent_keeps_static_order() {
         let routes = vec![cloud("a"), local("b")];
-        let plan = plan_routes(&ctx("hello there"), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx("hello there"), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["a", "b"]);
         assert_eq!(plan.intent, Intent::Unknown);
     }
@@ -433,7 +492,7 @@ mod tests {
     fn single_bucket_keeps_configured_order() {
         // All-cloud routes with a light intent: no reordering opportunity.
         let routes = vec![cloud("c2"), cloud("c1")];
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["c2", "c1"]);
     }
 
@@ -441,14 +500,14 @@ mod tests {
     fn open_circuits_are_skipped_before_bucketing() {
         let routes = vec![local("l1"), local("l2"), cloud("c1")];
         let open = |id: &str| id == "l1";
-        let plan = plan_routes(&ctx(LIGHT), &routes, None,&open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None,&open, &no_health);
         assert_eq!(ids(&plan), vec!["l2", "c1"]);
     }
 
     #[test]
     fn plan_records_reason() {
         let routes = vec![local("l1")];
-        let plan = plan_routes(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert!(!plan.reason.is_empty());
     }
 
@@ -456,7 +515,7 @@ mod tests {
     fn smart_router_classifies_and_buckets() {
         let routes = vec![cloud("a"), local("b")];
         let router = SmartRouter::default();
-        let plan = router.plan(&ctx(LIGHT), &routes, None, &none_open, &no_health);
+        let plan = router.plan(&ctx(LIGHT), &refs(&routes), None, &none_open, &no_health);
         assert_eq!(ids(&plan), vec!["b", "a"]);
         assert_eq!(plan.intent, Intent::ExplainError);
     }

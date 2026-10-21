@@ -48,8 +48,11 @@ pub trait IntentClassifier: Send + Sync {
 ///   outrank the generic "refactor" keyword.
 pub struct KeywordClassifier;
 
-/// (intent, keywords) in precedence order; matched as case-insensitive
-/// substrings of the last user message.
+/// (intent, keywords) in precedence order. Single-word keywords match
+/// whole words of the lowercased prompt by prefix (a word is a maximal
+/// run of alphanumerics), so stems like "panick" catch "panicked" but
+/// "format" does not fire on "information". Keywords with spaces or
+/// punctuation ("clean up", "trade-off") keep plain substring matching.
 const RULES: &[(Intent, &[&str])] = &[
     (
         Intent::WriteTest,
@@ -71,7 +74,7 @@ const RULES: &[(Intent, &[&str])] = &[
         Intent::StaticCheck,
         &[
             "lint", "clippy", "eslint", "ruff", "unused import", "type check",
-            "typecheck", "format",
+            "typecheck", "format", "reformat",
         ],
     ),
     (
@@ -91,11 +94,22 @@ const RULES: &[(Intent, &[&str])] = &[
     ),
 ];
 
+/// Match one keyword against the (already lowercased) prompt.
+fn keyword_matches(prompt: &str, keyword: &str) -> bool {
+    if keyword.chars().all(|c: char| c.is_alphanumeric()) {
+        prompt
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word.starts_with(keyword))
+    } else {
+        prompt.contains(keyword)
+    }
+}
+
 impl IntentClassifier for KeywordClassifier {
     fn classify(&self, ctx: &ClassifyCtx<'_>) -> Intent {
         let prompt = ctx.prompt.to_lowercase();
         for (intent, keywords) in RULES {
-            if keywords.iter().any(|k| prompt.contains(k)) {
+            if keywords.iter().any(|k| keyword_matches(&prompt, k)) {
                 return *intent;
             }
         }
@@ -174,6 +188,36 @@ mod tests {
         assert_eq!(classify("hello, who are you?"), Intent::Unknown);
         assert_eq!(classify("summarize this document"), Intent::Unknown);
         assert_eq!(classify(""), Intent::Unknown);
+    }
+
+    #[test]
+    fn single_word_keywords_match_on_word_boundaries() {
+        // "information" contains the substring "format": plain substring
+        // matching misroutes any prompt mentioning information to
+        // StaticCheck. Whole-word matching must not.
+        assert_eq!(
+            classify("give me more information about the parser"),
+            Intent::Unknown
+        );
+        assert_eq!(
+            classify("summarize the information in this file"),
+            Intent::Unknown
+        );
+        // Real format asks still match, including inflections (word-prefix).
+        assert_eq!(classify("format this file"), Intent::StaticCheck);
+        assert_eq!(classify("reformat the config file"), Intent::StaticCheck);
+        assert_eq!(classify("fix the formatting here"), Intent::StaticCheck);
+    }
+
+    #[test]
+    fn stem_keywords_still_match_inflections() {
+        // The "panick" stem exists to catch panicked/panicking; word-prefix
+        // matching must preserve that.
+        assert_eq!(
+            classify("the thread panicked at runtime"),
+            Intent::ExplainError
+        );
+        assert_eq!(classify("it keeps panicking on startup"), Intent::ExplainError);
     }
 
     #[test]

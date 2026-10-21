@@ -341,8 +341,13 @@ fn prepare_bodies(
     };
 
     // Passthrough body: stream_options injection + shallow model rewrite
-    // (single parse).
-    let passthrough_body: Option<Vec<u8>> = transform_passthrough_body(endpoint, body, model_override);
+    // (single parse). Skipped on the convert path, where only the
+    // converted body is ever sent.
+    let passthrough_body: Option<Vec<u8>> = if convert_path {
+        None
+    } else {
+        transform_passthrough_body(endpoint, body, model_override)
+    };
 
     Ok(PreparedBodies {
         converted_body,
@@ -718,6 +723,11 @@ async fn failover_loop(
     start: Instant,
 ) -> Response {
     let mut last_err: Option<(StatusCode, String)> = None;
+    // Per-route body preparation is memoized by model override: adjacent
+    // entries in a tier usually share the same override (static routing is
+    // all-None), so failover retries must not re-run the full conversion.
+    let mut bodies_cache: std::collections::HashMap<Option<String>, PreparedBodies> =
+        std::collections::HashMap::new();
 
     for entry in entries {
         let route_id = entry.route_id.as_str();
@@ -744,23 +754,33 @@ async fn failover_loop(
         // Per-route body preparation: each entry may carry its own model
         // override (Smart Fader per-tier models). The convert path is fixed
         // by (endpoint, target_protocol) — only the override differs — so
-        // re-preparing per entry is cheap.
+        // bodies are cached per override value.
+        let bodies = match bodies_cache.get(&entry.model_override) {
+            Some(b) => b,
+            None => {
+                let prepared = match prepare_bodies(
+                    endpoint,
+                    target_protocol,
+                    original_body,
+                    entry.model_override.as_deref(),
+                ) {
+                    Ok(r) => r,
+                    Err(resp) => {
+                        session_failed(svc, session_id);
+                        return *resp;
+                    }
+                };
+                bodies_cache
+                    .entry(entry.model_override.clone())
+                    .or_insert(prepared)
+            }
+        };
         let PreparedBodies {
             converted_body: conv_body,
             passthrough_body: passthru_body,
             convert_path,
-        } = match prepare_bodies(
-            endpoint,
-            target_protocol,
-            original_body,
-            entry.model_override.as_deref(),
-        ) {
-            Ok(r) => r,
-            Err(resp) => {
-                session_failed(svc, session_id);
-                return *resp;
-            }
-        };
+        } = bodies;
+        let convert_path = *convert_path;
 
         let out_body: &[u8] = if convert_path {
             conv_body.as_deref().unwrap_or(original_body)
@@ -898,17 +918,22 @@ async fn forward_with_failover(
         .iter()
         .filter_map(|id| provider_map.get(id).copied())
         .collect();
-    let prompt_text = parsed.map_or(String::new(), |v| extract_prompt_text(v, endpoint));
+    let router = svc.active_router();
+    // Prompt extraction (parse + 4KB copy of the last user turn) only pays
+    // off when the router actually classifies; the static path skips it.
+    let prompt_text = if router.is_smart() {
+        parsed.map_or(String::new(), |v| extract_prompt_text(v, endpoint))
+    } else {
+        String::new()
+    };
     let classify_ctx = crate::router::classifier::ClassifyCtx {
         endpoint,
         model: model.as_deref(),
         prompt: &prompt_text,
     };
-    let route_set: Vec<crate::models::Provider> =
-        route_providers.into_iter().cloned().collect();
-    let plan = svc.active_router().plan(
+    let plan = router.plan(
         &classify_ctx,
-        &route_set,
+        &route_providers,
         model_override.as_deref(),
         &|id: &str| svc.circuit_open(id),
         &|id: &str| svc.health_signal(id),
@@ -1267,6 +1292,36 @@ pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap
 mod tests {
     use super::*;
     use futures::{stream, StreamExt};
+
+    #[test]
+    fn prepare_bodies_convert_path_skips_passthrough_transform() {
+        // messages→chat convert path: the passthrough body is never sent
+        // (out_body picks the converted body), so prepare_bodies must not
+        // spend a parse+serialize cycle producing it.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let prepared = prepare_bodies("messages", "chat", &body, Some("gpt-y"))
+            .unwrap_or_else(|_| panic!("prepare failed"));
+        assert!(prepared.convert_path);
+        assert!(prepared.converted_body.is_some());
+        assert!(prepared.passthrough_body.is_none());
+    }
+
+    #[test]
+    fn prepare_bodies_passthrough_path_still_transforms() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "a",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let prepared = prepare_bodies("chat", "chat", &body, Some("b"))
+            .unwrap_or_else(|_| panic!("prepare failed"));
+        assert!(!prepared.convert_path);
+        assert!(prepared.passthrough_body.is_some());
+    }
 
     #[test]
     fn extract_prompt_text_chat_takes_last_user_turn() {

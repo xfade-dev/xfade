@@ -561,6 +561,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_fader_toggle_flips_routing_without_restart() {
+        // `xfade proxy smart on|off` writes proxy_state.smart_enabled and
+        // the daemon re-reads it per request (active_router), so flipping
+        // the flag mid-flight must reroute immediately — no restart.
+        let dir = tempfile::tempdir().unwrap();
+        let local = MockUpstream::spawn().await;
+        let cloud = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        let lp = crate::models::Provider::new(
+            "local",
+            crate::models::ToolKind::Codex,
+            Some(local.url()),
+        );
+        core.add_provider(lp, Some("kl")).unwrap();
+
+        let mut cp = crate::models::Provider::new(
+            "cloud",
+            crate::models::ToolKind::Codex,
+            Some(cloud.url()),
+        );
+        cp.extra = serde_json::json!({"tier": "cloud"});
+        core.add_provider(cp, Some("kc")).unwrap();
+
+        core.db()
+            .set_routes(&["cloud".into(), "local".into()], None, "chat")
+            .unwrap();
+        // smart starts OFF (default).
+
+        let handle = core.clone();
+        let url = spawn_service(ProxyService::new(core)).await;
+        cloud.respond_with(200, "{}");
+        local.respond_with(200, "{}");
+
+        let light =
+            r#"{"model":"m","messages":[{"role":"user","content":"why does this fail to compile?"}]}"#;
+
+        // OFF: configured order wins → cloud serves the light prompt.
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(cloud.call_count().await, 1);
+        assert_eq!(local.call_count().await, 0);
+
+        // Flip ON mid-flight: the next light prompt goes local-first.
+        handle.db().set_smart_enabled(true).unwrap();
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(local.call_count().await, 1, "smart on must reroute without restart");
+        assert_eq!(cloud.call_count().await, 1, "no extra cloud call after flip");
+
+        // Flip back OFF: configured order wins again.
+        handle.db().set_smart_enabled(false).unwrap();
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", light, "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(cloud.call_count().await, 2);
+        assert_eq!(local.call_count().await, 1, "smart off must restore static order");
+    }
+
+    #[tokio::test]
     async fn upstream_4xx_no_failover() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;

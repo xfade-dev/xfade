@@ -387,6 +387,8 @@ impl Database {
     }
 
     /// Read proxy routes and associated config; returns None if not set.
+    /// An empty route set (post-`clear_routes`) also reads as None: "no
+    /// usable routes" is a single representation for all consumers.
     /// Returns (routes, model_override, target_protocol).
     pub fn get_routes(&self) -> Result<Option<RoutesConfig>> {
         let conn = self.conn();
@@ -398,6 +400,9 @@ impl Database {
             Some(row) => {
                 let s: String = row.get(0)?;
                 let routes: Vec<String> = serde_json::from_str(&s)?;
+                if routes.is_empty() {
+                    return Ok(None);
+                }
                 let model_override: Option<String> = row.get(1)?;
                 let target_protocol: String = row.get(2)?;
                 Ok(Some((routes, model_override, target_protocol)))
@@ -406,9 +411,22 @@ impl Database {
         }
     }
 
+    /// Clear the route set without touching the independent Smart Fader
+    /// toggle (`smart_enabled`).
     pub fn clear_routes(&self) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM proxy_state WHERE id = 1", [])?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
+        self.conn().execute(
+            "UPDATE proxy_state
+             SET routes = '[]', model_override = NULL, updated_at = ?1
+             WHERE id = 1",
+            params![now],
+        )?;
         Ok(())
     }
 
@@ -889,6 +907,21 @@ mod tests {
         assert!(db.smart_enabled().unwrap());
         db.set_smart_enabled(false).unwrap();
         assert!(!db.smart_enabled().unwrap());
+    }
+
+    #[test]
+    fn clear_routes_keeps_smart_enabled() {
+        // `xfade proxy clear` clears the route set; it must not silently
+        // reset the independent Smart Fader toggle.
+        let db = Database::open_memory().unwrap();
+        db.set_routes(&["p1".to_string()], None, "chat").unwrap();
+        db.set_smart_enabled(true).unwrap();
+
+        db.clear_routes().unwrap();
+
+        assert!(db.smart_enabled().unwrap());
+        // No routes left to serve.
+        assert!(db.get_routes().unwrap().is_none());
     }
 
     #[test]
