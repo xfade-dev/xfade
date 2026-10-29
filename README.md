@@ -173,7 +173,7 @@ Details:
 - **In-bucket ordering**: within a tier, providers are ordered by recent health (error rate, then latency) from a 30s-TTL stats snapshot — no per-request GROUP BY. Providers without stats keep their configured position relative to each other.
 - **Circuit breakers and failover behave exactly as with the fader off**: open circuits are skipped before bucketing, and a failing primary still fails over through the list.
 - Model overrides now also apply on the chat→chat passthrough path (local runtimes): the `model` field is rewritten per route.
-- Project analysis (language fingerprint + git pulse, cached in the `repo_maps` table) ships as an enrichment signal for future features — phase-2 classification itself only reads the prompt text, and nothing consumes the analyzer yet.
+- Project analysis (language fingerprint + git pulse, cached in the `repo_maps` table) surfaces through `xfade project`, a serve-startup prewarm of the cwd, and the latest repo map shown in `xfade proxy status`. Phase-2 classification itself only reads the prompt text.
 
 ### daemon (macOS + Linux)
 

@@ -2,16 +2,23 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v0.9.0 — 2026-10-29
 
 ### New
-- **feat(cli)**: instant-launch subcommands — `xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]`. The tool name is the subcommand (a shorthand for `xfade run`); the provider is resolved on the spot, unregistered presets auto-create (third-party presets may use the global API key), `--model` without a name reverse-looks-up a matching preset/provider, and `name --base-url --key` registers an ad-hoc provider. All one-off overrides are never persisted and never touch the tool's config. Subcommands exist for all 9 tools; env injection is verified for **claude and aider only** — codex 0.155.0 / opencode 1.18.31 / pi 0.87.0 were real-machine tested and ignore env overrides for custom providers, so those subcommands point at `xfade use`.
+- **feat(cli)**: instant-launch subcommands — `xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]`. The tool name is the subcommand (a shorthand for `xfade run`); the provider is resolved on the spot, unregistered presets auto-create (third-party presets may use the global API key), `--model` without a name reverse-looks-up a matching preset/provider, and `name --base-url --key` registers an ad-hoc provider. All one-off overrides are never persisted and never touch the tool's config. Subcommands exist for all 9 tools; injection is verified for **claude** (env), **aider** (env), **codex** (`-c model_providers.<id>.*` overrides + `env_key` → `XFADE_CODEX_KEY`, plus `--disable apps`) and **opencode** (inline `OPENCODE_CONFIG_CONTENT`) — codex-cli 0.155.0 / opencode 1.18.31 real-machine verified with zero writes to the real config homes. pi ignores env overrides for custom providers, so pi (and omp/cline/hermes/openclaw) point at `xfade use`.
 - **feat(core)**: session identity for proxied conversations — the opener (system + first user turn) is hashed into a fingerprint; requests within a 30-minute sticky window reuse the same session id (`X-Xfade-Session-Id` response header). No prompt text is stored (only a truncated opener preview). New `sessions` / `handovers` tables (eviction-isolated from the 10k request-log cap) plus `PRAGMA busy_timeout` for cross-process writes.
 - **feat(cli)**: unified session view — `xfade sessions` lists conversations (tool/provider/tokens/status), `xfade sessions show <id>` shows one session plus its model-switch timeline, `xfade stats --by session` aggregates per session. Model switches via `xfade use` and `xfade proxy use --model` land on the timeline and are backfilled from the next matching request.
 - **feat(core)**: `xfade run` with an official provider + `--model` (via the instant syntax) now injects the model-class env var instead of silently dropping the override.
 - **feat(proxy)**: Smart Fader — intent-aware tiered routing, off by default, enabled with `xfade proxy smart on`. Requests are classified by pure keyword rules (light intents: error triage / tests / static checks / small refactors → local-first; heavy intents: big refactors / architecture → cloud-first; unknown → configured order). Tiers come from `extra.tier` with a loopback-base_url heuristic (Ollama / LM Studio / MLX). Within a bucket, providers order by recent health (error rate then latency) from a 30s-TTL stats snapshot. Circuit breakers and failover semantics are unchanged, and the fader is read from the DB per request so the toggle reaches a running daemon immediately.
 - **fix(proxy)**: a route `--model` override now rewrites the `model` field on the chat→chat passthrough path too (previously only protocol-conversion paths applied it), so model overrides finally reach local OpenAI-compatible runtimes. The failover loop also prepares bodies per route, paving the way for per-tier model overrides.
-- **feat(core)**: project analyzer — language fingerprint (manifest scan, no parsing) and git pulse (branch/head/recent subjects), cached in a new `repo_maps` table keyed by a manifest fingerprint. Enrichment signal for future features; nothing consumes it yet.
+- **feat(core)**: project analyzer — language fingerprint (manifest scan, no parsing) and git pulse (branch/head/recent subjects), cached in a new `repo_maps` table keyed by a manifest fingerprint. Consumers: `xfade project` prints the cwd fingerprint + git pulse, `xfade serve` prewarms the cwd at startup, and `xfade proxy status` shows the latest repo map.
+
+### Fixes
+- **fix(proxy)**: hardening — failover body cache (no re-serialization per route), protocol conversion skipped on passthrough paths, prompt extraction skipped when the fader is off, loopback host matching is exact (fixes `127.0.0.1.evil.com` false positive), `clear_routes` preserves `smart_enabled`, and intent keywords use word boundaries.
+- **fix(run)**: bare aider model names are prefixed with `openai/` so litellm resolves them against the injected base URL.
+
+### Testing
+- **test**: release test plan (`docs/testing-plan-v2-2026-10-14.md`) + real-binary acceptance script (`scripts/v2-test.sh`) — 27 assertions against local double sinks, plus 5 assertions over real dual links via `XFADE_TEST_BASEURL/KEY/MODEL`.
 
 ## v0.8.4 — 2026-09-24
 

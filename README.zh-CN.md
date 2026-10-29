@@ -169,7 +169,7 @@ xfade stats [--by provider|model|session]   # 请求统计聚合
 - **层内排序**：按近期健康度（错误率、再延迟）排序，数据来自 30s TTL 的统计快照——不会每请求跑 GROUP BY。无统计的 provider 彼此保持配置顺序。
 - **熔断与 failover 行为与关闭时完全一致**：熔断项分桶前剔除，主路由失败依旧沿列表回退。
 - model override 现在同样作用于 chat→chat passthrough 路径（本地运行时）：按路由改写 `model` 字段。
-- 项目分析（语言指纹 + git pulse，缓存在 `repo_maps` 表）已作为未来功能的增强信号交付——阶段2 的分类本身只读 prompt 文本，目前尚无消费方。
+- 项目分析（语言指纹 + git pulse，缓存在 `repo_maps` 表）的消费方：`xfade project` 打印、serve 启动预热 cwd、`xfade proxy status` 展示最新 repo map。阶段2 的分类本身只读 prompt 文本。
 
 ### daemon（macOS + Linux）
 
