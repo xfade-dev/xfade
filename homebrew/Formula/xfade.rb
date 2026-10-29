@@ -1,10 +1,9 @@
 class Xfade < Formula
   desc "Route AI providers for AI coding tools, with local proxy"
   homepage "https://xfade.dev"
-  version "0.9.0"
-  license "MIT OR Apache-2.0"
+  license any_of: ["MIT", "Apache-2.0"]
 
-  # This formula belongs to the standalone tap repo homebrew-xfade; the url/sha256 below are updated after each release.
+  # This formula belongs to the standalone tap repo homebrew-xfade; url/sha256 are updated after each release.
   on_macos do
     on_arm do
       url "https://github.com/xfade-dev/xfade/releases/download/v0.9.0/xfade-aarch64-apple-darwin.tar.gz"
