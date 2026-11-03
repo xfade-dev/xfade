@@ -1032,7 +1032,24 @@ fn self_update() -> Result<(), CoreError> {
         let new_bin = tmp.join("xfade");
         let current_exe =
             std::env::current_exe().map_err(|e| CoreError::Proxy(format!("current_exe: {e}")))?;
-        std::fs::copy(&new_bin, &current_exe).map_err(|e| {
+        // Atomic replace: stage in the same directory, then rename. Renaming
+        // also replaces a symlink itself instead of writing through to its
+        // target (e.g. a dev-directory binary linked into /usr/local/bin,
+        // which a later `cargo build` would fight over).
+        if std::fs::symlink_metadata(&current_exe)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            println!(
+                "xfade: {} is a symlink; replacing the link itself (its target is left untouched)",
+                current_exe.display()
+            );
+        }
+        let dir = current_exe
+            .parent()
+            .ok_or_else(|| CoreError::Proxy("current_exe has no parent dir".into()))?;
+        let staged = dir.join(format!(".xfade-update-{}", std::process::id()));
+        let replace_err = |e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 CoreError::Proxy(format!(
                     "replace binary ({}): permission denied — \
@@ -1042,7 +1059,9 @@ fn self_update() -> Result<(), CoreError> {
             } else {
                 CoreError::Proxy(format!("replace binary ({}): {e}", current_exe.display()))
             }
-        })?;
+        };
+        std::fs::copy(&new_bin, &staged).map_err(replace_err)?;
+        std::fs::rename(&staged, &current_exe).map_err(replace_err)?;
         println!("xfade: updated to {tag}");
         Ok(())
     })

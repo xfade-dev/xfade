@@ -146,6 +146,8 @@ class H(BaseHTTPRequestHandler):
             payload = json.dumps({"error": {"message": f"sink injected {mode}"}}).encode()
             self.send_response(int(mode))
             self.send_header("content-type", "application/json")
+            if mode == "429":
+                self.send_header("retry-after", "17")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -244,6 +246,26 @@ before_local=$(n_local)
 st=$(post "$LIGHT")
 assert_eq "$st" 400 "上游 400 原样透传"
 assert_eq "$(n_local)" "$before_local" "local 未被兜底调用"
+echo 200 > "$MODE_CLOUD"
+
+# ---------- 5b. 单路由 429：错误体 + Retry-After 透传 ----------
+sect "5b. 单路由 429：上游错误原因直达客户端（不再裸 429）"
+"$XFADE_BIN" proxy use cld >/dev/null   # 单路由：429 后无兜底，直接暴露最终响应
+echo 429 > "$MODE_CLOUD"
+st=$(curl -s -D "$WORK/resp.headers" -o "$WORK/resp.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer client-token' \
+  -d "$LIGHT" "http://127.0.0.1:$PORT_PROXY/v1/chat/completions")
+assert_eq "$st" 429 "客户端收到 429"
+if grep -q 'sink injected 429' "$WORK/resp.json"; then
+  ok "上游错误体保留（budget/原因可见）"
+else
+  bad "错误体被丢弃: $(cat "$WORK/resp.json")"
+fi
+if grep -qi '^retry-after: 17' "$WORK/resp.headers"; then
+  ok "Retry-After 头透传"
+else
+  bad "Retry-After 头缺失"
+fi
 echo 200 > "$MODE_CLOUD"
 
 # ---------- 6. passthrough model 改写 ----------

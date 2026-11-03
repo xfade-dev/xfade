@@ -2,6 +2,16 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.9.1 — 2026-11-03
+
+### Fixes
+- **fix(proxy)**: the final failover response now preserves the upstream error body and `Retry-After` header instead of returning a bare status — a 429 like `budget_exceeded` finally reaches the client, so tools no longer look "hung" while blindly retrying an exhausted key (`forward.rs`).
+- **fix(core)**: keyring reads run on a worker thread with a slow-read hint — if macOS is waiting on a Keychain authorization dialog (common right after a self-update re-signs the binary), the CLI says so after 3s instead of hanging silently. Reads are never aborted, so a slow read can't be misreported as a missing key (`secrets.rs`).
+- **fix(self-update)**: the new binary is staged in the same directory and atomically renamed into place (no truncate-in-place window), and a symlinked install (e.g. `/usr/local/bin/xfade` → dev `target/release/xfade`) replaces the link itself rather than writing through to the link target.
+
+### Testing
+- **test**: `v2-test.sh` gains a single-route 429 case asserting the error body and `Retry-After` reach the client.
+
 ## v0.9.0 — 2026-10-29
 
 ### New

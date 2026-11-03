@@ -47,6 +47,34 @@ impl KeyringStore {
     }
 }
 
+/// Read a password on a worker thread so a slow keychain read (macOS waiting
+/// on an authorization prompt) can tell the user where to look instead of
+/// hanging silently. The read is never aborted — a slow read must not be
+/// misreported as a missing key.
+fn get_password_with_hint(entry: keyring::Entry, key_ref: &str) -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(entry.get_password());
+    });
+    let result = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "xfade: waiting on the OS keychain for '{key_ref}' — \
+                 if an authorization dialog is showing, please allow it"
+            );
+            rx.recv().expect("keyring worker disconnected")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            unreachable!("keyring worker disconnected before sending")
+        }
+    };
+    result.map_err(|e| match e {
+        keyring::Error::NoEntry => CoreError::SecretNotFound(key_ref.to_string()),
+        other => CoreError::Keyring(other.to_string()),
+    })
+}
+
 impl Default for KeyringStore {
     fn default() -> Self {
         Self::new()
@@ -61,10 +89,7 @@ impl SecretStore for KeyringStore {
     }
 
     fn get(&self, key_ref: &str) -> Result<String> {
-        self.entry(key_ref)?.get_password().map_err(|e| match e {
-            keyring::Error::NoEntry => CoreError::SecretNotFound(key_ref.to_string()),
-            other => CoreError::Keyring(other.to_string()),
-        })
+        get_password_with_hint(self.entry(key_ref)?, key_ref)
     }
 
     fn delete(&self, key_ref: &str) -> Result<()> {
@@ -82,16 +107,18 @@ impl SecretStore for KeyringStore {
     fn migrate_key(&self, from: &str, to: &str) -> Result<bool> {
         let legacy = keyring::Entry::new(LEGACY_SERVICE, from)
             .map_err(|e| CoreError::Keyring(e.to_string()))?;
-        match legacy.get_password() {
+        match get_password_with_hint(legacy, from) {
             Ok(secret) => {
                 self.set(to, &secret)?;
+                let legacy = keyring::Entry::new(LEGACY_SERVICE, from)
+                    .map_err(|e| CoreError::Keyring(e.to_string()))?;
                 match legacy.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => Ok(true),
                     Err(e) => Err(CoreError::Keyring(e.to_string())),
                 }
             }
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(e) => Err(CoreError::Keyring(e.to_string())),
+            Err(CoreError::SecretNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 }

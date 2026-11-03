@@ -722,7 +722,7 @@ async fn failover_loop(
     req_model: &str,
     start: Instant,
 ) -> Response {
-    let mut last_err: Option<(StatusCode, String)> = None;
+    let mut last_err: Option<(StatusCode, String, Option<axum::http::HeaderValue>)> = None;
     // Per-route body preparation is memoized by model override: adjacent
     // entries in a tier usually share the same override (static routing is
     // all-None), so failover retries must not re-run the full conversion.
@@ -818,7 +818,11 @@ async fn failover_loop(
                     .await;
                 }
                 if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    let _resp = handle_upstream_error(
+                    let retry_after = resp
+                        .headers()
+                        .get(axum::http::header::RETRY_AFTER)
+                        .cloned();
+                    let err_resp = handle_upstream_error(
                         svc,
                         session_id,
                         route_id,
@@ -829,7 +833,15 @@ async fn failover_loop(
                         start,
                     )
                     .await;
-                    last_err = Some((status, String::new()));
+                    // Preserve the upstream error body (e.g. 429 budget_exceeded)
+                    // so the client sees the real reason instead of a bare status
+                    // it can only retry blindly.
+                    let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await
+                    {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(_) => String::new(),
+                    };
+                    last_err = Some((status, text, retry_after));
                     continue;
                 }
                 // Other 4xx: passthrough, stop failover.
@@ -860,7 +872,7 @@ async fn failover_loop(
                     Some(e.clone()),
                 );
                 svc.record_failure(route_id);
-                last_err = Some((StatusCode::BAD_GATEWAY, e));
+                last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                 continue;
             }
         }
@@ -869,10 +881,13 @@ async fn failover_loop(
     session_failed(svc, session_id);
 
     match last_err {
-        Some((status, text)) => Response::builder()
-            .status(status)
-            .body(text.into())
-            .unwrap(),
+        Some((status, text, retry_after)) => {
+            let mut builder = Response::builder().status(status);
+            if let Some(v) = retry_after {
+                builder = builder.header(axum::http::header::RETRY_AFTER, v);
+            }
+            builder.body(text.into()).unwrap()
+        }
         None => Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body("no usable provider".into())
