@@ -207,9 +207,14 @@ enum ProxyCmd {
     /// Set proxy routes (primary → fallback, in argument order)
     Use {
         names: Vec<String>,
-        /// Override the upstream model field (passthrough the client's model when omitted)
+        /// Override the upstream model field (global fallback; passthrough the client's model when omitted)
         #[arg(long)]
         model: Option<String>,
+        /// Per-provider model override, repeatable: --route-model <id>=<model>.
+        /// Overrides --model for that provider; essential when upstreams have
+        /// disjoint model catalogs.
+        #[arg(long = "route-model", value_parser = parse_kv)]
+        route_models: Vec<(String, String)>,
         /// Target protocol: chat (OpenAI-compatible) or messages (Anthropic native passthrough)
         #[arg(long, value_parser = ["chat", "messages"], default_value = "chat")]
         target: String,
@@ -220,6 +225,13 @@ enum ProxyCmd {
     Clear,
     /// Toggle the Smart Fader (intent-aware local/cloud tiered routing)
     Smart {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Toggle failover on qualifying 4xx responses (401/403 and narrow 400 model-rejection).
+    /// Default off; 429/5xx/transport errors always fail over.
+    #[command(name = "failover-4xx")]
+    Failover4xx {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
@@ -267,6 +279,39 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected key=value, got {s}"))
+}
+
+/// Validate and collect repeatable `--route-model <id>=<model>` values.
+/// An id must be one of the configured route names; ids cannot repeat and
+/// neither side may be empty.
+fn build_route_models(
+    names: &[String],
+    raw: &[(String, String)],
+) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+    let known: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut out = std::collections::BTreeMap::new();
+    for (id, model) in raw {
+        if id.is_empty() || model.is_empty() {
+            return Err(CoreError::ConfigParse {
+                path: "route-model".into(),
+                msg: format!("expected <id>=<model> with non-empty parts, got {id:?}={model:?}"),
+            });
+        }
+        if !known.contains(id.as_str()) {
+            return Err(CoreError::ConfigParse {
+                path: "route-model".into(),
+                msg: format!("unknown provider id '{id}' (must be one of the route names)"),
+            });
+        }
+        if out.contains_key(id) {
+            return Err(CoreError::ConfigParse {
+                path: "route-model".into(),
+                msg: format!("duplicate --route-model for provider '{id}'"),
+            });
+        }
+        out.insert(id.clone(), model.clone());
+    }
+    Ok(out)
 }
 
 /// --set value: use JSON when it parses (objects/arrays/numbers/booleans), otherwise treat as a string
@@ -705,6 +750,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             ProxyCmd::Use {
                 names,
                 model,
+                route_models,
                 target,
             } => {
                 if names.is_empty() {
@@ -724,8 +770,14 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         )));
                     }
                 }
+                let route_model_map = build_route_models(&names, &route_models)?;
                 let prev = core.db().get_routes().ok().flatten();
-                core.db().set_routes(&names, model.as_deref(), &target)?;
+                core.db().set_routes_with_models(
+                    &names,
+                    model.as_deref(),
+                    &target,
+                    &route_model_map,
+                )?;
                 // Session timeline: mid-flight model switches land here
                 // (`proxy use --model`), not in `xfade use` — the gateway picks
                 // them up on the very next request without a client restart.
@@ -753,6 +805,9 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 match model.as_deref() {
                     Some(m) => println!("model: {m}"),
                     None => println!("model: (passthrough)"),
+                }
+                for (id, m) in &route_model_map {
+                    println!("route model: {id} = {m}");
                 }
                 println!("target: {target}");
                 Ok(())
@@ -783,6 +838,21 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     "off"
                 };
                 println!("smart fader: {smart}");
+                let route_models = core.db().get_route_models()?;
+                if route_models.is_empty() {
+                    println!("route models: (none)");
+                } else {
+                    println!("route models:");
+                    for (id, m) in &route_models {
+                        println!("  {id} = {m}");
+                    }
+                }
+                let failover_4xx = if core.db().get_failover_4xx()? {
+                    "on"
+                } else {
+                    "off"
+                };
+                println!("failover 4xx: {failover_4xx}");
                 if let Some((root, map_json)) = core.db().latest_repo_map()? {
                     let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
                     let lang = v["lang"].as_str().unwrap_or("?");
@@ -806,6 +876,17 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     println!("smart fader: on — light intents (error triage, tests, checks, small refactors) go local-first; heavy intents (big refactors, architecture) go cloud-first");
                 } else {
                     println!("smart fader: off — static route order");
+                }
+                Ok(())
+            }
+            ProxyCmd::Failover4xx { state } => {
+                let core = build_core()?;
+                let on = state == "on";
+                core.db().set_failover_4xx(on)?;
+                if on {
+                    println!("failover 4xx: on — qualifying 401/403 and model-rejection 400 responses trigger failover");
+                } else {
+                    println!("failover 4xx: off — only 429/5xx/transport errors trigger failover");
                 }
                 Ok(())
             }
@@ -1523,6 +1604,58 @@ fn print_table(list: &[Provider]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn build_route_models_collects_valid_entries() {
+        let out = build_route_models(
+            &names(&["freebuff", "omni"]),
+            &kv(&[
+                ("freebuff", "z-ai/glm-5.3-flash"),
+                ("omni", "auto/best-fast"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out["freebuff"], "z-ai/glm-5.3-flash");
+        assert_eq!(out["omni"], "auto/best-fast");
+    }
+
+    #[test]
+    fn build_route_models_empty_raw_is_empty_map() {
+        assert!(build_route_models(&names(&["yy"]), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_route_models_rejects_unknown_id() {
+        let err = build_route_models(&names(&["yy"]), &kv(&[("ghost", "m")])).unwrap_err();
+        assert!(err.to_string().contains("unknown provider id"), "{err}");
+    }
+
+    #[test]
+    fn build_route_models_rejects_duplicate_id() {
+        let err =
+            build_route_models(&names(&["yy"]), &kv(&[("yy", "m1"), ("yy", "m2")])).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn build_route_models_rejects_empty_parts() {
+        let err = build_route_models(&names(&["yy"]), &kv(&[("yy", "")])).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
+        let err = build_route_models(&names(&["yy"]), &kv(&[("", "m")])).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
+    }
 
     fn prov(id: &str, model: Option<&str>) -> Provider {
         let mut p = Provider::new(id, ToolKind::ClaudeCode, Some("https://gw".into()));

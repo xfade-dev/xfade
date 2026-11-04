@@ -46,8 +46,8 @@ xfade add kimi --tool codex --base-url https://api.moonshot.cn/v1 --key sk-xxx
 # 2. Switch to it (writes ~/.codex/config.toml + auth.json, auto-backs-up the old config)
 xfade use kimi --tool codex
 
-# 3. Show the current provider
-xfade current --tool codex
+# 3. Show the current provider for each tool
+xfade current
 ```
 
 Tip: run bare `xfade` to open the interactive TUI and switch providers with arrow keys / fader.
@@ -131,7 +131,7 @@ xfade use <id> --tool <t>
 xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected (claude / aider / codex / opencode)
 xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
                                         # instant launch: claude/aider/codex/opencode work; other tools point at `use`
-xfade current --tool <t>
+xfade current
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
 xfade presets                     # list built-in presets for all tools
@@ -148,10 +148,11 @@ xfade self-update                  # update to the latest GitHub release
 
 ```bash
 xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # run in foreground
-xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
+xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status
 xfade proxy clear
 xfade proxy smart on|off              # Smart Fader toggle (off by default)
+xfade proxy failover-4xx on|off       # 4xx failover toggle (off by default)
 xfade stats [--by provider|model|session]   # aggregate request stats
 ```
 

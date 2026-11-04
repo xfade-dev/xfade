@@ -1,6 +1,7 @@
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
 use rusqlite::{params, Connection};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 use time::format_description::well_known::Rfc3339;
@@ -223,6 +224,15 @@ impl Database {
                 [],
             )?;
         }
+        if !existing_cols.contains("route_models") {
+            conn.execute("ALTER TABLE proxy_state ADD COLUMN route_models TEXT", [])?;
+        }
+        if !existing_cols.contains("failover_4xx") {
+            conn.execute(
+                "ALTER TABLE proxy_state ADD COLUMN failover_4xx INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // Same pattern for request_logs: pre-tool-column databases get a
         // default of '' (those rows only show up in unfiltered stats views).
         let mut stmt = conn.prepare("PRAGMA table_info(request_logs)")?;
@@ -386,6 +396,47 @@ impl Database {
         Ok(())
     }
 
+    /// Set proxy routes together with a per-provider model map
+    /// (`--route-model id=model`). Kept separate from `set_routes` so the
+    /// legacy three-arg writer (GUI + tests) never touches the new columns:
+    /// its column-scoped `ON CONFLICT` upsert leaves `route_models` and
+    /// `failover_4xx` intact. This writer's conflict clause likewise avoids
+    /// `smart_enabled` / `failover_4xx`, so `proxy use` does not reset those
+    /// independent toggles.
+    pub fn set_routes_with_models(
+        &self,
+        routes: &[String],
+        model_override: Option<&str>,
+        target_protocol: &str,
+        route_models: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
+        self.conn().execute(
+            "INSERT INTO proxy_state (id, routes, model_override, target_protocol, route_models, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET
+                routes = excluded.routes,
+                model_override = excluded.model_override,
+                target_protocol = excluded.target_protocol,
+                route_models = excluded.route_models,
+                updated_at = excluded.updated_at",
+            params![
+                serde_json::to_string(routes)?,
+                model_override,
+                target_protocol,
+                serde_json::to_string(route_models)?,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Read proxy routes and associated config; returns None if not set.
     /// An empty route set (post-`clear_routes`) also reads as None: "no
     /// usable routes" is a single representation for all consumers.
@@ -423,9 +474,61 @@ impl Database {
                 })?;
         self.conn().execute(
             "UPDATE proxy_state
-             SET routes = '[]', model_override = NULL, updated_at = ?1
+             SET routes = '[]', model_override = NULL, route_models = '{}', updated_at = ?1
              WHERE id = 1",
             params![now],
+        )?;
+        Ok(())
+    }
+
+    /// Per-provider model overrides (`--route-model id=model`). NULL/empty/
+    /// malformed JSON reads as an empty map (pre-migration rows included).
+    pub fn get_route_models(&self) -> Result<BTreeMap<String, String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT route_models FROM proxy_state WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => {
+                let s: Option<String> = row.get(0)?;
+                Ok(match s {
+                    Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+                    _ => BTreeMap::new(),
+                })
+            }
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Whether qualifying 4xx responses should trigger failover. Default off.
+    /// Read on every request so `xfade proxy failover-4xx on/off` takes
+    /// effect on a running daemon immediately.
+    pub fn get_failover_4xx(&self) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT failover_4xx FROM proxy_state WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, i64>(0)? != 0),
+            None => Ok(false),
+        }
+    }
+
+    pub fn set_failover_4xx(&self, on: bool) -> Result<()> {
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
+        // Full upsert: proxy_state has NOT NULL columns without defaults
+        // (routes, updated_at), so a partial INSERT OR IGNORE would be
+        // silently swallowed by the conflict clause. The conflict clause
+        // only updates failover_4xx, leaving routes + other toggles intact.
+        self.conn().execute(
+            "INSERT INTO proxy_state (id, routes, model_override, target_protocol, updated_at, failover_4xx)
+             VALUES (1, '[]', NULL, 'chat', ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET failover_4xx = excluded.failover_4xx",
+            params![now, on as i64],
         )?;
         Ok(())
     }
@@ -936,6 +1039,118 @@ mod tests {
     }
 
     #[test]
+    fn set_routes_with_models_roundtrips() {
+        let db = Database::open_memory().unwrap();
+        let mut models = BTreeMap::new();
+        models.insert("freebuff".to_string(), "z-ai/glm-5.3-flash".to_string());
+        models.insert("omni".to_string(), "auto/best-fast".to_string());
+        db.set_routes_with_models(
+            &["freebuff".into(), "omni".into()],
+            Some("global-fallback"),
+            "chat",
+            &models,
+        )
+        .unwrap();
+
+        let (routes, model_override, target_protocol) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["freebuff".to_string(), "omni".to_string()]);
+        assert_eq!(model_override.as_deref(), Some("global-fallback"));
+        assert_eq!(target_protocol, "chat");
+        assert_eq!(db.get_route_models().unwrap(), models);
+    }
+
+    #[test]
+    fn get_route_models_defaults_to_empty_map() {
+        let db = Database::open_memory().unwrap();
+        assert!(db.get_route_models().unwrap().is_empty());
+        // Legacy set_routes never writes the column → still empty.
+        db.set_routes(&["yy".into()], None, "chat").unwrap();
+        assert!(db.get_route_models().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_set_routes_preserves_new_columns() {
+        // GUI + test callers use the three-arg set_routes. Its column-scoped
+        // upsert must not wipe a CLI-configured model map or the 4xx toggle.
+        let db = Database::open_memory().unwrap();
+        let mut models = BTreeMap::new();
+        models.insert("omni".to_string(), "auto/best-fast".to_string());
+        db.set_routes_with_models(&["omni".into()], None, "chat", &models)
+            .unwrap();
+        db.set_failover_4xx(true).unwrap();
+        db.set_smart_enabled(true).unwrap();
+
+        db.set_routes(&["omni".into(), "bak".into()], None, "chat")
+            .unwrap();
+
+        assert_eq!(db.get_route_models().unwrap(), models);
+        assert!(db.get_failover_4xx().unwrap());
+        assert!(db.smart_enabled().unwrap());
+        let (routes, _, _) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["omni".to_string(), "bak".to_string()]);
+    }
+
+    #[test]
+    fn set_failover_4xx_defaults_off_and_roundtrips() {
+        let db = Database::open_memory().unwrap();
+        assert!(!db.get_failover_4xx().unwrap());
+        db.set_failover_4xx(true).unwrap();
+        assert!(db.get_failover_4xx().unwrap());
+        db.set_failover_4xx(false).unwrap();
+        assert!(!db.get_failover_4xx().unwrap());
+    }
+
+    #[test]
+    fn failover_4xx_toggle_keeps_routes_and_models() {
+        let db = Database::open_memory().unwrap();
+        let mut models = BTreeMap::new();
+        models.insert("omni".to_string(), "auto/best-fast".to_string());
+        db.set_routes_with_models(&["omni".into()], None, "chat", &models)
+            .unwrap();
+
+        db.set_failover_4xx(true).unwrap();
+
+        let (routes, _, _) = db.get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec!["omni".to_string()]);
+        assert_eq!(db.get_route_models().unwrap(), models);
+        assert!(db.get_failover_4xx().unwrap());
+    }
+
+    #[test]
+    fn clear_routes_resets_models_but_keeps_toggles() {
+        let db = Database::open_memory().unwrap();
+        let mut models = BTreeMap::new();
+        models.insert("omni".to_string(), "auto/best-fast".to_string());
+        db.set_routes_with_models(&["omni".into()], None, "chat", &models)
+            .unwrap();
+        db.set_failover_4xx(true).unwrap();
+        db.set_smart_enabled(true).unwrap();
+
+        db.clear_routes().unwrap();
+
+        assert!(db.get_route_models().unwrap().is_empty());
+        // Independent toggles survive a route clear.
+        assert!(db.get_failover_4xx().unwrap());
+        assert!(db.smart_enabled().unwrap());
+        assert!(db.get_routes().unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_use_does_not_reset_toggles() {
+        // `xfade proxy use` goes through set_routes_with_models; it must not
+        // flip the Smart Fader or the 4xx failover switch.
+        let db = Database::open_memory().unwrap();
+        db.set_smart_enabled(true).unwrap();
+        db.set_failover_4xx(true).unwrap();
+
+        db.set_routes_with_models(&["yy".into()], None, "chat", &BTreeMap::new())
+            .unwrap();
+
+        assert!(db.smart_enabled().unwrap());
+        assert!(db.get_failover_4xx().unwrap());
+    }
+
+    #[test]
     fn repo_maps_upsert_and_get() {
         let db = Database::open_memory().unwrap();
         assert!(db.get_repo_map("/proj").unwrap().is_none());
@@ -1100,6 +1315,9 @@ mod tests {
         // Migration defaults: model_override None, target_protocol 'chat'
         assert_eq!(model_override, None);
         assert_eq!(target_protocol, "chat");
+        // The two new columns also get safe defaults on a pre-existing row.
+        assert!(db.get_route_models().unwrap().is_empty());
+        assert!(!db.get_failover_4xx().unwrap());
         // And we can update with new values
         db.set_routes(&["yy".into()], Some("gpt-5.6-luna"), "messages")
             .unwrap();

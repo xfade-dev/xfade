@@ -2,6 +2,24 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.10.0 — 2026-11-04
+
+### New
+- **feat(proxy)**: per-provider model overrides — `xfade proxy use a b --route-model a=<model> --route-model b=<model>` (repeatable). Each route resolves its own model *after* the router plans, so upstreams with disjoint model catalogs (a local gateway vs. a cloud router) can finally share one route list; `--model` stays the global fallback. Stored in a new `route_models` column and resolved by `resolve_model_for`; `clear_routes` resets it. The failover loop already keyed its prepared bodies on `RouteEntry.model_override`, so each upstream gets its own rewritten body with no cache redesign.
+- **feat(proxy)**: configurable 4xx failover — `xfade proxy failover-4xx on|off` (off by default). Only narrow cases qualify: `401`/`403`, and `400` model-rejection responses (`model_not_allowed`, "model … not in / not allowed / not found"). Transport errors, `429` and `5xx` always fail over; generic `400`/`404`/`422` still pass straight through to the client, so a bad request is never mistaken for a dead upstream.
+- **feat(cli)**: `xfade proxy status` now prints the per-route model map and the `failover 4xx` state.
+
+### Fixes
+- **fix(proxy)**: Anthropic `/v1/messages` streaming emitted `message_start` twice when the first upstream chunk was empty — `phase == Initial` was the guard, but an empty chunk never leaves `Initial`. A dedicated `StreamState.started` flag now guards the event; `Phase::Initial` is kept only for lazy content-block opening.
+- **fix(cli)**: the new subcommand is explicitly named `failover-4xx` (clap would otherwise derive `failover4xx` from the `Failover4xx` variant).
+- **docs**: removed non-existent flags/examples across both READMEs and `docs/` — `--routes a,b`, `--model-override`, `--target-protocol`, `xfade current --tool <t>`, `xfade serve --foreground`, comma-separated route names. `docs/api.md` gains a per-provider model / 4xx failover section.
+
+### Compatibility
+- DB migration adds `route_models` and `failover_4xx` via guarded `ALTER TABLE`. The legacy `set_routes` path (used by the GUI) performs a column-scoped UPSERT, so GUI saves do not wipe CLI-configured values — no GUI changes needed. Both toggles survive `clear_routes`.
+
+### Testing
+- **test**: `cargo fmt --all`, `cargo clippy --all-targets --workspace -- -D warnings`, and `cargo test --workspace` are clean — 384 passed. New coverage: DB migration round-trips and legacy-UPSERT preservation, `resolve_model_for` fallbacks, 4xx qualification boundaries, per-route model delivery to each upstream, and the duplicate-`message_start` regression.
+
 ## v0.9.1 — 2026-11-03
 
 ### Fixes

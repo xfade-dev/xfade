@@ -7,7 +7,7 @@ This guide demonstrates adding a third-party provider, switching, and the option
 ```bash
 xfade add <id> --tool <tool> --base-url <url> --key <key> [--set '<extra json>']
 xfade use <id> --tool <tool>
-xfade current --tool <tool>
+xfade current
 ```
 
 `<tool>` ∈ `claude-code | codex | open-code | pi | oh-my-pi | aider`. The original config is auto-backed-up before switching (`xfade backup ls --tool <tool>` to view/restore).
@@ -108,7 +108,7 @@ xfade serve install --port 24860        # macOS resident daemon
 # or foreground: xfade serve --port 24860
 
 # 2. Configure routes (primary→fallback)
-xfade proxy use --routes yy,bak --model-override gpt-5.6-luna --target-protocol chat
+xfade proxy use yy bak --model gpt-5.6-luna --target chat
 
 # 3. Point the tool at the local proxy (Codex as an example)
 xfade add local-proxy --tool codex --base-url http://127.0.0.1:24860/v1 --key any

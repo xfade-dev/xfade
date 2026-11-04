@@ -21,12 +21,12 @@ hot-switch the underlying provider without restarting Cursor.
 ## 2. Hot-switch the upstream
 
 ```bash
-xfade proxy use kimi,bak --target-protocol chat     # primary → fallback, no restart
+xfade proxy use kimi bak --target chat     # primary → fallback, no restart
 xfade proxy status
 curl http://127.0.0.1:24860/__xfade/status          # routes + circuit status
 ```
 
-Routes are re-read on every request, so the switch is immediate. `--target-protocol chat`
+Routes are re-read on every request, so the switch is immediate. `--target chat`
 keeps the OpenAI wire format Cursor already speaks; `messages` targets Anthropic-native
 upstreams (the proxy translates in both directions).
 

@@ -268,6 +268,11 @@ struct ResolvedRoutes<'a> {
     model_override: Option<String>,
     target_protocol: String,
     provider_map: std::collections::HashMap<String, &'a crate::models::Provider>,
+    /// Per-provider model overrides (`--route-model id=model`); empty when
+    /// only the global `--model` fallback is configured.
+    route_models: std::collections::BTreeMap<String, String>,
+    /// Whether qualifying 4xx responses should trigger failover.
+    failover_4xx: bool,
 }
 
 /// Prepared request bodies for both paths (result of `prepare_bodies`).
@@ -295,11 +300,18 @@ fn resolve_routes<'a>(
     };
     let provider_map: std::collections::HashMap<String, &crate::models::Provider> =
         providers.iter().map(|p| (p.id.clone(), p)).collect();
+    // These two are independent config toggles read per request (same
+    // pattern as `smart_enabled()` via `active_router()`), so CLI changes
+    // take effect on a running daemon immediately.
+    let route_models = svc.core.db().get_route_models().unwrap_or_default();
+    let failover_4xx = svc.core.db().get_failover_4xx().unwrap_or(false);
     Ok(ResolvedRoutes {
         routes,
         model_override,
         target_protocol,
         provider_map,
+        route_models,
+        failover_4xx,
     })
 }
 
@@ -637,9 +649,37 @@ async fn handle_success_non_streaming(
         .unwrap()
 }
 
-/// Handle an upstream error response (5xx, 429, or connection failure).
-/// Returns the response to send (either pass-through for 4xx, or signal
-/// for failover continuation).
+/// Whether a 4xx response is a *transient* upstream problem worth failing
+/// over on — deliberately narrow, so a bad request from the client (400
+/// validation, 404, 422…) is still returned immediately instead of being
+/// retried against every fallback with the same broken payload.
+///
+/// Qualifying:
+/// - 401 / 403: a key/permission problem that may be specific to one
+///   upstream (e.g. "No active credentials for provider").
+/// - 400 only when it looks like a model-rejection from the gateway
+///   (`model_not_allowed` / "model … not in/not allowed/not found"), which
+///   is exactly the heterogeneous-upstream case `--route-model` addresses.
+fn qualifies_for_4xx_failover(status: StatusCode, body: &[u8]) -> bool {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => true,
+        StatusCode::BAD_REQUEST => {
+            let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+            text.contains("model_not_allowed")
+                || (text.contains("model")
+                    && (text.contains("not allowed")
+                        || text.contains("not in")
+                        || text.contains("not found")))
+        }
+        _ => false,
+    }
+}
+
+/// Handle an upstream error response. Returns `(response, should_continue)`:
+/// `should_continue` is true when the failover loop should try the next
+/// route (429/5xx always; a qualifying 4xx only when `failover_4xx` is on).
+/// A continuing route is also recorded as a circuit-breaker failure; a
+/// passthrough 4xx is not.
 async fn handle_upstream_error(
     svc: &ProxyService,
     session_id: Option<&str>,
@@ -649,34 +689,9 @@ async fn handle_upstream_error(
     endpoint: &str,
     model: &Option<String>,
     start: Instant,
-) -> Response {
+    failover_4xx: bool,
+) -> (Response, bool) {
     let status = resp.status();
-
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        let bytes = resp.bytes().await.unwrap_or_default();
-        let duration_ms = start.elapsed().as_millis() as i64;
-        let usage = Usage::from_json(&bytes);
-        log_request(
-            svc,
-            session_id,
-            endpoint,
-            model,
-            route_id,
-            tool,
-            status.as_u16() as i64,
-            usage,
-            duration_ms,
-            None,
-        );
-        svc.record_failure(route_id);
-        // Signal caller to continue failover via the error variant.
-        return Response::builder()
-            .status(status)
-            .body(String::from_utf8_lossy(&bytes).to_string().into())
-            .unwrap();
-    }
-
-    // Other 4xx: passthrough, no failover, no circuit breaker.
     let bytes = resp.bytes().await.unwrap_or_default();
     let duration_ms = start.elapsed().as_millis() as i64;
     let usage = Usage::from_json(&bytes);
@@ -692,10 +707,20 @@ async fn handle_upstream_error(
         duration_ms,
         None,
     );
-    Response::builder()
+
+    let should_continue = status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (failover_4xx && qualifies_for_4xx_failover(status, &bytes));
+
+    if should_continue {
+        svc.record_failure(route_id);
+    }
+
+    let response = Response::builder()
         .status(status)
         .body(Body::from(bytes))
-        .unwrap()
+        .unwrap();
+    (response, should_continue)
 }
 
 /// Fold a pipeline-level failure (no routes, bad conversion, all routes
@@ -721,6 +746,7 @@ async fn failover_loop(
     original_body: &[u8],
     req_model: &str,
     start: Instant,
+    failover_4xx: bool,
 ) -> Response {
     let mut last_err: Option<(StatusCode, String, Option<axum::http::HeaderValue>)> = None;
     // Per-route body preparation is memoized by model override: adjacent
@@ -817,35 +843,8 @@ async fn failover_loop(
                     )
                     .await;
                 }
-                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    let retry_after = resp
-                        .headers()
-                        .get(axum::http::header::RETRY_AFTER)
-                        .cloned();
-                    let err_resp = handle_upstream_error(
-                        svc,
-                        session_id,
-                        route_id,
-                        provider.tool.as_str(),
-                        resp,
-                        endpoint,
-                        &model,
-                        start,
-                    )
-                    .await;
-                    // Preserve the upstream error body (e.g. 429 budget_exceeded)
-                    // so the client sees the real reason instead of a bare status
-                    // it can only retry blindly.
-                    let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await
-                    {
-                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                        Err(_) => String::new(),
-                    };
-                    last_err = Some((status, text, retry_after));
-                    continue;
-                }
-                // Other 4xx: passthrough, stop failover.
-                return handle_upstream_error(
+                let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+                let (err_resp, should_continue) = handle_upstream_error(
                     svc,
                     session_id,
                     route_id,
@@ -854,8 +853,22 @@ async fn failover_loop(
                     endpoint,
                     &model,
                     start,
+                    failover_4xx,
                 )
                 .await;
+                if should_continue {
+                    // Preserve the upstream error body (e.g. 429 budget_exceeded)
+                    // so the client sees the real reason instead of a bare status
+                    // it can only retry blindly.
+                    let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
+                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                        Err(_) => String::new(),
+                    };
+                    last_err = Some((status, text, retry_after));
+                    continue;
+                }
+                // Non-qualifying 4xx: passthrough, stop failover.
+                return err_resp;
             }
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
@@ -916,6 +929,8 @@ async fn forward_with_failover(
         model_override,
         target_protocol,
         provider_map,
+        route_models,
+        failover_4xx,
     } = match resolve_routes(svc, &providers) {
         Ok(r) => r,
         Err(resp) => {
@@ -946,7 +961,7 @@ async fn forward_with_failover(
         model: model.as_deref(),
         prompt: &prompt_text,
     };
-    let plan = router.plan(
+    let mut plan = router.plan(
         &classify_ctx,
         &route_providers,
         model_override.as_deref(),
@@ -959,6 +974,20 @@ async fn forward_with_failover(
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body("no usable provider".into())
             .unwrap();
+    }
+
+    // Stage 2b: resolve each route's effective model override. The router
+    // plans with the single global override; here a per-provider entry
+    // (`--route-model id=model`) takes precedence, falling back to the
+    // global. `failover_loop` already caches prepared bodies keyed by each
+    // entry's model_override, so heterogeneous upstreams each get their own
+    // correctly rewritten request body.
+    for entry in &mut plan.entries {
+        entry.model_override = crate::router::decision::resolve_model_for(
+            &entry.route_id,
+            &route_models,
+            model_override.as_deref(),
+        );
     }
 
     let req_model = model.clone().unwrap_or_default();
@@ -977,6 +1006,7 @@ async fn forward_with_failover(
         body,
         &req_model,
         start,
+        failover_4xx,
     )
     .await
 }
@@ -1307,6 +1337,51 @@ pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap
 mod tests {
     use super::*;
     use futures::{stream, StreamExt};
+
+    #[test]
+    fn qualifies_for_4xx_failover_auth_statuses() {
+        assert!(qualifies_for_4xx_failover(StatusCode::UNAUTHORIZED, b"{}"));
+        assert!(qualifies_for_4xx_failover(StatusCode::FORBIDDEN, b"{}"));
+    }
+
+    #[test]
+    fn qualifies_for_4xx_failover_400_model_rejection_only() {
+        // freebuff-style explicit code.
+        assert!(qualifies_for_4xx_failover(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"code":"model_not_allowed","message":"not allowed"}}"#
+        ));
+        // "not in this proxy's model list" phrasing.
+        assert!(qualifies_for_4xx_failover(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Model 'x' is not in this proxy's model list"}}"#
+        ));
+        // "model not found" phrasing.
+        assert!(qualifies_for_4xx_failover(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"model not found"}}"#
+        ));
+        // Generic 400 validation errors must NOT fail over.
+        assert!(!qualifies_for_4xx_failover(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"invalid temperature"}}"#
+        ));
+        assert!(!qualifies_for_4xx_failover(
+            StatusCode::BAD_REQUEST,
+            b"bad request"
+        ));
+    }
+
+    #[test]
+    fn qualifies_for_4xx_failover_rejects_other_4xx() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::TOO_MANY_REQUESTS, // handled by the always-failover branch
+        ] {
+            assert!(!qualifies_for_4xx_failover(status, b"model not found"));
+        }
+    }
 
     #[test]
     fn prepare_bodies_convert_path_skips_passthrough_transform() {

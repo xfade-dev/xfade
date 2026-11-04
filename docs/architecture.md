@@ -88,11 +88,11 @@ POST /v1/chat/completions
 ```
 xfade serve install
   → cli::daemon::install(home, host, port, token, load=true)
-    → write ~/Library/LaunchAgents/ai.xfade.serve.plist (ProgramArguments=xfade serve --foreground …)
+    → write ~/Library/LaunchAgents/ai.xfade.serve.plist (ProgramArguments=xfade serve …)
     → write $XFADE_DATA_DIR/daemon.json {host,port,auth_token}
     → launchctl unload + load (idempotent)
 
-launchd-managed process = `xfade serve --foreground` → ProxyService::serve (axum)
+launchd-managed process = `xfade serve` → ProxyService::serve (axum)
   GET /__xfade/status → read db routes + in-memory circuits → JSON
 ```
 

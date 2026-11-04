@@ -512,6 +512,11 @@ pub fn response_openai_to_anthropic(body: &[u8], req_model: &str) -> Result<Byte
 #[derive(Debug)]
 struct StreamState {
     phase: Phase,
+    /// Whether `message_start` has already been emitted. Kept separate from
+    /// `phase`: the first chunk may carry only `delta.role` (or empty
+    /// `delta.content`), which leaves the phase at `Initial` but must not
+    /// cause a second `message_start` on the next chunk.
+    started: bool,
     /// Next Anthropic content-block index. Text and tool_use blocks share one
     /// sequential counter — the Anthropic protocol requires unique, increasing
     /// indexes across the whole message (the OpenAI tool-call index is only a
@@ -592,6 +597,7 @@ where
         upstream: Box::pin(upstream),
         conv: StreamState {
             phase: Phase::Initial,
+            started: false,
             next_block: 0,
         },
         pending: std::collections::VecDeque::new(),
@@ -729,10 +735,13 @@ fn process_frames(
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
         let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
 
-        // First chunk → message_start. Text and tool blocks are opened lazily
-        // (on first non-empty content / first tool_call), so an empty text
-        // block is never emitted ahead of a tool_use block.
-        if matches!(state.phase, Phase::Initial) {
+        // message_start is emitted exactly once, guarded by `started` rather
+        // than `phase == Initial`: an empty first chunk (role-only or empty
+        // content) leaves the phase at Initial, and previously caused a
+        // second message_start on the next chunk. Text and tool blocks are
+        // still opened lazily (on first non-empty content / first tool_call),
+        // so an empty text block is never emitted ahead of a tool_use block.
+        if !state.started {
             let id = message_id.clone().unwrap_or_default();
             out.push(sse_event(
                 "message_start",
@@ -750,6 +759,7 @@ fn process_frames(
                     }
                 }),
             ));
+            state.started = true;
         }
 
         // delta.content text → text_delta.
@@ -1535,6 +1545,37 @@ mod tests {
         assert!(s.contains("message_delta"));
         assert!(s.contains("message_stop"));
         assert!(s.contains(r#""output_tokens":2"#));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_message_start_exactly_once() {
+        // Regression for the duplicate `message_start` bug: a role-only frame
+        // and an empty-content frame (in one chunk), followed by a content
+        // chunk, must still emit `message_start` exactly once. Previously the
+        // phase stayed `Initial` across these frames and each one re-emitted
+        // message_start.
+        let first = b"data: {\"id\":\"r1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n";
+        let chunks: Vec<std::io::Result<Bytes>> = vec![
+            Ok(Bytes::from(first.to_vec())),
+            Ok(ok_chunk(br#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
+            Ok(ok_chunk(br#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#)),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let out_bytes = collect_stream(stream_openai_to_anthropic(stream, "m".into())).await;
+        let s = String::from_utf8(out_bytes).unwrap();
+        assert_eq!(
+            s.matches("event: message_start").count(),
+            1,
+            "expected exactly one message_start, got:\n{s}"
+        );
+        assert_eq!(
+            s.matches("event: content_block_start").count(),
+            1,
+            "expected exactly one content_block_start, got:\n{s}"
+        );
+        assert!(s.contains(r#""text":"hi","type":"text_delta""#));
+        assert!(s.contains("event: message_stop"));
     }
 
     #[tokio::test]

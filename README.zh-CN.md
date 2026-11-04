@@ -46,8 +46,8 @@ xfade add kimi --tool codex --base-url https://api.moonshot.cn/v1 --key sk-xxx
 # 2. 切换到它（写入 ~/.codex/config.toml + auth.json，自动备份原配置）
 xfade use kimi --tool codex
 
-# 3. 查看当前
-xfade current --tool codex
+# 3. 查看各工具的当前 provider
+xfade current
 ```
 
 提示：直接运行 `xfade` 打开交互式 TUI，用方向键 / 推子切换 provider。
@@ -127,7 +127,7 @@ xfade use <id> --tool <t>
 xfade run <id> [--tool <t>] [-- <args>]  # 注入一次性启动工具（claude / aider / codex / opencode）
 xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
                                         # 即时启动：claude/aider/codex/opencode 可用；其余工具指引 `use`
-xfade current --tool <t>
+xfade current
 xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
 xfade rm <id> --tool <t>
 xfade presets                     # 列出所有工具的内置预设
@@ -144,10 +144,11 @@ xfade self-update                  # 自更新到最新 GitHub Release
 
 ```bash
 xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # 前台运行
-xfade proxy use --routes yy,bak [--model-override gpt-x] [--target-protocol chat|messages]
+xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status
 xfade proxy clear
 xfade proxy smart on|off              # Smart Fader 开关（默认关闭）
+xfade proxy failover-4xx on|off       # 4xx failover 开关（默认关闭）
 xfade stats [--by provider|model|session]   # 请求统计聚合
 ```
 

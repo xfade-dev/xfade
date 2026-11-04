@@ -69,15 +69,31 @@ xfade serve install [--port --host --auth-token]                          # macO
 xfade serve uninstall | stop                                              # uninstall
 xfade serve status                                                        # query status
 
-xfade proxy use --routes a,b [--model-override M] [--target-protocol chat|messages]
+xfade proxy use a b [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status
 xfade proxy clear
+xfade proxy smart on|off
+xfade proxy failover-4xx on|off
 xfade stats
 ```
 
 `--set '<json>'`: merged into the provider's `extra` field (e.g. Codex's `wire_api`, OpenCode's `models`).
 
 `<tool>` ∈ `claude-code | codex | open-code | pi | oh-my-pi | aider`. The global config (`config.json`) holds the shared defaults (`base_url` / `model` / `api` / `api_key` / `secrets` backend) that a provider inherits when it omits its own value.
+
+## Per-provider model overrides & 4xx failover
+
+`--model M` sets a single global upstream model applied to every route. When providers expose disjoint model catalogs (e.g. a local gateway vs. a cloud router), use repeatable `--route-model <id>=<model>` to pin a model per provider; `--model` stays the fallback for any route without an explicit entry.
+
+```bash
+xfade proxy use freebuff omni \
+  --route-model freebuff=z-ai/glm-5.3-flash \
+  --route-model omni=auto/best-fast \
+  --target chat
+xfade proxy status        # prints the per-route model map
+```
+
+`xfade proxy failover-4xx on|off` (default **off**) additionally fails over on narrow 4xx responses: `401`, `403`, and `400` model-rejection responses (`model_not_allowed`, "model … not in / not allowed / not found"). Transport errors, `429`, and `5xx` always fail over regardless of this toggle; generic `400`/`404`/`422` still pass through to the client.
 
 ## GUI invoke commands
 

@@ -93,6 +93,21 @@ impl Router for DefaultRouter {
     }
 }
 
+/// Resolve the effective model override for one route: a per-provider entry
+/// (`--route-model id=model`) wins, otherwise the global `--model` fallback
+/// applies. A route with neither entry falls back to `None` (passthrough of
+/// the client's model), which is exactly the pre-feature behavior.
+pub fn resolve_model_for(
+    route_id: &str,
+    route_models: &std::collections::BTreeMap<String, String>,
+    global: Option<&str>,
+) -> Option<String> {
+    route_models
+        .get(route_id)
+        .cloned()
+        .or_else(|| global.map(String::from))
+}
+
 /// Determine a provider's tier: explicit `extra.tier` wins; otherwise a
 /// loopback base_url is local, everything else cloud.
 pub fn provider_tier(p: &Provider) -> Tier {
@@ -313,6 +328,44 @@ mod tests {
 
     const LIGHT: &str = "why does this fail to compile?";
     const HEAVY: &str = "restructure the whole proxy module into layers";
+
+    #[test]
+    fn resolve_model_for_prefers_per_route_entry() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("freebuff".to_string(), "z-ai/glm-5.3-flash".to_string());
+        assert_eq!(
+            resolve_model_for("freebuff", &map, Some("global-fallback")),
+            Some("z-ai/glm-5.3-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_falls_back_to_global() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("freebuff".to_string(), "z-ai/glm-5.3-flash".to_string());
+        assert_eq!(
+            resolve_model_for("omni", &map, Some("global-fallback")),
+            Some("global-fallback".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_none_when_no_entry_no_global() {
+        let map = std::collections::BTreeMap::new();
+        assert_eq!(resolve_model_for("omni", &map, None), None);
+    }
+
+    #[test]
+    fn resolve_model_for_empty_map_equals_global_only() {
+        let map = std::collections::BTreeMap::new();
+        // An empty map is the pre-feature configuration: the global value
+        // (or passthrough) is the only source.
+        assert_eq!(
+            resolve_model_for("yy", &map, Some("m-x")),
+            Some("m-x".to_string())
+        );
+        assert_eq!(resolve_model_for("yy", &map, None), None);
+    }
 
     #[test]
     fn routers_advertise_smartness() {

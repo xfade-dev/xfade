@@ -642,6 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_4xx_no_failover() {
+        // Default off: even a qualifying 4xx is passed through unchanged.
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
@@ -654,6 +655,155 @@ mod tests {
         let (status, body) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(status, 403);
         assert!(body.contains("denied"));
+        assert_eq!(up2.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn per_route_models_reach_each_upstream() {
+        // Heterogeneous upstreams: `--route-model` gives each provider its
+        // own valid model. The primary 500 forces failover so both bodies
+        // are observable and must carry different `model` values.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(
+            &dir,
+            &[("freebuff", &up.url(), "k1"), ("omni", &up2.url(), "k2")],
+        );
+        let mut models: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        models.insert("freebuff".into(), "z-ai/glm-5.3-flash".into());
+        models.insert("omni".into(), "auto/best-fast".into());
+        core.db()
+            .set_routes_with_models(&["freebuff".into(), "omni".into()], None, "chat", &models)
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(500, "boom");
+        up2.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"client-model","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            up.last_request()
+                .await
+                .body
+                .contains(r#""model":"z-ai/glm-5.3-flash""#),
+            "primary did not receive its per-route model"
+        );
+        assert!(
+            up2.last_request()
+                .await
+                .body
+                .contains(r#""model":"auto/best-fast""#),
+            "fallback did not receive its per-route model"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_model_overrides_global_fallback() {
+        // A provider with no explicit entry falls back to the global --model.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        let mut models: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        models.insert("yy".into(), "specific-model".into());
+        core.db()
+            .set_routes_with_models(
+                &["yy".into(), "bak".into()],
+                Some("global-fallback"),
+                "chat",
+                &models,
+            )
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(500, "boom");
+        up2.respond_with(200, "{}");
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"client-model","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(up
+            .last_request()
+            .await
+            .body
+            .contains(r#""model":"specific-model""#));
+        assert!(up2
+            .last_request()
+            .await
+            .body
+            .contains(r#""model":"global-fallback""#));
+    }
+
+    #[tokio::test]
+    async fn failover_4xx_on_fails_over_on_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
+        core.db().set_failover_4xx(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(403, r#"{"error":"denied"}"#);
+        up2.respond_with(200, r#"{"usage":{}}"#);
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(up.call_count().await, 1);
+        assert_eq!(up2.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn failover_4xx_on_fails_over_on_model_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
+        core.db().set_failover_4xx(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(
+            400,
+            r#"{"error":{"code":"model_not_allowed","message":"not in model list"}}"#,
+        );
+        up2.respond_with(200, r#"{"usage":{}}"#);
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(up2.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn failover_4xx_on_ignores_non_qualifying_4xx() {
+        // Even with the toggle on, a generic 400/404 is a client error and
+        // must not be retried against every fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1"), ("bak", &up2.url(), "k2")]);
+        core.db()
+            .set_routes(&["yy".into(), "bak".into()], None, "chat")
+            .unwrap();
+        core.db().set_failover_4xx(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(404, "not found");
+        let (status, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(status, 404);
         assert_eq!(up2.call_count().await, 0);
     }
 
