@@ -235,6 +235,13 @@ enum ProxyCmd {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// Aggregate /v1/models across all routes and pin posts by the client-selected model.
+    /// Default off (first-success passthrough).
+    #[command(name = "models-merge")]
+    ModelsMerge {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -853,6 +860,12 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     "off"
                 };
                 println!("failover 4xx: {failover_4xx}");
+                let models_merge = if core.db().models_merge_enabled()? {
+                    "on"
+                } else {
+                    "off"
+                };
+                println!("models merge: {models_merge}");
                 if let Some((root, map_json)) = core.db().latest_repo_map()? {
                     let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
                     let lang = v["lang"].as_str().unwrap_or("?");
@@ -887,6 +900,17 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     println!("failover 4xx: on — qualifying 401/403 and model-rejection 400 responses trigger failover");
                 } else {
                     println!("failover 4xx: off — only 429/5xx/transport errors trigger failover");
+                }
+                Ok(())
+            }
+            ProxyCmd::ModelsMerge { state } => {
+                let core = build_core()?;
+                let on = state == "on";
+                core.db().set_models_merge_enabled(on)?;
+                if on {
+                    println!("models merge: on — /v1/models aggregates all routes; posts are pinned to the provider owning the selected model");
+                } else {
+                    println!("models merge: off — /v1/models is first-success passthrough");
                 }
                 Ok(())
             }
@@ -1614,6 +1638,19 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn models_merge_subcommand_parses_on_off() {
+        // Clap would derive `modelsmerge` without the explicit #[command(name)].
+        for state in ["on", "off"] {
+            Cli::command()
+                .try_get_matches_from(["xfade", "proxy", "models-merge", state])
+                .unwrap_or_else(|e| panic!("models-merge {state} should parse: {e}"));
+        }
+        assert!(Cli::command()
+            .try_get_matches_from(["xfade", "proxy", "models-merge", "maybe"])
+            .is_err());
     }
 
     #[test]

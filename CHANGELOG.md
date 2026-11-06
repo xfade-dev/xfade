@@ -2,6 +2,18 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.10.1 — 2026-11-06
+
+### New
+- **feat(proxy)**: opt-in aggregated `/v1/models` — `xfade proxy models-merge on|off` (off by default). When on, the daemon probes `/v1/models` on every configured route concurrently and merges the catalogs, so AI coding tools can see and select models from all providers. Raw ids stay unchanged when unambiguous; ids exposed by multiple routes are namespaced as `<route_id>/<model>`. A persisted `model → owning route` map pins a later POST to the provider owning the client-selected model and forwards the real upstream model id. Unrecognized/legacy model ids keep the existing `--route-model` / `--model` / Smart Fader behavior. With the toggle off, GET and POST behavior is byte-for-byte unchanged.
+- **feat(cli)**: `xfade proxy status` prints the `models merge` state; `/__xfade/status` exposes `models_merge`.
+
+### Compatibility
+- DB migration adds `models_merge` (toggle) and `model_routes` (JSON map) via guarded `ALTER TABLE`. The legacy three-arg `set_routes` used by the GUI stays column-scoped, so no GUI changes are required. Route writers clear the cached map; all independent toggles survive `proxy use` / `proxy clear`.
+
+### Testing
+- **test**: `cargo fmt --all`, `cargo clippy --all-targets --workspace -- -D warnings`, and `cargo test --workspace` are clean — 405 passed. New coverage: OFF passthrough is byte-for-byte, the zero-success degrade retains the last-known map, and failed catalog probes leave the circuit breaker untouched, alongside the aggregation / namespacing / pinning / degrade integration tests. Internal refactor: a shared `upsert_proxy_state_column` writer and a `Database::model_route_for` lookup.
+
 ## v0.10.0 — 2026-11-04
 
 ### New

@@ -41,7 +41,7 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:24860/__xfade/status
 | POST | `/v1/chat/completions` | OpenAI Chat style |
 | POST | `/v1/responses` | OpenAI Responses style |
 | POST | `/v1/messages` | Anthropic Messages style |
-| GET | `/v1/models` | model-list passthrough |
+| GET | `/v1/models` | model-list passthrough (first success); aggregated across all routes when `models-merge` is on |
 | GET | `/__xfade/status` | admin endpoint (see above) |
 
 `/v1/*` goes through `auth_guard` (if auth_token is set) + route failover + protocol conversion (per `target_protocol`). Streaming responses are SSE-passthrough, with an 8KB tail buffer extracting usage for logging.
@@ -74,6 +74,7 @@ xfade proxy status
 xfade proxy clear
 xfade proxy smart on|off
 xfade proxy failover-4xx on|off
+xfade proxy models-merge on|off
 xfade stats
 ```
 
@@ -94,6 +95,28 @@ xfade proxy status        # prints the per-route model map
 ```
 
 `xfade proxy failover-4xx on|off` (default **off**) additionally fails over on narrow 4xx responses: `401`, `403`, and `400` model-rejection responses (`model_not_allowed`, "model … not in / not allowed / not found"). Transport errors, `429`, and `5xx` always fail over regardless of this toggle; generic `400`/`404`/`422` still pass through to the client.
+
+## Aggregated model catalog (`models-merge`)
+
+By default `GET /v1/models` is a plain failover forward, so a client only ever sees the **first** successful upstream's catalog. When several routes expose disjoint model lists, that hides most of them from AI coding tools.
+
+`xfade proxy models-merge on` (default **off**) changes `/v1/models` into an aggregator: the daemon probes `/v1/models` on every configured route concurrently (5s timeout each, skipping circuit-open providers) and merges the `data[]` arrays into one `{"object":"list","data":[...]}` response.
+
+```bash
+xfade proxy use freebuff omni --target chat
+xfade proxy models-merge on
+xfade proxy status           # prints "models merge: on"
+curl -s http://127.0.0.1:24860/v1/models | jq '.data[].id'
+```
+
+- **Model IDs stay raw** when an id is exposed by only one route (the common case). When two routes expose the *same* id, those entries are exposed as `<route_id>/<model>` (e.g. `omni/gpt-x`) so the id is unambiguous.
+- The daemon persists a `model → owning route` map (rebuilt on each aggregated `/v1/models`). A later POST carrying one of those ids is **pinned to the owning provider first** and the forwarded body uses the real upstream model id (a namespaced id is stripped). All other routes remain as failover with their existing `--route-model` / `--model` overrides.
+- A client model that is **not** in the map (a legacy hardcoded id, or none at all) keeps 100% of the pre-feature behavior: `--route-model` → global `--model` → Smart Fader / static ordering.
+- The toggle and the map are read per request, so `models-merge on|off` and a fresh `GET /v1/models` take effect on a running daemon with no restart. `proxy use` / `proxy clear` invalidate the map; it is rebuilt on the next `/v1/models` call.
+- If **no** upstream returns a usable catalog, `/v1/models` degrades to the original first-success forward rather than returning an empty list. The last-known map is retained.
+- Turning the toggle **off** restores the exact original first-success behavior on both GET and POST.
+
+`xfade proxy status` prints the `models merge` state; `/__xfade/status` exposes it as `models_merge`.
 
 ## GUI invoke commands
 

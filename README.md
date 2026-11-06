@@ -153,6 +153,7 @@ xfade proxy status
 xfade proxy clear
 xfade proxy smart on|off              # Smart Fader toggle (off by default)
 xfade proxy failover-4xx on|off       # 4xx failover toggle (off by default)
+xfade proxy models-merge on|off       # aggregate /v1/models across all routes (off by default)
 xfade stats [--by provider|model|session]   # aggregate request stats
 ```
 
@@ -175,6 +176,12 @@ Details:
 - **Circuit breakers and failover behave exactly as with the fader off**: open circuits are skipped before bucketing, and a failing primary still fails over through the list.
 - Model overrides now also apply on the chat→chat passthrough path (local runtimes): the `model` field is rewritten per route.
 - Project analysis (language fingerprint + git pulse, cached in the `repo_maps` table) surfaces through `xfade project`, a serve-startup prewarm of the cwd, and the latest repo map shown in `xfade proxy status`. Phase-2 classification itself only reads the prompt text.
+
+### Aggregated model catalog (`models-merge`)
+
+Off by default — enable with `xfade proxy models-merge on`. By default `/v1/models` returns only the first successful upstream's catalog, which hides the other routes' models from AI coding tools.
+
+When on, the daemon probes `/v1/models` on every configured route and merges the results into one list, so tools can see and select models from **all** providers. Raw model ids are kept when unambiguous; ids exposed by two or more routes are namespaced as `<route_id>/<model>`. A `model → owning route` map is persisted, so a later request carrying one of those ids is pinned to that provider first (with the real upstream model id), while unrecognized/legacy ids keep the existing `--route-model` / `--model` / Smart Fader behavior. Turning it off restores the exact original first-success behavior. See [docs/api.md](docs/api.md#aggregated-model-catalog-models-merge) for details.
 
 ### daemon (macOS + Linux)
 

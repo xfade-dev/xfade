@@ -149,6 +149,7 @@ xfade proxy status
 xfade proxy clear
 xfade proxy smart on|off              # Smart Fader 开关（默认关闭）
 xfade proxy failover-4xx on|off       # 4xx failover 开关（默认关闭）
+xfade proxy models-merge on|off       # 聚合所有路由的 /v1/models（默认关闭）
 xfade stats [--by provider|model|session]   # 请求统计聚合
 ```
 
@@ -171,6 +172,12 @@ xfade stats [--by provider|model|session]   # 请求统计聚合
 - **熔断与 failover 行为与关闭时完全一致**：熔断项分桶前剔除，主路由失败依旧沿列表回退。
 - model override 现在同样作用于 chat→chat passthrough 路径（本地运行时）：按路由改写 `model` 字段。
 - 项目分析（语言指纹 + git pulse，缓存在 `repo_maps` 表）的消费方：`xfade project` 打印、serve 启动预热 cwd、`xfade proxy status` 展示最新 repo map。阶段2 的分类本身只读 prompt 文本。
+
+### 聚合模型列表（`models-merge`）
+
+默认关闭——`xfade proxy models-merge on` 显式开启。默认 `/v1/models` 只返回第一个成功上游的模型列表，多个路由时 AI coding tools 看不到其它 provider 的模型。
+
+开启后，daemon 并发探测每个已配置路由的 `/v1/models` 并合并成一个列表，工具即可看到并选用**所有** provider 的模型。id 无冲突时保留原始 id；被两个及以上路由同时暴露的 id 会加上 `<route_id>/` 命名空间前缀（如 `omni/gpt-x`）。同时持久化一份 `model → 所属路由` 映射：后续请求带上这些 id 时，会**优先钉到所属 provider** 并转发真实上游模型 id（命名空间前缀会被剥离）；未识别/旧模型 id 仍保持原有 `--route-model` / `--model` / Smart Fader 行为。关闭后完全恢复原来的「第一个成功上游」语义。详见 [docs/api.md](docs/api.md#aggregated-model-catalog-models-merge)。
 
 ### daemon（macOS + Linux）
 

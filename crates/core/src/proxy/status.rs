@@ -36,6 +36,10 @@ pub struct StatusDto {
     pub routes: Vec<String>,
     pub model_override: Option<String>,
     pub target_protocol: String,
+    /// Whether `/v1/models` aggregates all routes and posts are pinned by model.
+    /// `default` keeps this DTO readable against an older daemon's response.
+    #[serde(default)]
+    pub models_merge: bool,
     pub circuits: Vec<CircuitDto>,
 }
 
@@ -64,6 +68,7 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         routes,
         model_override,
         target_protocol,
+        models_merge: svc.core.db().models_merge_enabled().unwrap_or(false),
         circuits,
     })
 }

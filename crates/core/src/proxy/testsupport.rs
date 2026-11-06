@@ -235,6 +235,35 @@ pub async fn http_post_json(url: &str, path: &str, body: &str, auth: &str) -> (u
     (status, text)
 }
 
+pub async fn http_get(url: &str, path: &str, auth: &str) -> (u16, String) {
+    let (status, _, text) = http_get_with_headers(url, path, auth).await;
+    (status, text)
+}
+
+/// Like `http_get`, but also returns the response headers (lowercased names).
+/// Used by the aggregated `/v1/models` tests to check the JSON content-type.
+pub async fn http_get_with_headers(
+    url: &str,
+    path: &str,
+    auth: &str,
+) -> (u16, Vec<(String, String)>, String) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}{path}"))
+        .header("Authorization", auth)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let text = resp.text().await.unwrap();
+    (status, headers, text)
+}
+
 /// Like `http_post_json`, but also returns the response headers (lowercased
 /// names). Used by the session-identity end-to-end test.
 pub async fn http_post_json_with_headers(

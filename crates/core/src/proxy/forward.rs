@@ -37,6 +37,10 @@ const STRIP_HEADERS: &[&str] = &[
 /// Tail ring buffer size kept while streaming to extract usage at the end (~8KB).
 const SSE_TAIL_CAP: usize = 8 * 1024;
 
+/// Per-upstream timeout for the aggregated `/v1/models` probe. The shared
+/// client has a 120s total timeout, far too long for a model-list poll.
+const MODELS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn endpoint_path(endpoint: &str) -> &'static str {
     match endpoint {
         "chat" => "/chat/completions",
@@ -990,6 +994,24 @@ async fn forward_with_failover(
         );
     }
 
+    // Stage 2c: model→route pinning (aggregated `/v1/models`). Off by default.
+    // A recognized client-selected model wins over `--route-model` / the global
+    // `--model` / Smart Fader ordering for the primary entry only; the other
+    // routes stay as failover with their Stage 2b overrides intact. An
+    // unrecognized (legacy) model leaves the plan completely unchanged.
+    if svc.core.db().models_merge_enabled().unwrap_or(false) {
+        if let Some(sel) = model.as_deref() {
+            let mr = svc.core.db().model_route_for(sel).unwrap_or_default();
+            if let Some(mr) = mr {
+                if let Some(pos) = plan.entries.iter().position(|e| e.route_id == mr.route_id) {
+                    let mut pinned = plan.entries.remove(pos);
+                    pinned.model_override = Some(mr.upstream_model);
+                    plan.entries.insert(0, pinned);
+                }
+            }
+        }
+    }
+
     let req_model = model.clone().unwrap_or_default();
 
     // Stage 3: execute failover loop across the planned entries.
@@ -1328,9 +1350,153 @@ pub async fn handle(
     resp
 }
 
+/// One upstream's contribution to the aggregated model catalog.
+struct ModelProbe {
+    route_id: String,
+    models: Vec<serde_json::Value>,
+}
+
+/// Fetch and merge `/v1/models` from every configured route. Raw ids are kept
+/// when unambiguous; ids exposed by more than one route get a `<route_id>/`
+/// prefix so a client-selected id can be mapped back to exactly one provider.
+/// Circuit state is deliberately not mutated by these discovery probes.
+async fn aggregate_models(svc: &ProxyService, headers: &HeaderMap) -> Response {
+    let providers = svc.core.list(None).unwrap_or_default();
+    let ResolvedRoutes {
+        routes,
+        provider_map,
+        ..
+    } = match resolve_routes(svc, &providers) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+
+    let mut probes = Vec::new();
+    for route_id in &routes {
+        if svc.circuit_open(route_id) {
+            continue;
+        }
+        let Some(provider) = provider_map.get(route_id).copied() else {
+            continue;
+        };
+        let Some(base_url) = provider.base_url.clone() else {
+            continue;
+        };
+        let auth_key = if provider.is_official() {
+            None
+        } else {
+            svc.core.secrets().get(&provider.key_ref).ok()
+        };
+        let client = svc.client.clone();
+        let hdrs = headers.clone();
+        let rid = route_id.clone();
+        probes.push(async move {
+            // Reuse the normal upstream request builder: correct `/v1/models`
+            // URL, stripped client auth, injected upstream key, GET no body.
+            let outcome = tokio::time::timeout(
+                MODELS_PROBE_TIMEOUT,
+                try_forward(
+                    &client,
+                    "GET",
+                    &base_url,
+                    "models",
+                    &hdrs,
+                    &[],
+                    auth_key.as_deref(),
+                ),
+            )
+            .await;
+            let models = match outcome {
+                Ok(Ok(resp)) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| {
+                            v["data"].as_array().map(|a| {
+                                a.iter()
+                                    .filter(|m| m.get("id").and_then(|i| i.as_str()).is_some())
+                                    .cloned()
+                                    .collect()
+                            })
+                        })
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            ModelProbe {
+                route_id: rid,
+                models,
+            }
+        });
+    }
+
+    let results: Vec<ModelProbe> = futures::future::join_all(probes).await;
+
+    // Count how many distinct routes expose each raw id (a route exposing the
+    // same id twice still counts once).
+    let mut route_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for probe in &results {
+        let mut seen = std::collections::HashSet::new();
+        for m in &probe.models {
+            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                if seen.insert(id.to_string()) {
+                    *route_counts.entry(id.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut map = crate::store::db::ModelRoutes::new();
+    for probe in &results {
+        for m in &probe.models {
+            let Some(raw) = m.get("id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            let ambiguous = route_counts.get(raw).copied().unwrap_or(1) > 1;
+            let (exposed, entry) = if ambiguous {
+                let exposed = format!("{}/{}", probe.route_id, raw);
+                let mut e = m.clone();
+                e["id"] = serde_json::Value::String(exposed.clone());
+                (exposed, e)
+            } else {
+                (raw.to_string(), m.clone())
+            };
+            merged.push(entry);
+            map.insert(
+                exposed,
+                crate::store::db::ModelRoute {
+                    route_id: probe.route_id.clone(),
+                    upstream_model: raw.to_string(),
+                },
+            );
+        }
+    }
+
+    if merged.is_empty() {
+        // No usable catalog: degrade to the pre-feature first-success forward
+        // and keep the last-known map so existing pinning still works.
+        return forward_with_failover(svc, "GET", "models", headers, &[], None, None, None).await;
+    }
+
+    let _ = svc.core.db().set_model_routes(&map);
+
+    let body = serde_json::json!({ "object": "list", "data": merged });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+        .unwrap()
+}
+
 pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
-    let endpoint = "models";
-    forward_with_failover(&svc, "GET", endpoint, &headers, &[], None, None, None).await
+    // Read per request so `xfade proxy models-merge on/off` reaches a running
+    // daemon immediately. Off keeps the exact pre-feature first-success path.
+    if svc.core.db().models_merge_enabled().unwrap_or(false) {
+        return aggregate_models(&svc, &headers).await;
+    }
+    forward_with_failover(&svc, "GET", "models", &headers, &[], None, None, None).await
 }
 
 #[cfg(test)]

@@ -122,6 +122,17 @@ curl http://127.0.0.1:24860/__xfade/status
 
 `target_protocol`: `chat` (OpenAI style) / `messages` (Anthropic style), deciding the protocol-conversion direction. `model_override` passes through or overrides the upstream model name.
 
+With more than one route, `/v1/models` only shows the first successful upstream's models by default. To let a tool see and pick models from **every** provider:
+
+```bash
+xfade proxy use freebuff omni --target chat
+xfade proxy models-merge on
+curl http://127.0.0.1:24860/v1/models   # merged catalog of both routes
+xfade proxy status                      # shows "models merge: on"
+```
+
+Off by default; `xfade proxy models-merge off` restores the original single-catalog behavior. See [docs/api.md](api.md#aggregated-model-catalog-models-merge) for how selected model ids are mapped back to their owning provider.
+
 ## GUI
 
 `npx tauri dev` (or install the .dmg) → the Providers page works like the CLI above; the Proxy page starts/stops the daemon and edits routes; Stats/Logs show stats and logs; the tray provides quick switching.

@@ -1433,4 +1433,387 @@ mod tests {
         // Two openers → two sessions.
         assert_eq!(db.list_sessions(10).unwrap().len(), 2);
     }
+
+    // ── Aggregated /v1/models (`models-merge`) ────────────────────────────
+
+    fn models_catalog(ids: &[&str]) -> String {
+        let data: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "object": "model" }))
+            .collect();
+        serde_json::json!({ "object": "list", "data": data }).to_string()
+    }
+
+    fn two_upstreams(dir: &tempfile::TempDir, up: &MockUpstream, up2: &MockUpstream) -> Core {
+        test_core(
+            dir,
+            &[("freebuff", &up.url(), "k1"), ("omni", &up2.url(), "k2")],
+        )
+    }
+
+    fn two_routes() -> Vec<String> {
+        vec!["freebuff".to_string(), "omni".to_string()]
+    }
+
+    /// Spawn two upstreams and a service wired to both routes with the given
+    /// models-merge toggle. Returns the upstreams, a clone of the shared
+    /// `Database` (for asserting the persisted map), and the base URL.
+    async fn two_route_service(
+        dir: &tempfile::TempDir,
+        merge: bool,
+    ) -> (
+        MockUpstream,
+        MockUpstream,
+        crate::store::db::Database,
+        String,
+    ) {
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = two_upstreams(dir, &up, &up2);
+        let db = core.db().clone();
+        core.db()
+            .set_routes_with_models(&two_routes(), None, "chat", &Default::default())
+            .unwrap();
+        core.db().set_models_merge_enabled(merge).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        (up, up2, db, url)
+    }
+
+    fn catalog_ids(v: &serde_json::Value) -> Vec<&str> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn models_merge_off_is_first_success_passthrough() {
+        // With the toggle off, /v1/models must behave exactly as before: the
+        // first successful upstream's catalog verbatim, second one never queried.
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, false).await;
+        let expected = models_catalog(&["m-a"]);
+        up.respond_with(200, &expected);
+        up2.respond_with(200, &models_catalog(&["m-b"]));
+
+        let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body, expected,
+            "OFF must pass the first catalog through verbatim"
+        );
+        assert_eq!(up2.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_aggregates_all_route_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(200, &models_catalog(&["m-a", "m-c"]));
+        up2.respond_with(200, &models_catalog(&["m-b"]));
+
+        let (status, headers, body) = http_get_with_headers(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.contains("application/json")));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["object"], "list");
+        let ids = catalog_ids(&v);
+        assert_eq!(ids.len(), 3);
+        for expected in ["m-a", "m-c", "m-b"] {
+            assert!(ids.contains(&expected), "missing {expected} in {ids:?}");
+        }
+        assert_eq!(up.call_count().await, 1);
+        assert_eq!(up2.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_namespaces_colliding_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(200, &models_catalog(&["gpt-x", "only-a"]));
+        up2.respond_with(200, &models_catalog(&["gpt-x", "only-b"]));
+
+        let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let ids = catalog_ids(&v);
+        assert!(
+            !ids.contains(&"gpt-x"),
+            "ambiguous raw id must not be exposed"
+        );
+        for expected in ["freebuff/gpt-x", "omni/gpt-x", "only-a", "only-b"] {
+            assert!(ids.contains(&expected), "missing {expected} in {ids:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_persists_model_to_route_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, db, url) = two_route_service(&dir, true).await;
+        up.respond_with(200, &models_catalog(&["only-a", "shared"]));
+        up2.respond_with(200, &models_catalog(&["only-b", "shared"]));
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let map = db.get_model_routes().unwrap();
+        assert_eq!(map["only-a"].route_id, "freebuff");
+        assert_eq!(map["only-a"].upstream_model, "only-a");
+        assert_eq!(map["only-b"].route_id, "omni");
+        assert_eq!(map["freebuff/shared"].route_id, "freebuff");
+        assert_eq!(map["freebuff/shared"].upstream_model, "shared");
+        assert_eq!(map["omni/shared"].route_id, "omni");
+        assert_eq!(map["omni/shared"].upstream_model, "shared");
+        assert!(
+            !map.contains_key("shared"),
+            "ambiguous raw id is not mapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_pinned_model_routes_to_owner_with_real_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(200, &models_catalog(&["a-model"]));
+        up2.respond_with(200, &models_catalog(&["auto/best-fast"]));
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"auto/best-fast","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        // The model is owned by the *second* route, so it must be pinned first.
+        assert_eq!(up2.call_count().await, 2, "omni should see GET + POST");
+        assert_eq!(up.call_count().await, 1, "freebuff should only see the GET");
+        assert!(up2
+            .last_request()
+            .await
+            .body
+            .contains(r#""model":"auto/best-fast""#));
+    }
+
+    #[tokio::test]
+    async fn post_namespaced_model_forwards_real_upstream_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(200, &models_catalog(&["gpt-x"]));
+        up2.respond_with(200, &models_catalog(&["gpt-x"]));
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"omni/gpt-x","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(up2.call_count().await, 2);
+        assert_eq!(up.call_count().await, 1);
+        let seen = up2.last_request().await;
+        assert!(
+            seen.body.contains(r#""model":"gpt-x""#),
+            "namespaced id must be stripped to the real upstream id: {}",
+            seen.body
+        );
+    }
+
+    #[tokio::test]
+    async fn post_unknown_model_keeps_existing_override_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = two_upstreams(&dir, &up, &up2);
+        let mut models = std::collections::BTreeMap::new();
+        models.insert("freebuff".to_string(), "z-ai/glm-5.3-flash".to_string());
+        models.insert("omni".to_string(), "auto/best-fast".to_string());
+        core.db()
+            .set_routes_with_models(&two_routes(), None, "chat", &models)
+            .unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(200, &models_catalog(&["a-model"]));
+        up2.respond_with(200, &models_catalog(&["b-model"]));
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"legacy-unknown","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        // No pin: the primary keeps its --route-model override.
+        assert!(up
+            .last_request()
+            .await
+            .body
+            .contains(r#""model":"z-ai/glm-5.3-flash""#));
+        assert_eq!(
+            up2.call_count().await,
+            1,
+            "only the catalog GET reached omni"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_merge_off_post_ignores_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = two_upstreams(&dir, &up, &up2);
+        core.db().set_routes(&two_routes(), None, "chat").unwrap();
+        // Manually populate a map while the toggle stays off.
+        let mut map = crate::store::db::ModelRoutes::new();
+        map.insert(
+            "auto/best-fast".to_string(),
+            crate::store::db::ModelRoute {
+                route_id: "omni".to_string(),
+                upstream_model: "auto/best-fast".to_string(),
+            },
+        );
+        core.db().set_model_routes(&map).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_with(200, "{}");
+        up2.respond_with(200, "{}");
+
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"auto/best-fast","messages":[]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(up.call_count().await, 1, "primary should receive the POST");
+        assert_eq!(up2.call_count().await, 0, "no pin when the toggle is off");
+        assert!(up
+            .last_request()
+            .await
+            .body
+            .contains(r#""model":"auto/best-fast""#));
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_skips_circuit_open_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = two_upstreams(&dir, &up, &up2);
+        core.db()
+            .set_routes_with_models(&two_routes(), None, "chat", &Default::default())
+            .unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+        let svc = ProxyService::new(core);
+        for _ in 0..super::FAIL_THRESHOLD {
+            svc.record_failure("freebuff");
+        }
+        let url = spawn_service(svc).await;
+        up.respond_with(200, &models_catalog(&["a-model"]));
+        up2.respond_with(200, &models_catalog(&["b-model"]));
+
+        let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("b-model"));
+        assert!(!body.contains("a-model"));
+        assert_eq!(up.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_one_upstream_down_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(500, "boom");
+        up2.respond_with(200, &models_catalog(&["b-model"]));
+
+        let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(catalog_ids(&v), vec!["b-model"]);
+    }
+
+    #[tokio::test]
+    async fn models_merge_on_zero_success_degrades_to_first_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, db, url) = two_route_service(&dir, true).await;
+        // Seed a last-known map; a zero-success probe must NOT clear it.
+        let mut seed = crate::store::db::ModelRoutes::new();
+        seed.insert(
+            "m-old".to_string(),
+            crate::store::db::ModelRoute {
+                route_id: "freebuff".to_string(),
+                upstream_model: "m-old".to_string(),
+            },
+        );
+        db.set_model_routes(&seed).unwrap();
+        up.respond_with(500, "boom");
+        up2.respond_with(500, "boom");
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_ne!(
+            status, 200,
+            "zero-success must not return an empty 200 catalog"
+        );
+        assert_eq!(
+            db.get_model_routes().unwrap(),
+            seed,
+            "last-known map must survive the zero-success degrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_probe_does_not_mutate_circuit_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (up, up2, _db, url) = two_route_service(&dir, true).await;
+        up.respond_with(500, "boom");
+        up2.respond_with(200, &models_catalog(&["b-model"]));
+
+        let (status, _) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+
+        // A failed discovery probe must not feed the chat circuit breaker.
+        let v: serde_json::Value = reqwest::get(format!("{url}/__xfade/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let freebuff = v["circuits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["provider_id"] == "freebuff");
+        assert!(
+            freebuff.is_none() || freebuff.unwrap()["fails"] == 0,
+            "failed models probe must not record a circuit failure: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_surfaces_models_merge_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        let v: serde_json::Value = reqwest::get(format!("{url}/__xfade/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["models_merge"], true);
+    }
 }
