@@ -2,7 +2,7 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v0.11.1 — 2026-11-15
 
 ### Security
 - **fix(deps)**: v0.11.0 binaries were built with TLS and runtime crates that have published advisories. Updated `rustls` 0.23.42 → 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349), `rustls-webpki` 0.103.13 → 0.103.17 (RUSTSEC-2026-0382), `webpki-roots` 1.0.9 → 1.0.12 (RUSTSEC-2026-0381, distrusted emSign roots), `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386), `rustix` 1.1.4 → 1.1.6 (RUSTSEC-2026-0486).
@@ -10,7 +10,13 @@ This project follows [Semantic Versioning](https://semver.org/).
 - **chore(deps)**: `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29 (one crossterm in the tree; drops `paste`, fixes `lru` unsoundness RUSTSEC-2026-0253 / -0002).
 - **feat(supply-chain)**: `cargo-deny` is now a CI hard gate (`deny.toml`, `.github/workflows/supply-chain.yml`, also run daily). Releases additionally publish a CycloneDX SBOM (`xfade.cdx.json`) covered by `SHA256SUMS`, the Sigstore signature and the provenance attestation.
 
+### Added
+- **feat(sessions)**: handover L2 — `xfade <tool> --handover` now also passes the brief to Claude Code, Codex, OpenCode (as the initial prompt) and Aider (`--message`), in addition to printing/copying it.
+- **feat(sessions)**: handover L3 — opt-in transparent injection of model-switch context. Off by default; enable with `xfade proxy handover-inject on` (shown in `proxy status`). Context is prepended to the final user message as data and never written into `system` / `instructions`; it is injected once per switch and only after the upstream accepts the request. Project root comes from a vetted `x-xfade-project-root` header (stripped before forwarding), the latest analyzed project, or the daemon cwd. `xfade <tool>` now caches the launch directory's project map for this.
+
 ### Known gaps
+- Handover L3 is experimental. Without the header, project resolution is "most recently analyzed project", which is ambiguous when several projects are active.
+- With `--handover`, Codex treats the first positional argument as its initial task and starts working on it.
 - `serde_yaml` (via `unsafe-libyaml`, unmaintained) and GUI-only tauri/gtk3 crates are recorded as reasoned ignores in `deny.toml`.
 
 ## v0.11.0 — 2026-11-15
