@@ -259,6 +259,12 @@ impl Database {
         if !existing_cols.contains("model_routes") {
             conn.execute("ALTER TABLE proxy_state ADD COLUMN model_routes TEXT", [])?;
         }
+        if !existing_cols.contains("handover_auto_inject") {
+            conn.execute(
+                "ALTER TABLE proxy_state ADD COLUMN handover_auto_inject INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         // Same pattern for request_logs: pre-tool-column databases get a
         // default of '' (those rows only show up in unfiltered stats views).
         let mut stmt = conn.prepare("PRAGMA table_info(request_logs)")?;
@@ -412,7 +418,8 @@ impl Database {
     /// Set proxy routes (primary→fallback order) + model override + target protocol.
     /// A changed route set invalidates the cached aggregated model→route map,
     /// so the conflict clause also resets `model_routes`; the independent
-    /// toggles (`smart_enabled`, `failover_4xx`, `models_merge`) are preserved.
+    /// toggles (`smart_enabled`, `failover_4xx`, `models_merge`,
+    /// `handover_auto_inject`) are preserved.
     /// Kept as the legacy three-arg writer (GUI + tests): its column-scoped
     /// upsert never touches those toggles.
     pub fn set_routes(
@@ -452,7 +459,8 @@ impl Database {
     /// `set_routes` (GUI + tests). Both route writers clear the cached
     /// `model_routes` map because a changed route set makes it stale; both
     /// leave the independent toggles (`smart_enabled`, `failover_4xx`,
-    /// `models_merge`) intact, so `proxy use` never resets them.
+    /// `models_merge`, `handover_auto_inject`) intact, so `proxy use`
+    /// never resets them.
     pub fn set_routes_with_models(
         &self,
         routes: &[String],
@@ -515,7 +523,7 @@ impl Database {
 
     /// Clear the route set and the cached aggregated model→route map without
     /// touching the independent toggles (`smart_enabled`, `failover_4xx`,
-    /// `models_merge`).
+    /// `models_merge`, `handover_auto_inject`).
     pub fn clear_routes(&self) -> Result<()> {
         let now =
             OffsetDateTime::now_utc()
@@ -629,6 +637,24 @@ impl Database {
 
     pub fn set_models_merge_enabled(&self, on: bool) -> Result<()> {
         self.upsert_proxy_state_column("models_merge", on as i64)
+    }
+
+    /// Whether the proxy transparently injects pending session-handover
+    /// context into the next upstream request (L3). Default off; read on
+    /// every request so `xfade proxy handover-inject on/off` takes effect
+    /// on a running daemon immediately.
+    pub fn handover_auto_inject_enabled(&self) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT handover_auto_inject FROM proxy_state WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, i64>(0)? != 0),
+            None => Ok(false),
+        }
+    }
+
+    pub fn set_handover_auto_inject_enabled(&self, on: bool) -> Result<()> {
+        self.upsert_proxy_state_column("handover_auto_inject", on as i64)
     }
 
     /// Cached `model → owning route` map built by the aggregated `/v1/models`.
@@ -1016,63 +1042,41 @@ impl Database {
     }
 
     /// Find the most recent pending handover that has not been injected yet.
-    /// Matches either the current `session_id` or an unattributed handover (`session_id IS NULL`)
-    /// within the time window (`cutoff_ts`).
+    /// Prefers a handover already attributed to `session_id`; falls back to the
+    /// newest unattributed row (`session_id IS NULL`) within `cutoff_ts`.
+    /// Returns `None` when no session id is available — auto-inject must not
+    /// claim a pending handover for an unidentified conversation.
     pub fn find_pending_handover(
         &self,
         session_id: Option<&str>,
         cutoff_ts: &str,
     ) -> Result<Option<HandoverRow>> {
+        let Some(sid) = session_id else {
+            return Ok(None);
+        };
         let conn = self.conn();
-        match session_id {
-            Some(sid) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
-                     FROM handovers
-                     WHERE (session_id = ?1 OR session_id IS NULL)
-                       AND ts >= ?2
-                       AND injected = 0
-                     ORDER BY id DESC LIMIT 1",
-                )?;
-                let mut rows = stmt.query(params![sid, cutoff_ts])?;
-                match rows.next()? {
-                    Some(row) => Ok(Some(HandoverRow {
-                        id: row.get(0)?,
-                        tool: row.get(1)?,
-                        session_id: row.get(2)?,
-                        from_model: row.get(3)?,
-                        to_model: row.get(4)?,
-                        ts: row.get(5)?,
-                        injected: row.get::<_, i64>(6)? != 0,
-                        injected_at: row.get(7)?,
-                    })),
-                    None => Ok(None),
-                }
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
-                     FROM handovers
-                     WHERE session_id IS NULL
-                       AND ts >= ?1
-                       AND injected = 0
-                     ORDER BY id DESC LIMIT 1",
-                )?;
-                let mut rows = stmt.query(params![cutoff_ts])?;
-                match rows.next()? {
-                    Some(row) => Ok(Some(HandoverRow {
-                        id: row.get(0)?,
-                        tool: row.get(1)?,
-                        session_id: row.get(2)?,
-                        from_model: row.get(3)?,
-                        to_model: row.get(4)?,
-                        ts: row.get(5)?,
-                        injected: row.get::<_, i64>(6)? != 0,
-                        injected_at: row.get(7)?,
-                    })),
-                    None => Ok(None),
-                }
-            }
+        let mut stmt = conn.prepare(
+            "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
+             FROM handovers
+             WHERE (session_id = ?1 OR session_id IS NULL)
+               AND ts >= ?2
+               AND injected = 0
+             ORDER BY CASE WHEN session_id = ?1 THEN 0 ELSE 1 END, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![sid, cutoff_ts])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(HandoverRow {
+                id: row.get(0)?,
+                tool: row.get(1)?,
+                session_id: row.get(2)?,
+                from_model: row.get(3)?,
+                to_model: row.get(4)?,
+                ts: row.get(5)?,
+                injected: row.get::<_, i64>(6)? != 0,
+                injected_at: row.get(7)?,
+            })),
+            None => Ok(None),
         }
     }
 
@@ -1352,6 +1356,16 @@ mod tests {
         assert!(db.models_merge_enabled().unwrap());
         db.set_models_merge_enabled(false).unwrap();
         assert!(!db.models_merge_enabled().unwrap());
+    }
+
+    #[test]
+    fn handover_auto_inject_defaults_off_and_roundtrips() {
+        let db = Database::open_memory().unwrap();
+        assert!(!db.handover_auto_inject_enabled().unwrap());
+        db.set_handover_auto_inject_enabled(true).unwrap();
+        assert!(db.handover_auto_inject_enabled().unwrap());
+        db.set_handover_auto_inject_enabled(false).unwrap();
+        assert!(!db.handover_auto_inject_enabled().unwrap());
     }
 
     #[test]
@@ -1937,6 +1951,12 @@ mod tests {
         )
         .unwrap();
 
+        // No session → refuse to claim an unattributed handover.
+        assert!(db
+            .find_pending_handover(None, "2026-10-09T09:50:00Z")
+            .unwrap()
+            .is_none());
+
         // Query pending handover within window
         let pending = db
             .find_pending_handover(Some("s1"), "2026-10-09T09:50:00Z")
@@ -1961,6 +1981,25 @@ mod tests {
         assert_eq!(hs.len(), 1);
         assert!(hs[0].injected);
         assert_eq!(hs[0].injected_at.as_deref(), Some("2026-10-09T10:01:00Z"));
+    }
+
+    #[test]
+    fn find_pending_handover_prefers_session_attributed() {
+        let db = Database::open_memory().unwrap();
+        db.insert_handover("claude", Some("a"), Some("b"), "2026-10-09T10:00:00Z")
+            .unwrap();
+        // Attribute the older row to s1 while leaving injected=0.
+        db.backfill_handover_session("s1", "2026-10-09T09:00:00Z")
+            .unwrap();
+        // Newer unattributed switch — must not steal priority from s1's row.
+        db.insert_handover("claude", Some("c"), Some("d"), "2026-10-09T10:01:00Z")
+            .unwrap();
+        let pending = db
+            .find_pending_handover(Some("s1"), "2026-10-09T09:00:00Z")
+            .unwrap()
+            .expect("should find pending handover");
+        assert_eq!(pending.session_id.as_deref(), Some("s1"));
+        assert_eq!(pending.to_model.as_deref(), Some("b"));
     }
 
     #[test]

@@ -43,6 +43,8 @@ const STRIP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "anthropic-version",
     "anthropic-beta",
+    // Local-only hint for handover context; must not leak a filesystem path.
+    "x-xfade-project-root",
 ];
 
 /// Tail ring buffer size kept while streaming to extract usage at the end (~8KB).
@@ -1345,36 +1347,48 @@ pub async fn handle(
         crate::sessions::resolve_session(svc.core.db(), &fp, &opener)
     });
 
-    // Check for a pending handover to auto-inject into the request
-    let cutoff = crate::sessions::cutoff_rfc3339(crate::sessions::SESSION_STICKY_WINDOW_SECS);
-    if let Ok(Some(handover)) = svc
+    // Opt-in L3: inject pending handover as user-level data (never system).
+    let mut injected_handover: Option<i64> = None;
+    let auto_inject = svc
         .core
         .db()
-        .find_pending_handover(session_id.as_deref(), &cutoff)
-    {
-        if let Some(ref mut parsed_val) = parsed {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let mut brief = crate::sessions::handover::collect_handover(
-                svc.core.db(),
-                &cwd,
-                crate::sessions::handover::DEFAULT_MAX_DIFF_CHARS,
-            );
-            if brief.model.is_none() {
-                brief.model = handover.from_model.clone();
-            }
-            brief.session_id = session_id.clone();
-            let xml = brief
-                .to_injection_xml(handover.from_model.as_deref(), handover.to_model.as_deref());
-            if crate::sessions::handover::inject_handover_into_payload(parsed_val, endpoint, &xml) {
-                if let Ok(new_bytes) = serde_json::to_vec(parsed_val) {
-                    body = Bytes::from(new_bytes);
+        .handover_auto_inject_enabled()
+        .unwrap_or(false);
+    if auto_inject {
+        let cutoff = crate::sessions::cutoff_rfc3339(crate::sessions::SESSION_STICKY_WINDOW_SECS);
+        if let Ok(Some(handover)) = svc
+            .core
+            .db()
+            .find_pending_handover(session_id.as_deref(), &cutoff)
+        {
+            if let Some(ref mut parsed_val) = parsed {
+                let header_root = headers
+                    .get("x-xfade-project-root")
+                    .and_then(|v| v.to_str().ok());
+                let root =
+                    crate::sessions::handover::resolve_project_root(svc.core.db(), header_root);
+                let mut brief = crate::sessions::handover::collect_handover_for(
+                    svc.core.db(),
+                    &root,
+                    crate::sessions::handover::DEFAULT_MAX_DIFF_CHARS,
+                    session_id.as_deref(),
+                );
+                if brief.model.is_none() {
+                    brief.model = handover.from_model.clone();
                 }
-                let now = crate::sessions::now_rfc3339();
-                let effective_sid = session_id.as_deref().unwrap_or("");
-                let _ = svc
-                    .core
-                    .db()
-                    .mark_handover_injected(handover.id, effective_sid, &now);
+                brief.session_id = session_id.clone();
+                let xml = brief
+                    .to_injection_xml(handover.from_model.as_deref(), handover.to_model.as_deref());
+                if crate::sessions::handover::inject_handover_into_payload(
+                    parsed_val, endpoint, &xml,
+                ) {
+                    if let Ok(new_bytes) = serde_json::to_vec(parsed_val) {
+                        body = Bytes::from(new_bytes);
+                    }
+                    // Marked only after the upstream accepts the request, so
+                    // a failed attempt does not burn the handover.
+                    injected_handover = Some(handover.id);
+                }
             }
         }
     }
@@ -1389,6 +1403,15 @@ pub async fn handle(
         session_id.as_deref(),
     )
     .await;
+    if let Some(id) = injected_handover {
+        if resp.status().is_success() {
+            let _ = svc.core.db().mark_handover_injected(
+                id,
+                session_id.as_deref().unwrap_or(""),
+                &crate::sessions::now_rfc3339(),
+            );
+        }
+    }
     // Surface the session id so clients/tools can correlate requests.
     if let Some(sid) = &session_id {
         if let Ok(value) = axum::http::HeaderValue::from_str(sid) {

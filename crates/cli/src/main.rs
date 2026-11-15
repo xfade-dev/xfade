@@ -259,6 +259,14 @@ enum ProxyCmd {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// Toggle transparent session-handover injection on the next proxy request (L3).
+    /// Default off. When on, pending model-switch context is prepended to the
+    /// last user message (never elevated into system/instructions).
+    #[command(name = "handover-inject")]
+    HandoverInject {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -893,6 +901,12 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     "off"
                 };
                 println!("models merge: {models_merge}");
+                let handover_inject = if core.db().handover_auto_inject_enabled()? {
+                    "on"
+                } else {
+                    "off"
+                };
+                println!("handover inject: {handover_inject}");
                 if let Some((root, map_json)) = core.db().latest_repo_map()? {
                     let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
                     let lang = v["lang"].as_str().unwrap_or("?");
@@ -938,6 +952,19 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     println!("models merge: on — /v1/models aggregates all routes; posts are pinned to the provider owning the selected model");
                 } else {
                     println!("models merge: off — /v1/models is first-success passthrough");
+                }
+                Ok(())
+            }
+            ProxyCmd::HandoverInject { state } => {
+                let core = build_core()?;
+                let on = state == "on";
+                core.db().set_handover_auto_inject_enabled(on)?;
+                if on {
+                    println!("handover inject: on — pending model-switch context is prepended to the next request's last user message (opt-in L3)");
+                } else {
+                    println!(
+                        "handover inject: off — proxy does not rewrite request bodies for handover"
+                    );
                 }
                 Ok(())
             }
@@ -1506,6 +1533,7 @@ fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), Co
     };
     let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
     warn_legacy_wire_api(tool);
+    warm_project_map(&core);
 
     let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
     let status = Command::new(&bin)
@@ -1524,6 +1552,15 @@ fn cmd_run(name: &str, tool: Option<ToolKind>, args: &[String]) -> Result<(), Co
             }
         })?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Cache the launch directory's project fingerprint so handover context
+/// (L3) resolves to the project the tool was started in, not the daemon's cwd.
+/// Directories without language/git signals are skipped by `analyze`.
+fn warm_project_map(core: &Core) {
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = xfade_core::analyzer::analyze(&cwd, core.db());
+    }
 }
 
 /// Newer Codex refuses to start when any ~/.codex/config.toml provider still
@@ -1597,6 +1634,7 @@ fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
 
     let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
     warn_legacy_wire_api(tool);
+    warm_project_map(&core);
 
     let mut tool_args = opts.args.clone();
     if opts.handover {
@@ -1883,6 +1921,18 @@ mod tests {
         }
         assert!(Cli::command()
             .try_get_matches_from(["xfade", "proxy", "models-merge", "maybe"])
+            .is_err());
+    }
+
+    #[test]
+    fn handover_inject_subcommand_parses_on_off() {
+        for state in ["on", "off"] {
+            Cli::command()
+                .try_get_matches_from(["xfade", "proxy", "handover-inject", state])
+                .unwrap_or_else(|e| panic!("handover-inject {state} should parse: {e}"));
+        }
+        assert!(Cli::command()
+            .try_get_matches_from(["xfade", "proxy", "handover-inject", "maybe"])
             .is_err());
     }
 
