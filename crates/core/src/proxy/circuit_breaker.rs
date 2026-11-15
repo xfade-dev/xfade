@@ -125,6 +125,10 @@ impl ProviderCircuit {
         self.probe_in_flight.store(false, Ordering::Release);
     }
 
+    fn release_probe(&self) {
+        self.probe_in_flight.store(false, Ordering::Release);
+    }
+
     fn allow_request(&self, config: &CircuitBreakerConfig) -> bool {
         let current_state = self.state.load(Ordering::Acquire);
         match current_state {
@@ -345,6 +349,16 @@ impl CircuitBreaker {
             }
         }
         None
+    }
+
+    /// Release in-flight probe reservation (e.g. when a probe request in HalfOpen
+    /// completes with a client-side non-qualifying 4xx error such as 400 or 404).
+    pub fn release_probe(&self, provider_id: &str) {
+        if let Ok(map) = self.providers.read() {
+            if let Some(p) = map.get(provider_id) {
+                p.release_probe();
+            }
+        }
     }
 
     /// Reset an individual provider to `Closed` with all counters zeroed.
@@ -673,5 +687,32 @@ mod tests {
 
         // 3 failures / 5 requests = 60% >= 50% -> should trip to Open
         assert_eq!(cb.state("p-window"), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_release_probe_frees_in_flight_slot_in_half_open() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_seconds: 0,
+            error_rate_threshold: 0.5,
+            min_requests: 1,
+        });
+
+        cb.record_failure("p-probe");
+        assert_eq!(cb.state("p-probe"), CircuitState::Open);
+
+        // Allow probe enters HalfOpen and sets probe_in_flight = true
+        assert!(cb.allow_request("p-probe"));
+        assert_eq!(cb.state("p-probe"), CircuitState::HalfOpen);
+
+        // Concurrent probe rejected
+        assert!(!cb.allow_request("p-probe"));
+
+        // Release probe reservation
+        cb.release_probe("p-probe");
+
+        // Next probe is now admitted
+        assert!(cb.allow_request("p-probe"));
     }
 }

@@ -94,10 +94,8 @@ impl ProxyService {
                     for _ in 0..c.fails.max(FAIL_THRESHOLD) {
                         circuit_breaker.record_failure(&id);
                     }
-                } else if c.fails > 0 {
-                    for _ in 0..c.fails {
-                        circuit_breaker.record_failure(&id);
-                    }
+                } else {
+                    let _ = core.db().delete_circuit(&id);
                 }
             }
         }
@@ -2293,5 +2291,97 @@ mod tests {
             "rectified request should have bumped max_tokens above budget, got: {}",
             last_req.body
         );
+    }
+
+    #[tokio::test]
+    async fn test_probe_non_qualifying_4xx_releases_reservation_and_does_not_hang_half_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_primary = MockUpstream::spawn().await;
+        let up_backup = MockUpstream::spawn().await;
+
+        let core = test_core(
+            &dir,
+            &[
+                ("pri", &up_primary.url(), "k1"),
+                ("bak", &up_backup.url(), "k2"),
+            ],
+        );
+        core.db()
+            .set_routes(&["pri".into(), "bak".into()], None, "chat")
+            .unwrap();
+
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0, // Instant cooldown for probe testing
+            error_rate_threshold: 0.5,
+            min_requests: 1,
+        }));
+
+        let svc = ProxyService::new(core).with_circuit_breaker(cb.clone());
+        let url = spawn_service(svc).await;
+
+        // 1. Primary returns 500 -> trips to Open
+        up_primary.respond_sequence(vec![
+            (500, "overloaded"),
+            (400, r#"{"error":"invalid syntax"}"#),
+            (404, "not found"),
+        ]);
+        up_backup.respond_with(200, r#"{"choices":[]}"#);
+
+        let (s1, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(s1, 200);
+        assert_eq!(cb.state("pri"), CircuitState::Open);
+
+        // 2. Next request probes in HalfOpen: primary returns unrectified 400
+        let (s2, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(s2, 400);
+
+        // Verify probe slot was released and did not hang HalfOpen:
+        assert_eq!(cb.state("pri"), CircuitState::HalfOpen);
+        assert!(
+            cb.allow_request("pri"),
+            "probe in flight must be released on unrectified 400"
+        );
+        cb.release_probe("pri"); // release probe slot claimed in assertion
+
+        // 3. Next probe returns 404:
+        let (s3, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
+        assert_eq!(s3, 404);
+        assert!(
+            cb.allow_request("pri"),
+            "probe in flight must be released on 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restoring_expired_cooldown_circuit_starts_in_closed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[("expired_provider", "http://127.0.0.1:9999", "k1")]);
+
+        // Save a circuit whose cooldown expired 100 seconds ago
+        let past = now_secs() - 100;
+        let circuit = Circuit {
+            fails: 3,
+            cooldown_until_secs: past,
+        };
+        core.db()
+            .save_circuit("expired_provider", &circuit)
+            .unwrap();
+
+        // Start ProxyService with this core DB
+        let svc = ProxyService::new(core.clone());
+
+        // Verify provider is in Closed state, not Open!
+        assert_eq!(
+            svc.circuit_breaker.state("expired_provider"),
+            CircuitState::Closed
+        );
+        assert!(svc.circuit_breaker.allow_request("expired_provider"));
+        assert!(!svc.circuit_open("expired_provider"));
+
+        // Verify the expired circuit was cleaned from the database
+        let loaded = core.db().load_circuits().unwrap();
+        assert!(!loaded.contains_key("expired_provider"));
     }
 }
