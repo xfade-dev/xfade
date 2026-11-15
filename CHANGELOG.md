@@ -13,6 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/).
 - **fix(files)**: files that can hold credentials are created owner-only (0600) from the start and renamed into place — client config files written by every adapter, their backups and restores, the file secrets backend (previously written first, then chmod'ed), `daemon.json`, and the plist/unit.
 - **fix(cli)**: `xfade config` no longer prints the first 8 characters of the global API key.
 - **fix(install)**: `install.sh` and `xfade self-update` now verify the downloaded tarball against the release's `SHA256SUMS` and abort (installing nothing) on a mismatch, a missing `SHA256SUMS`, or an unlisted asset. The release workflow no longer ignores a failed checksum check.
+- **feat(supply-chain)**: releases now publish a keyless Sigstore signature bundle for `SHA256SUMS` plus GitHub build-provenance attestations for all assets. Release workflow actions are pinned to immutable commits, and `scripts/verify-release.sh` verifies the signer identity and selected CLI archive.
 
 ### Compatibility
 - Clients that reach the proxy through a non-loopback hostname (for example from a container via `host.docker.internal`) need `--host <addr>` **and** an auth token now.

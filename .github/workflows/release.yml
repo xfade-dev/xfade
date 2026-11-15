@@ -24,11 +24,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin third-party actions to immutable commits: a mutable tag in the
+      # release path would undermine the provenance we publish below.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install Linux dependencies (dbus for keyring)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
@@ -54,7 +56,7 @@ jobs:
             shasum -a 256 xfade-* > "../checksums-${{ matrix.target }}.txt"
           fi
           cd ..
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cli-${{ matrix.target }}
           path: |
@@ -65,10 +67,10 @@ jobs:
     name: GUI macOS (dmg)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: "npm"
@@ -85,7 +87,7 @@ jobs:
       - name: tauri build
         working-directory: crates/gui
         run: npx tauri build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gui-dmg
           path: |
@@ -98,24 +100,53 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
-      - name: merge checksums
+      - name: Assemble release assets and checksums
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p release
-          find artifacts -name 'checksums-*.txt' -exec cat {} \; > release/SHA256SUMS
           find artifacts -name 'xfade-*' -exec cp {} release/ \;
           find artifacts -name '*.dmg' -exec cp {} release/ \;
-          cd release && sha256sum -c SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+          cd release
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      - name: Sign checksum manifest with Sigstore
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --yes \
+            --bundle release/SHA256SUMS.sigstore.json \
+            release/SHA256SUMS
+          cosign verify-blob \
+            --bundle release/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            release/SHA256SUMS
+
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release/*
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |
             release/xfade-*
             release/*.dmg
             release/SHA256SUMS
+            release/SHA256SUMS.sigstore.json

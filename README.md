@@ -33,6 +33,17 @@ curl -fsSL https://xfade.sh | sh
 cargo build --release -p xfade   # output target/release/xfade
 ```
 
+Release downloads include a keyless Sigstore signature and GitHub build
+provenance. To verify both the signer and the SHA-256 checksum before running a
+download (requires `cosign`):
+
+```bash
+scripts/verify-release.sh vX.Y.Z
+```
+
+See [RELEASE.md](RELEASE.md#signing) for manual Cosign and GitHub attestation
+verification. The one-line installer verifies SHA-256 automatically.
+
 ### GUI
 
 Download `xfade-gui_<version>_aarch64.dmg` (macOS Apple Silicon) from GitHub Release and drag it into Applications. Or build from source — see "Development" below.

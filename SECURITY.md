@@ -23,3 +23,16 @@ Security-relevant areas of this project include, but are not limited to:
 ## Coordinated disclosure
 
 We will keep the reporter informed of progress and credit them in the release notes unless they request otherwise.
+
+## Release integrity
+
+CLI release artifacts are covered by a SHA-256 manifest signed keylessly by
+this repository's GitHub Actions release workflow using Sigstore. GitHub also
+records build-provenance attestations for the artifacts. Verification
+instructions and the precise signer identity are documented in
+[`RELEASE.md`](RELEASE.md#signing).
+
+These signatures establish which source workflow produced an artifact; they do
+not by themselves prove that the software is free of vulnerabilities. The
+macOS GUI also requires Apple Developer ID signing and notarization for full
+Gatekeeper trust; that is tracked separately.
