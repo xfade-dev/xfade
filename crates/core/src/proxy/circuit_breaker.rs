@@ -133,31 +133,35 @@ impl ProviderCircuit {
                 let now = now_secs();
                 let opened_at = self.opened_at_secs.load(Ordering::Acquire);
                 if now >= opened_at + config.timeout_seconds as i64 {
-                    // Timeout elapsed: attempt to transition Open -> HalfOpen.
-                    // The winner of the CAS gets the single initial probe permission.
+                    // Atomically claim the probe reservation FIRST before state transition.
+                    // This guarantees exactly one thread holds probe permission and eliminates
+                    // the race condition where concurrent threads see STATE_HALF_OPEN with
+                    // probe_in_flight not yet set to true.
                     if self
-                        .state
-                        .compare_exchange(
-                            STATE_OPEN,
-                            STATE_HALF_OPEN,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .probe_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.consecutive_successes.store(0, Ordering::Release);
-                        self.probe_in_flight.store(true, Ordering::Release);
-                        true
-                    } else {
-                        // Another thread already transitioned to HalfOpen. Check probe slot.
-                        let s = self.state.load(Ordering::Acquire);
-                        if s == STATE_HALF_OPEN {
-                            self.probe_in_flight
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
+                        if self
+                            .state
+                            .compare_exchange(
+                                STATE_OPEN,
+                                STATE_HALF_OPEN,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            self.consecutive_successes.store(0, Ordering::Release);
+                            true
                         } else {
-                            s == STATE_CLOSED
+                            // State changed out of OPEN (e.g. manual reset); release reservation
+                            self.probe_in_flight.store(false, Ordering::Release);
+                            self.state.load(Ordering::Acquire) == STATE_CLOSED
                         }
+                    } else {
+                        // Another thread already claimed the probe reservation
+                        false
                     }
                 } else {
                     false
@@ -177,22 +181,28 @@ impl ProviderCircuit {
         let current_state = self.state.load(Ordering::Acquire);
         match current_state {
             STATE_HALF_OPEN => {
-                // Free the probe slot so another probe can run if threshold not yet reached
-                self.probe_in_flight.store(false, Ordering::Release);
                 let succ = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
                 if succ >= config.success_threshold {
-                    // Fully recovered: transition to Closed and reset counters
+                    // Fully recovered: transition to Closed first, then reset counters and probe
                     self.state.store(STATE_CLOSED, Ordering::Release);
                     self.consecutive_failures.store(0, Ordering::Release);
                     self.total_requests.store(0, Ordering::Release);
                     self.total_failures.store(0, Ordering::Release);
                     self.consecutive_successes.store(0, Ordering::Release);
                     self.probe_in_flight.store(false, Ordering::Release);
+                } else {
+                    // Still in HalfOpen, need further successful probes: release slot for next probe
+                    self.probe_in_flight.store(false, Ordering::Release);
                 }
             }
             STATE_CLOSED => {
                 self.consecutive_failures.store(0, Ordering::Release);
-                self.total_requests.fetch_add(1, Ordering::Relaxed);
+                let total_r = self.total_requests.fetch_add(1, Ordering::AcqRel) + 1;
+                let max_window = config.min_requests.saturating_mul(10).max(10);
+                if total_r >= max_window {
+                    self.total_requests.store(0, Ordering::Release);
+                    self.total_failures.store(0, Ordering::Release);
+                }
             }
             _ => {}
         }
@@ -224,6 +234,14 @@ impl ProviderCircuit {
                     self.state.store(STATE_OPEN, Ordering::Release);
                     self.probe_in_flight.store(false, Ordering::Release);
                     self.consecutive_successes.store(0, Ordering::Release);
+                    self.total_requests.store(0, Ordering::Release);
+                    self.total_failures.store(0, Ordering::Release);
+                } else {
+                    let max_window = config.min_requests.saturating_mul(10).max(10);
+                    if total_r >= max_window {
+                        self.total_requests.store(0, Ordering::Release);
+                        self.total_failures.store(0, Ordering::Release);
+                    }
                 }
             }
             STATE_OPEN => {
@@ -579,5 +597,81 @@ mod tests {
         cb.reset("p1");
         assert_eq!(cb.state("p1"), CircuitState::Closed);
         assert_eq!(cb.remaining_cooldown_secs("p1"), None);
+    }
+
+    #[test]
+    fn test_circuit_competing_threads_at_timeout_admit_only_one_probe() {
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 2,
+            timeout_seconds: 0, // instant cooldown
+            error_rate_threshold: 0.6,
+            min_requests: 5,
+        }));
+
+        cb.record_failure("competing-upstream");
+        cb.record_failure("competing-upstream");
+        assert_eq!(cb.state("competing-upstream"), CircuitState::Open);
+
+        // Spawn multiple concurrent threads competing to call allow_request at the exact same instant
+        let num_threads = 20;
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+        let admitted_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let cb_clone = Arc::clone(&cb);
+                let barrier_clone = Arc::clone(&barrier);
+                let admitted_clone = Arc::clone(&admitted_count);
+                thread::spawn(move || {
+                    barrier_clone.wait();
+                    if cb_clone.allow_request("competing-upstream") {
+                        admitted_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one thread should have won the probe reservation
+        assert_eq!(
+            admitted_count.load(Ordering::SeqCst),
+            1,
+            "Only 1 probe request must be admitted when multiple threads race at timeout"
+        );
+        assert_eq!(cb.state("competing-upstream"), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_circuit_closed_periodic_window_reset_prevents_dilution() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 10,
+            success_threshold: 2,
+            timeout_seconds: 60,
+            error_rate_threshold: 0.5,
+            min_requests: 5,
+        });
+
+        // Simulate 50 successful requests (hitting min_requests * 10 window reset)
+        for _ in 0..50 {
+            cb.record_success("p-window");
+        }
+        assert_eq!(cb.state("p-window"), CircuitState::Closed);
+
+        // In the fresh window, 3 failures out of 5 requests trip the breaker
+        cb.record_failure("p-window");
+        cb.record_success("p-window");
+        cb.record_failure("p-window");
+        cb.record_success("p-window");
+        cb.record_failure("p-window");
+
+        // 3 failures / 5 requests = 60% >= 50% -> should trip to Open
+        assert_eq!(cb.state("p-window"), CircuitState::Open);
     }
 }
