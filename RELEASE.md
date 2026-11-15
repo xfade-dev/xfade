@@ -12,6 +12,10 @@
   - Multi-platform CLI binaries (macOS arm/intel, linux, windows) + sha256.
   - macOS GUI `.dmg`/`.app` (including the xfade sidecar).
   - Aggregated into a GitHub Release + `SHA256SUMS`.
+  - `SHA256SUMS` is signed keylessly with Sigstore; the bundle is published as
+    `SHA256SUMS.sigstore.json`.
+  - Every release asset receives a GitHub build-provenance attestation.
+  - Release-path GitHub Actions are pinned to immutable commit SHAs.
 
 ## Release flow
 
@@ -64,8 +68,48 @@ npx tauri build        # produces src-tauri/target/release/bundle/{dmg,macos}/
 
 ## Signing
 
-- Currently ad-hoc signed (runs locally on macOS, but Gatekeeper warns on distribution). Proper distribution requires Developer ID signing + notarization — configure `tauri.conf.json`'s `signingIdentity` + notarization later.
-- Homebrew users are unaffected by Gatekeeper (binaries installed via brew).
+### CLI release artifacts
+
+Release artifacts are signed by the GitHub Actions release workflow using
+Sigstore keyless signing. The ephemeral certificate is bound to this exact
+workflow identity and recorded in Sigstore's transparency log; no long-lived
+private signing key is stored in GitHub.
+
+Verify a release (requires `cosign`):
+
+```bash
+scripts/verify-release.sh vX.Y.Z
+```
+
+Or verify already-downloaded files directly:
+
+```bash
+cosign verify-blob SHA256SUMS \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity \
+    "https://github.com/xfade-dev/xfade/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+sha256sum -c SHA256SUMS       # Linux
+# shasum -a 256 -c SHA256SUMS # macOS
+```
+
+GitHub also stores build provenance for each asset:
+
+```bash
+gh attestation verify xfade-<target>.tar.gz --repo xfade-dev/xfade
+```
+
+The one-line installer verifies `SHA256SUMS` but does not install Cosign as a
+dependency. Users who need signer identity and provenance verification should
+run the command above before executing the downloaded binary.
+
+### macOS GUI
+
+The `.dmg` checksum is covered by the signed manifest and build provenance, but
+the app is still ad-hoc code-signed. Gatekeeper distribution additionally
+requires Apple Developer ID signing and notarization; configure Tauri's
+`signingIdentity` and notarization credentials separately.
 
 ## crates.io
 

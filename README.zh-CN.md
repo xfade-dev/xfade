@@ -33,6 +33,16 @@ curl -fsSL https://xfade.sh | sh
 cargo build --release -p xfade   # 产物 target/release/xfade
 ```
 
+Release 产物包含 Sigstore 无长期私钥签名和 GitHub 构建来源证明。运行下载文件前，
+可同时验证签发者身份与 SHA-256（需要安装 `cosign`）：
+
+```bash
+scripts/verify-release.sh vX.Y.Z
+```
+
+手动 Cosign 验签及 GitHub attestation 验证命令见
+[RELEASE.md](RELEASE.md#signing)。一行安装脚本会自动校验 SHA-256。
+
 ### GUI
 
 从 GitHub Release 下载 `xfade-gui_<version>_aarch64.dmg`（macOS Apple Silicon）拖入 Applications。或源码构建见下方「开发」。
