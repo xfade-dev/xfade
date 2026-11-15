@@ -1518,11 +1518,111 @@ mod tests {
         assert_eq!(sessions[0].provider_id.as_deref(), Some("yy"));
         assert_eq!(sessions[0].first_prompt.as_deref(), Some("s\nhello"));
 
-        // The mid-session handover got backfilled onto this session.
+        // The mid-session handover got backfilled onto this session and injected.
         let hs = db.list_handovers(&sid).unwrap();
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].from_model.as_deref(), Some("old-m"));
         assert_eq!(hs[0].to_model.as_deref(), Some("new-m"));
+        assert!(hs[0].injected, "handover should be marked as injected");
+
+        // The upstream received the auto-injected handover context on Turn 2.
+        let turn2_req = up.last_request().await;
+        assert!(
+            turn2_req.body.contains("<xfade_handover_context>"),
+            "Turn 2 body should carry injected handover context"
+        );
+        assert!(
+            turn2_req.body.contains("Model Transition: old-m -> new-m"),
+            "Turn 2 should include model transition info"
+        );
+
+        // Turn 3: No new model switch → no re-injection.
+        up.respond_sequence(vec![(
+            200,
+            r#"{"id":"r3","choices":[{"index":0,"message":{"role":"assistant","content":"ok3"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":4}}"#,
+        )]);
+        let (status, _headers3, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"ok"},{"role":"user","content":"and now?"},{"role":"assistant","content":"ok2"},{"role":"user","content":"turn 3"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let turn3_req = up.last_request().await;
+        assert!(
+            !turn3_req.body.contains("<xfade_handover_context>"),
+            "Turn 3 body should NOT re-inject handover context"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_auto_injection_anthropic_messages_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db()
+            .set_routes(&["yy".into()], None, "messages")
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sequence(vec![
+            (
+                200,
+                r#"{"id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude-3-7-sonnet","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2}}"#,
+            ),
+            (
+                200,
+                r#"{"id":"m2","type":"message","role":"assistant","content":[{"type":"text","text":"sure"}],"model":"claude-3-7-sonnet","stop_reason":"end_turn","usage":{"input_tokens":25,"output_tokens":4}}"#,
+            ),
+        ]);
+
+        // Turn 1
+        let (status, headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/messages",
+            r#"{"model":"claude-3-7-sonnet","system":"You are Claude.","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sid = headers
+            .iter()
+            .find(|(k, _)| k == "x-xfade-session-id")
+            .expect("session id on turn 1")
+            .1
+            .clone();
+
+        // Model switch during session
+        crate::sessions::record_handover(
+            &db,
+            "claude",
+            Some("claude-3-5-sonnet"),
+            Some("claude-3-7-sonnet"),
+        )
+        .unwrap();
+
+        // Turn 2
+        let (status, _headers2, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/messages",
+            r#"{"model":"claude-3-7-sonnet","system":"You are Claude.","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"help me write code"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Verify upstream received the injected system prompt carrying handover context
+        let req2 = up.last_request().await;
+        let v: serde_json::Value = serde_json::from_str(&req2.body).unwrap();
+        let sys = v["system"].as_str().expect("system prompt string");
+        assert!(sys.starts_with("You are Claude.\n\n<xfade_handover_context>"));
+        assert!(sys.contains("Model Transition: claude-3-5-sonnet -> claude-3-7-sonnet"));
+
+        // Verify handover record in DB is marked injected
+        let hs = db.list_handovers(&sid).unwrap();
+        assert_eq!(hs.len(), 1);
+        assert!(hs[0].injected);
     }
 
     #[tokio::test]

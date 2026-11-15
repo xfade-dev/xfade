@@ -52,7 +52,7 @@ pub struct SessionRow {
 /// A model/route switch recorded on the session timeline. `session_id` is
 /// NULL at switch time (a config-level switch has no request context) and is
 /// backfilled by the forward pipeline from the next matching request.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
 pub struct HandoverRow {
     pub id: i64,
     pub tool: String,
@@ -60,6 +60,8 @@ pub struct HandoverRow {
     pub from_model: Option<String>,
     pub to_model: Option<String>,
     pub ts: String,
+    pub injected: bool,
+    pub injected_at: Option<String>,
 }
 
 /// Stats aggregation dimension.
@@ -207,7 +209,9 @@ impl Database {
                 session_id TEXT,
                 from_model TEXT,
                 to_model TEXT,
-                ts TEXT NOT NULL
+                ts TEXT NOT NULL,
+                injected INTEGER NOT NULL DEFAULT 0,
+                injected_at TEXT
             );",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
@@ -274,6 +278,25 @@ impl Database {
         }
         if !log_cols.contains("session_id") {
             conn.execute("ALTER TABLE request_logs ADD COLUMN session_id TEXT", [])?;
+        }
+        let existing_handover_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(handovers)")?;
+            let mut rows = stmt.query([])?;
+            let mut cols = std::collections::HashSet::new();
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                cols.insert(name);
+            }
+            cols
+        };
+        if !existing_handover_cols.contains("injected") {
+            conn.execute(
+                "ALTER TABLE handovers ADD COLUMN injected INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !existing_handover_cols.contains("injected_at") {
+            conn.execute("ALTER TABLE handovers ADD COLUMN injected_at TEXT", [])?;
         }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS repo_maps (
@@ -892,8 +915,8 @@ impl Database {
         ts: &str,
     ) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO handovers (tool, session_id, from_model, to_model, ts)
-             VALUES (?1, NULL, ?2, ?3, ?4)",
+            "INSERT INTO handovers (tool, session_id, from_model, to_model, ts, injected, injected_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, 0, NULL)",
             params![tool, from_model, to_model, ts],
         )?;
         Ok(())
@@ -972,7 +995,7 @@ impl Database {
     pub fn list_handovers(&self, session_id: &str) -> Result<Vec<HandoverRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, tool, session_id, from_model, to_model, ts
+            "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
              FROM handovers WHERE session_id = ?1 ORDER BY id ASC",
         )?;
         let mut rows = stmt.query(params![session_id])?;
@@ -985,9 +1008,90 @@ impl Database {
                 from_model: row.get(3)?,
                 to_model: row.get(4)?,
                 ts: row.get(5)?,
+                injected: row.get::<_, i64>(6)? != 0,
+                injected_at: row.get(7)?,
             });
         }
         Ok(out)
+    }
+
+    /// Find the most recent pending handover that has not been injected yet.
+    /// Matches either the current `session_id` or an unattributed handover (`session_id IS NULL`)
+    /// within the time window (`cutoff_ts`).
+    pub fn find_pending_handover(
+        &self,
+        session_id: Option<&str>,
+        cutoff_ts: &str,
+    ) -> Result<Option<HandoverRow>> {
+        let conn = self.conn();
+        match session_id {
+            Some(sid) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
+                     FROM handovers
+                     WHERE (session_id = ?1 OR session_id IS NULL)
+                       AND ts >= ?2
+                       AND injected = 0
+                     ORDER BY id DESC LIMIT 1",
+                )?;
+                let mut rows = stmt.query(params![sid, cutoff_ts])?;
+                match rows.next()? {
+                    Some(row) => Ok(Some(HandoverRow {
+                        id: row.get(0)?,
+                        tool: row.get(1)?,
+                        session_id: row.get(2)?,
+                        from_model: row.get(3)?,
+                        to_model: row.get(4)?,
+                        ts: row.get(5)?,
+                        injected: row.get::<_, i64>(6)? != 0,
+                        injected_at: row.get(7)?,
+                    })),
+                    None => Ok(None),
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, tool, session_id, from_model, to_model, ts, injected, injected_at
+                     FROM handovers
+                     WHERE session_id IS NULL
+                       AND ts >= ?1
+                       AND injected = 0
+                     ORDER BY id DESC LIMIT 1",
+                )?;
+                let mut rows = stmt.query(params![cutoff_ts])?;
+                match rows.next()? {
+                    Some(row) => Ok(Some(HandoverRow {
+                        id: row.get(0)?,
+                        tool: row.get(1)?,
+                        session_id: row.get(2)?,
+                        from_model: row.get(3)?,
+                        to_model: row.get(4)?,
+                        ts: row.get(5)?,
+                        injected: row.get::<_, i64>(6)? != 0,
+                        injected_at: row.get(7)?,
+                    })),
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Mark a handover as injected, attributing it to `session_id` if currently NULL.
+    pub fn mark_handover_injected(
+        &self,
+        id: i64,
+        session_id: &str,
+        injected_at: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE handovers
+             SET injected = 1,
+                 injected_at = ?1,
+                 session_id = CASE WHEN (session_id IS NULL OR session_id = '') AND ?2 != '' THEN ?2 ELSE session_id END
+             WHERE id = ?3",
+            params![injected_at, session_id, id],
+        )?;
+        Ok(())
     }
 
     // ── Circuit breaker persistence ───────────────────────────────────────
@@ -1819,6 +1923,44 @@ mod tests {
         db.backfill_handover_session("s11", "2026-10-09T13:00:00Z")
             .unwrap();
         assert!(db.list_handovers("s11").unwrap().is_empty());
+    }
+
+    #[test]
+    fn handover_pending_and_injection_lifecycle() {
+        let db = Database::open_memory().unwrap();
+        // Insert an unattributed handover
+        db.insert_handover(
+            "claude",
+            Some("opus"),
+            Some("sonnet"),
+            "2026-10-09T10:00:00Z",
+        )
+        .unwrap();
+
+        // Query pending handover within window
+        let pending = db
+            .find_pending_handover(Some("s1"), "2026-10-09T09:50:00Z")
+            .unwrap()
+            .expect("should find pending handover");
+        assert_eq!(pending.from_model.as_deref(), Some("opus"));
+        assert_eq!(pending.to_model.as_deref(), Some("sonnet"));
+        assert!(!pending.injected);
+
+        // Mark it as injected
+        db.mark_handover_injected(pending.id, "s1", "2026-10-09T10:01:00Z")
+            .unwrap();
+
+        // Should no longer be pending
+        let pending_after = db
+            .find_pending_handover(Some("s1"), "2026-10-09T09:50:00Z")
+            .unwrap();
+        assert!(pending_after.is_none());
+
+        // But list_handovers shows it as injected
+        let hs = db.list_handovers("s1").unwrap();
+        assert_eq!(hs.len(), 1);
+        assert!(hs[0].injected);
+        assert_eq!(hs[0].injected_at.as_deref(), Some("2026-10-09T10:01:00Z"));
     }
 
     #[test]

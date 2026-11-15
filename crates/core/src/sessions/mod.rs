@@ -31,13 +31,13 @@ pub const SESSION_STICKY_WINDOW_SECS: i64 = 30 * 60;
 /// never persisted.
 pub const FIRST_PROMPT_PREVIEW_CHARS: usize = 200;
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn cutoff_rfc3339(window_secs: i64) -> String {
+pub(crate) fn cutoff_rfc3339(window_secs: i64) -> String {
     (OffsetDateTime::now_utc() - time::Duration::seconds(window_secs))
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())

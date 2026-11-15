@@ -1327,8 +1327,9 @@ pub async fn handle(
     body: Bytes,
 ) -> Response {
     let endpoint = endpoint_from_path(uri.path());
+    let mut body = body;
     // Parse the body once; model extraction and the session engine share it.
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let mut parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
     let model = parsed
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()))
@@ -1343,6 +1344,40 @@ pub async fn handle(
         let fp = crate::sessions::fingerprint(&opener, endpoint);
         crate::sessions::resolve_session(svc.core.db(), &fp, &opener)
     });
+
+    // Check for a pending handover to auto-inject into the request
+    let cutoff = crate::sessions::cutoff_rfc3339(crate::sessions::SESSION_STICKY_WINDOW_SECS);
+    if let Ok(Some(handover)) = svc
+        .core
+        .db()
+        .find_pending_handover(session_id.as_deref(), &cutoff)
+    {
+        if let Some(ref mut parsed_val) = parsed {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let mut brief = crate::sessions::handover::collect_handover(
+                svc.core.db(),
+                &cwd,
+                crate::sessions::handover::DEFAULT_MAX_DIFF_CHARS,
+            );
+            if brief.model.is_none() {
+                brief.model = handover.from_model.clone();
+            }
+            brief.session_id = session_id.clone();
+            let xml = brief
+                .to_injection_xml(handover.from_model.as_deref(), handover.to_model.as_deref());
+            if crate::sessions::handover::inject_handover_into_payload(parsed_val, endpoint, &xml) {
+                if let Ok(new_bytes) = serde_json::to_vec(parsed_val) {
+                    body = Bytes::from(new_bytes);
+                }
+                let now = crate::sessions::now_rfc3339();
+                let effective_sid = session_id.as_deref().unwrap_or("");
+                let _ = svc
+                    .core
+                    .db()
+                    .mark_handover_injected(handover.id, effective_sid, &now);
+            }
+        }
+    }
     let mut resp = forward_with_failover(
         &svc,
         "POST",
