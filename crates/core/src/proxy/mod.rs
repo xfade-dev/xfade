@@ -3,6 +3,7 @@ pub mod convert;
 pub mod forward;
 #[cfg(test)]
 pub mod testsupport;
+pub mod thinking_rectifier;
 pub mod usage;
 
 mod auth;
