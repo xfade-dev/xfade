@@ -100,7 +100,7 @@ xfade proxy status        # prints the per-route model map
 
 By default `GET /v1/models` is a plain failover forward, so a client only ever sees the **first** successful upstream's catalog. When several routes expose disjoint model lists, that hides most of them from AI coding tools.
 
-`xfade proxy models-merge on` (default **off**) changes `/v1/models` into an aggregator: the daemon probes `/v1/models` on every configured route concurrently (5s timeout each, skipping circuit-open providers) and merges the `data[]` arrays into one `{"object":"list","data":[...]}` response.
+`xfade proxy models-merge on` (default **off**) changes `/v1/models` into an aggregator: the daemon probes `/v1/models` on every configured route concurrently (15s timeout each, skipping circuit-open providers) and merges the `data[]` arrays into one `{"object":"list","data":[...]}` response.
 
 ```bash
 xfade proxy use freebuff omni --target chat

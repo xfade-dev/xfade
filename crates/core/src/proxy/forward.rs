@@ -39,7 +39,9 @@ const SSE_TAIL_CAP: usize = 8 * 1024;
 
 /// Per-upstream timeout for the aggregated `/v1/models` probe. The shared
 /// client has a 120s total timeout, far too long for a model-list poll.
-const MODELS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 15s: large cold catalogs (e.g. a 500+ model router with a short cache TTL)
+/// can take several seconds to answer; 5s silently dropped whole routes.
+const MODELS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn endpoint_path(endpoint: &str) -> &'static str {
     match endpoint {
