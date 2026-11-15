@@ -2,7 +2,7 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v0.11.0 — 2026-11-15
 
 ### Security
 - **fix(proxy)**: inbound credentials no longer reach upstreams. Only `Authorization` used to be stripped, so a client's `x-api-key` / `api-key` / `x-goog-api-key` / `x-auth-token` / `proxy-authorization` / `cookie` were forwarded to the first-choice provider *and every failover target*. All are now dropped before the route's own key is injected.
