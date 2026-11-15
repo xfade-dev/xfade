@@ -15,6 +15,8 @@
 //! - Two conversations with an identical opener inside the sticky window
 //!   share one session row (observability-grade identity, not a guarantee).
 
+pub mod handover;
+
 use crate::error::Result;
 use crate::store::db::Database;
 use sha2::{Digest, Sha256};

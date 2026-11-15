@@ -44,6 +44,33 @@ pub fn git_pulse(root: &Path) -> Option<GitPulse> {
     })
 }
 
+/// Uncommitted working tree files (staged, modified, untracked) via `git status --porcelain`.
+pub fn git_working_files(root: &Path) -> Vec<String> {
+    git(root, &["status", "--porcelain"])
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Diff stat of uncommitted working tree changes.
+pub fn git_diff_stat(root: &Path, max_chars: usize) -> Option<String> {
+    let diff = git(root, &["diff", "HEAD", "--stat"]).or_else(|| git(root, &["diff", "--stat"]))?;
+    let trimmed = diff.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= max_chars {
+        Some(trimmed.to_string())
+    } else {
+        let truncated: String = trimmed.chars().take(max_chars).collect();
+        Some(format!("{truncated}\n... (truncated)"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +123,41 @@ mod tests {
         assert!(pulse
             .recent_subjects
             .contains(&"initial commit".to_string()));
+    }
+
+    #[test]
+    fn git_working_files_and_diff_stat_test() {
+        let d = tempfile::tempdir().unwrap();
+        init_repo(d.path());
+        commit(d.path(), "initial commit");
+
+        let test_file = d.path().join("modified.txt");
+        std::fs::write(&test_file, "line 1\nline 2\n").unwrap();
+        Command::new("git")
+            .args(["-C", d.path().to_str().unwrap(), "add", "modified.txt"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                d.path().to_str().unwrap(),
+                "commit",
+                "-q",
+                "-m",
+                "add modified.txt",
+            ])
+            .output()
+            .unwrap();
+
+        std::fs::write(&test_file, "line 1\nline 2\nline 3\n").unwrap();
+        let untracked = d.path().join("untracked.txt");
+        std::fs::write(&untracked, "hello").unwrap();
+
+        let files = git_working_files(d.path());
+        assert_eq!(files.len(), 2);
+
+        let stat = git_diff_stat(d.path(), 500);
+        assert!(stat.is_some());
+        assert!(stat.unwrap().contains("modified.txt"));
     }
 }

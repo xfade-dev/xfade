@@ -863,3 +863,23 @@ fn stats_by_session_accepted() {
         .assert()
         .failure();
 }
+
+#[test]
+fn handover_command_prints_brief() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["handover"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "### [xfade Session Handover Context]",
+        ));
+
+    xfade(home.path())
+        .args(["handover", "--raw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "### [xfade Session Handover Context]",
+        ));
+}

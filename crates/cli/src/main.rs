@@ -148,6 +148,15 @@ enum Cmd {
     Project,
     /// Update xfade to the latest GitHub release
     SelfUpdate,
+    /// Generate a seamless handover brief from the recent session and git state
+    Handover {
+        /// Copy handover brief to system clipboard
+        #[arg(long)]
+        copy: bool,
+        /// Only output the raw markdown brief (no formatting/hints)
+        #[arg(long)]
+        raw: bool,
+    },
     /// Interactive TUI for switching providers
     Tui {
         #[arg(long)]
@@ -191,6 +200,9 @@ struct RunOpts {
     /// API key (stored key first, then the global key)
     #[arg(long)]
     key: Option<String>,
+    /// Capture and copy handover context from the previous session into clipboard
+    #[arg(long)]
+    handover: bool,
     /// Arguments after `--` are passed to the tool itself
     #[arg(last = true)]
     args: Vec<String>,
@@ -1028,6 +1040,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
+        Cmd::Handover { copy, raw } => cmd_handover(copy, raw),
         Cmd::SelfUpdate => self_update(),
         Cmd::Tui { tool } => {
             let core = build_core()?;
@@ -1192,6 +1205,82 @@ fn parse_since(s: &str) -> Result<String, CoreError> {
             path: "time".into(),
             msg: e.to_string(),
         })
+}
+
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+
+    #[cfg(target_os = "windows")]
+    let mut child = Command::new("clip").stdin(Stdio::piped()).spawn()?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut child = {
+        if let Ok(c) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
+            c
+        } else if let Ok(c) = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            c
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither 'wl-copy' nor 'xclip' found",
+            ));
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clipboard command exited with status {status}"
+        )))
+    }
+}
+
+fn cmd_handover(copy: bool, raw: bool) -> Result<(), CoreError> {
+    let core = build_core()?;
+    let cwd = std::env::current_dir()?;
+    let brief = xfade_core::sessions::handover::collect_handover(
+        core.db(),
+        &cwd,
+        xfade_core::sessions::handover::DEFAULT_MAX_DIFF_CHARS,
+    );
+    let md = brief.to_markdown();
+
+    if raw {
+        println!("{md}");
+        return Ok(());
+    }
+
+    if copy {
+        match copy_to_clipboard(&md) {
+            Ok(()) => {
+                println!("✓ Handover brief copied to clipboard.");
+                println!();
+                println!("{md}");
+            }
+            Err(e) => {
+                eprintln!("note: clipboard copy failed ({e}); printing brief below:\n");
+                println!("{md}");
+            }
+        }
+    } else {
+        println!("{md}");
+        println!();
+        println!("tip: pass --copy to copy directly to clipboard, or pass --raw for piped output");
+    }
+    Ok(())
 }
 
 /// Interactive-mode decision: skip interactivity once NAME (positional) is provided.
@@ -1432,6 +1521,25 @@ fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
 
     let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
     warn_legacy_wire_api(tool);
+
+    if opts.handover {
+        let cwd = std::env::current_dir()?;
+        let brief = xfade_core::sessions::handover::collect_handover(
+            core.db(),
+            &cwd,
+            xfade_core::sessions::handover::DEFAULT_MAX_DIFF_CHARS,
+        );
+        let md = brief.to_markdown();
+        let copied = copy_to_clipboard(&md).is_ok();
+        eprintln!("╭────────────────────── [xfade] Session Handover ──────────────────────╮");
+        if copied {
+            eprintln!("│ Context from previous session captured & copied to clipboard!        │");
+        } else {
+            eprintln!("│ Context from previous session captured successfully.                 │");
+        }
+        eprintln!("╰──────────────────────────────────────────────────────────────────────╯");
+    }
+
     let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
     let status = Command::new(&bin)
         .args(plan.args_prefix())
