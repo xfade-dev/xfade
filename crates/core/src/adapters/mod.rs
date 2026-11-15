@@ -52,13 +52,9 @@ pub fn adapter_for(tool: ToolKind, home: &Path) -> Box<dyn ToolAdapter> {
 }
 
 /// Atomic write via temp file + rename; auto-creates parent directories.
+/// Client configs can embed API keys, so the file is created owner-only (0600).
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp-xfade");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
+    crate::fsutil::write_private(path, contents)?;
     Ok(())
 }
 

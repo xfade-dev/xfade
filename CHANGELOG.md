@@ -2,6 +2,26 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+- **fix(proxy)**: inbound credentials no longer reach upstreams. Only `Authorization` used to be stripped, so a client's `x-api-key` / `api-key` / `x-goog-api-key` / `x-auth-token` / `proxy-authorization` / `cookie` were forwarded to the first-choice provider *and every failover target*. All are now dropped before the route's own key is injected.
+- **fix(proxy)**: browser / DNS-rebinding defence. A loopback-bound listener now rejects requests whose `Host` is not `localhost` / a loopback IP, and requests carrying a non-loopback `Origin` (including `null`) with 403. CLI and SDK clients are unaffected.
+- **fix(proxy)**: binding a non-loopback `--host` without an auth token is now refused at startup. An empty token counts as no token.
+- **feat(proxy)**: when `auth_token` is set, it is accepted as `Authorization: Bearer` **or** `x-api-key` (Anthropic-native clients), and compared in constant time.
+- **fix(daemon)**: the auth token is no longer written into the launchd plist / systemd `ExecStart` (visible to every local user via `ps`). It lives in an owner-only `auth_token` file and the unit passes `--auth-token-file`. New flag: `xfade serve --auth-token-file <path>`. Re-run `xfade serve install` to migrate an existing install.
+- **fix(files)**: files that can hold credentials are created owner-only (0600) from the start and renamed into place — client config files written by every adapter, their backups and restores, the file secrets backend (previously written first, then chmod'ed), `daemon.json`, and the plist/unit.
+- **fix(cli)**: `xfade config` no longer prints the first 8 characters of the global API key.
+- **fix(install)**: `install.sh` and `xfade self-update` now verify the downloaded tarball against the release's `SHA256SUMS` and abort (installing nothing) on a mismatch, a missing `SHA256SUMS`, or an unlisted asset. The release workflow no longer ignores a failed checksum check.
+
+### Compatibility
+- Clients that reach the proxy through a non-loopback hostname (for example from a container via `host.docker.internal`) need `--host <addr>` **and** an auth token now.
+- Existing 0644 client config files are rewritten as 0600 the next time xfade writes them.
+
+### Known gaps (tracked, not in this change)
+- The proxy still defaults to no auth token on loopback; a generated per-install token needs a client-config migration and ships separately.
+- Adapters still write the real upstream API key into client config files (now 0600). Writing only a local proxy credential in proxy mode is planned.
+
 ## v0.10.1 — 2026-11-06
 
 ### New

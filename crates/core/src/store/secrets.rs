@@ -149,20 +149,12 @@ impl FileStore {
     }
 
     fn write_map(&self, map: &HashMap<String, String>) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Keyring(format!("create secrets dir: {e}")))?;
-        }
         let s = serde_json::to_string(map)
             .map_err(|e| CoreError::Keyring(format!("serialize secrets: {e}")))?;
-        std::fs::write(&self.path, s)
+        // Created owner-only (0600) from the start and renamed into place, so the
+        // secrets are never readable with wider permissions, even briefly.
+        crate::fsutil::write_private(&self.path, s.as_bytes())
             .map_err(|e| CoreError::Keyring(format!("write secrets: {e}")))?;
-        // Restrict to owner read/write (best-effort; a no-op on non-unix platforms).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
         Ok(())
     }
 }

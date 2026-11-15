@@ -143,7 +143,7 @@ xfade self-update                  # 自更新到最新 GitHub Release
 ### 本地代理
 
 ```bash
-xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # 前台运行
+xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T | --auth-token-file F]   # 前台运行
 xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status
 xfade proxy clear

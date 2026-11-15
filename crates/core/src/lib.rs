@@ -3,6 +3,7 @@ pub mod analyzer;
 pub mod backup;
 pub mod daemon;
 pub mod error;
+pub mod fsutil;
 pub mod launch;
 pub mod models;
 pub mod presets;

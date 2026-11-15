@@ -147,7 +147,7 @@ xfade self-update                  # update to the latest GitHub release
 ### Local proxy
 
 ```bash
-xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]   # run in foreground
+xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T | --auth-token-file F]   # run in foreground
 xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status
 xfade proxy clear

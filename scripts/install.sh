@@ -37,11 +37,14 @@ target="${target_arch}-${target_os}"
 echo "xfade: installing for ${target}"
 
 # --- resolve download URL --------------------------------------------------
+asset="xfade-${target}.tar.gz"
 if [ -n "${XFADE_VERSION:-}" ]; then
-  url="https://github.com/${REPO}/releases/download/${XFADE_VERSION}/xfade-${target}.tar.gz"
+  base="https://github.com/${REPO}/releases/download/${XFADE_VERSION}"
 else
-  url="https://github.com/${REPO}/releases/latest/download/xfade-${target}.tar.gz"
+  base="https://github.com/${REPO}/releases/latest/download"
 fi
+url="${base}/${asset}"
+sums_url="${base}/SHA256SUMS"
 
 # --- download + extract ----------------------------------------------------
 tmpdir="$(mktemp -d)"
@@ -49,6 +52,37 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "xfade: downloading $url"
 curl -fsSL "$url" -o "$tmpdir/xfade.tar.gz"
+
+# --- verify integrity (fail closed) ---------------------------------------
+# The tarball must match the SHA256SUMS published with the same release.
+# Nothing is extracted or installed unless the checksum matches.
+if ! curl -fsSL "$sums_url" -o "$tmpdir/SHA256SUMS"; then
+  echo "xfade: could not download $sums_url; refusing to install an unverified binary" >&2
+  exit 1
+fi
+expected="$(awk -v a="$asset" '{ f=$2; sub(/^\*/, "", f); if (f == a) { print $1; exit } }' "$tmpdir/SHA256SUMS")"
+if [ -z "$expected" ]; then
+  echo "xfade: $asset is not listed in SHA256SUMS; refusing to install" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmpdir/xfade.tar.gz" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmpdir/xfade.tar.gz" | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+  actual="$(openssl dgst -sha256 "$tmpdir/xfade.tar.gz" | awk '{print $NF}')"
+else
+  echo "xfade: no sha256sum/shasum/openssl available to verify the download" >&2
+  exit 1
+fi
+if [ "$expected" != "$actual" ]; then
+  echo "xfade: checksum mismatch for $asset" >&2
+  echo "  expected: $expected" >&2
+  echo "  actual:   $actual" >&2
+  exit 1
+fi
+echo "xfade: checksum verified"
+
 tar xzf "$tmpdir/xfade.tar.gz" -C "$tmpdir"
 
 # --- install ---------------------------------------------------------------

@@ -51,6 +51,7 @@ pub fn uninstall(home: &Path, do_unload: bool) -> Result<()> {
     let _ = std::fs::remove_file(daemon::plist_path(home));
     let _ = std::fs::remove_file(daemon::systemd_unit_path());
     let _ = std::fs::remove_file(daemon::daemon_json_path(&daemon::data_dir(home)));
+    let _ = std::fs::remove_file(daemon::token_file_path(&daemon::data_dir(home)));
     Ok(())
 }
 
@@ -77,7 +78,11 @@ mod tests {
         assert!(plist_txt.contains("ai.xfade.serve"));
         assert!(plist_txt.contains("serve"));
         assert!(plist_txt.contains("24860"));
-        assert!(plist_txt.contains("tok"));
+        // The token must live in an owner-only file, never in the plist args.
+        assert!(!plist_txt.contains("<string>tok</string>"));
+        assert!(plist_txt.contains("--auth-token-file"));
+        let tf = daemon::token_file_path(&daemon::data_dir(home));
+        assert_eq!(std::fs::read_to_string(tf).unwrap(), "tok");
         assert!(plist_txt.contains("RunAtLoad"));
         assert!(plist_txt.contains("KeepAlive"));
         let cfg_v: serde_json::Value =

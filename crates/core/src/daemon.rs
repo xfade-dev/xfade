@@ -38,11 +38,33 @@ pub fn read(data_dir: &Path) -> Option<DaemonConfig> {
     serde_json::from_str(&std::fs::read_to_string(daemon_json_path(data_dir)).ok()?).ok()
 }
 
+/// Owner-only file holding the proxy auth token. The service manager's unit
+/// passes `--auth-token-file <this>` so the token never appears in process
+/// arguments (visible to every local user via `ps`) or in the plist/unit file.
+pub fn token_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth_token")
+}
+
+/// Persist (or remove) the token file for `cfg`; returns its path when a token is set.
+fn sync_token_file(data_dir: &Path, cfg: &DaemonConfig) -> Result<Option<PathBuf>> {
+    let path = token_file_path(data_dir);
+    match cfg.auth_token.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) => {
+            crate::fsutil::write_private(&path, t.as_bytes())?;
+            Ok(Some(path))
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+            Ok(None)
+        }
+    }
+}
+
 pub fn write(data_dir: &Path, cfg: &DaemonConfig) -> Result<()> {
-    std::fs::create_dir_all(data_dir)?;
-    std::fs::write(
-        daemon_json_path(data_dir),
-        serde_json::to_string(cfg).unwrap(),
+    // daemon.json can hold the proxy auth token: owner-only.
+    crate::fsutil::write_private(
+        &daemon_json_path(data_dir),
+        serde_json::to_string(cfg).unwrap().as_bytes(),
     )?;
     Ok(())
 }
@@ -86,9 +108,10 @@ pub fn write_plist(exe: &str, cfg: &DaemonConfig, home: &Path) -> Result<PathBuf
         h = cfg.host,
         p = cfg.port
     );
-    if let Some(t) = &cfg.auth_token {
+    if let Some(tf) = sync_token_file(&dd, cfg)? {
         plist.push_str(&format!(
-            "<string>--auth-token</string><string>{t}</string>"
+            "<string>--auth-token-file</string><string>{}</string>",
+            tf.display()
         ));
     }
     plist.push_str(&format!(
@@ -100,7 +123,7 @@ pub fn write_plist(exe: &str, cfg: &DaemonConfig, home: &Path) -> Result<PathBuf
          </dict></plist>"
     ));
     let pp = plist_path(home);
-    std::fs::write(&pp, plist)?;
+    crate::fsutil::write_private(&pp, plist.as_bytes())?;
     write(&dd, cfg)?;
     Ok(pp)
 }
@@ -117,8 +140,8 @@ pub fn write_systemd_unit(exe: &str, cfg: &DaemonConfig) -> Result<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     std::fs::create_dir_all(&unit_dir)?;
     let mut exec = format!("{} serve --host {} --port {}", exe, cfg.host, cfg.port);
-    if let Some(t) = &cfg.auth_token {
-        exec.push_str(&format!(" --auth-token {}", t));
+    if let Some(tf) = sync_token_file(&dd, cfg)? {
+        exec.push_str(&format!(" --auth-token-file {}", tf.display()));
     }
     let unit = format!(
         "[Unit]\n\
@@ -135,7 +158,7 @@ pub fn write_systemd_unit(exe: &str, cfg: &DaemonConfig) -> Result<PathBuf> {
         log = dd.join("serve.log").display()
     );
     let up = systemd_unit_path();
-    std::fs::write(&up, unit)?;
+    crate::fsutil::write_private(&up, unit.as_bytes())?;
     write(&dd, cfg)?;
     Ok(up)
 }
@@ -222,4 +245,51 @@ pub fn unload(home: &Path) -> Result<()> {
         let _ = std::fs::remove_file(systemd_unit_path());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_passes_token_via_owner_only_file_not_argv() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = DaemonConfig {
+            host: "127.0.0.1".into(),
+            port: 24860,
+            auth_token: Some("s3cr3t-token".into()),
+        };
+        let pp = write_plist("/usr/bin/xfade", &cfg, home.path()).unwrap();
+        let plist = std::fs::read_to_string(&pp).unwrap();
+        assert!(!plist.contains("s3cr3t-token"), "token leaked into plist");
+        assert!(plist.contains("--auth-token-file"));
+        let dd = data_dir(home.path());
+        let tf = token_file_path(&dd);
+        assert_eq!(std::fs::read_to_string(&tf).unwrap(), "s3cr3t-token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [&tf, &daemon_json_path(&dd)] {
+                let m = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(m, 0o600, "{} must be owner-only", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn removing_token_removes_stale_token_file() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = DaemonConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            auth_token: Some("t".into()),
+        };
+        write_plist("/x", &cfg, home.path()).unwrap();
+        cfg.auth_token = None;
+        let pp = write_plist("/x", &cfg, home.path()).unwrap();
+        assert!(!token_file_path(&data_dir(home.path())).exists());
+        assert!(!std::fs::read_to_string(pp)
+            .unwrap()
+            .contains("--auth-token"));
+    }
 }

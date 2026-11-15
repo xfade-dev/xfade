@@ -162,7 +162,8 @@ impl ProxyService {
     }
 
     pub fn with_auth_token(mut self, token: Option<String>) -> Self {
-        self.auth_token = token;
+        // An empty token means "none", never "accept an empty credential".
+        self.auth_token = token.filter(|t| !t.is_empty());
         self
     }
 
@@ -201,6 +202,13 @@ impl ProxyService {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
+        if !auth::is_loopback_host(&self.host) && self.auth_token.is_none() {
+            return Err(crate::error::CoreError::Proxy(format!(
+                "refusing to listen on non-loopback address '{}' without an auth token; \
+                 pass --auth-token-file <path> (or bind 127.0.0.1)",
+                self.host
+            )));
+        }
         let addr = format!("{}:{}", self.host, self.port);
         let app = self.build_router();
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -234,6 +242,10 @@ impl ProxyService {
             .route("/health", get(|| async { "ok" }))
             .merge(protected)
             .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::host_origin_guard,
+            ))
             .with_state(state)
     }
 }
@@ -266,6 +278,112 @@ mod tests {
         let seen = up.last_request().await;
         assert_eq!(seen.authorization, "Bearer sk-real");
         assert!(seen.body.contains("\"model\":\"gpt-x\""));
+    }
+
+    async fn raw_get(url: &str, path: &str, headers: &[(&str, &str)]) -> u16 {
+        let mut req = reqwest::Client::new().get(format!("{url}{path}"));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_rejects_foreign_host_and_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let url = spawn_service(ProxyService::new(core)).await;
+        // DNS-rebinding style: attacker hostname resolving to 127.0.0.1.
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("Host", "evil.example:24860")]).await,
+            403
+        );
+        // Cross-site browser request.
+        assert_eq!(
+            raw_get(
+                &url,
+                "/__xfade/status",
+                &[("Origin", "https://evil.example")]
+            )
+            .await,
+            403
+        );
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("Origin", "null")]).await,
+            403
+        );
+        // /health is covered too.
+        assert_eq!(
+            raw_get(&url, "/health", &[("Host", "evil.example")]).await,
+            403
+        );
+        // Legitimate local clients still work.
+        assert_eq!(raw_get(&url, "/__xfade/status", &[]).await, 200);
+        assert_eq!(
+            raw_get(
+                &url,
+                "/__xfade/status",
+                &[("Origin", "http://localhost:3000")]
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("Host", "localhost:24860")]).await,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn token_accepts_bearer_or_x_api_key_and_rejects_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let url =
+            spawn_service(ProxyService::new(core).with_auth_token(Some("tok-123".into()))).await;
+        assert_eq!(raw_get(&url, "/__xfade/status", &[]).await, 401);
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("Authorization", "Bearer nope")]).await,
+            401
+        );
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("x-api-key", "nope")]).await,
+            401
+        );
+        assert_eq!(
+            raw_get(
+                &url,
+                "/__xfade/status",
+                &[("Authorization", "Bearer tok-123")]
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            raw_get(&url, "/__xfade/status", &[("x-api-key", "tok-123")]).await,
+            200
+        );
+        // /health stays open for liveness probes.
+        assert_eq!(raw_get(&url, "/health", &[]).await, 200);
+    }
+
+    #[tokio::test]
+    async fn empty_token_is_treated_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let svc = ProxyService::new(core).with_auth_token(Some(String::new()));
+        assert!(svc.auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_loopback_bind_requires_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let err = ProxyService::new(core)
+            .with_host_port("0.0.0.0", 0)
+            .serve_with_shutdown(async {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-loopback"), "{err}");
     }
 
     #[tokio::test]
