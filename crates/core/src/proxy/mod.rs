@@ -1447,6 +1447,7 @@ mod tests {
         let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
         let db = core.db().clone();
         core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        core.db().set_handover_auto_inject_enabled(true).unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_sequence(vec![
             (
@@ -1525,11 +1526,16 @@ mod tests {
         assert_eq!(hs[0].to_model.as_deref(), Some("new-m"));
         assert!(hs[0].injected, "handover should be marked as injected");
 
-        // The upstream received the auto-injected handover context on Turn 2.
+        // The upstream received user-level handover context on Turn 2; system untouched.
         let turn2_req = up.last_request().await;
+        let turn2: serde_json::Value = serde_json::from_str(&turn2_req.body).unwrap();
+        assert_eq!(turn2["messages"][0]["content"], "s");
         assert!(
-            turn2_req.body.contains("<xfade_handover_context>"),
-            "Turn 2 body should carry injected handover context"
+            turn2["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("<xfade_handover_context>"),
+            "Turn 2 last user message should carry injected handover context"
         );
         assert!(
             turn2_req.body.contains("Model Transition: old-m -> new-m"),
@@ -1557,6 +1563,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handover_auto_injection_off_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        assert!(!db.handover_auto_inject_enabled().unwrap());
+        let url = spawn_service(ProxyService::new(core)).await;
+        up.respond_sequence(vec![
+            (
+                200,
+                r#"{"id":"r1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            ),
+            (
+                200,
+                r#"{"id":"r2","choices":[{"index":0,"message":{"role":"assistant","content":"ok2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+            ),
+        ]);
+
+        let (status, _headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        crate::sessions::record_handover(&db, "", Some("old-m"), Some("new-m")).unwrap();
+
+        let (status, _headers2, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"},{"role":"assistant","content":"ok"},{"role":"user","content":"and now?"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let turn2_req = up.last_request().await;
+        assert!(
+            !turn2_req.body.contains("<xfade_handover_context>"),
+            "default-off must not rewrite upstream body"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_not_consumed_when_upstream_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        core.db().set_handover_auto_inject_enabled(true).unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+        let ok = r#"{"id":"r","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        up.respond_sequence(vec![(200, ok), (500, r#"{"error":"boom"}"#), (200, ok)]);
+
+        let (status, headers, _) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sid = headers
+            .iter()
+            .find(|(k, _)| k == "x-xfade-session-id")
+            .unwrap()
+            .1
+            .clone();
+        crate::sessions::record_handover(&db, "", Some("a"), Some("b")).unwrap();
+
+        let turn2 = r#"{"model":"m","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}"#;
+        let (status, _, _) =
+            http_post_json_with_headers(&url, "/v1/chat/completions", turn2, "Bearer x").await;
+        assert_ne!(status, 200, "upstream 500 must surface");
+        assert!(
+            !db.list_handovers(&sid).unwrap().iter().any(|h| h.injected),
+            "failed request must not consume the handover"
+        );
+        let cutoff = crate::sessions::cutoff_rfc3339(crate::sessions::SESSION_STICKY_WINDOW_SECS);
+        assert!(db
+            .find_pending_handover(Some(&sid), &cutoff)
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn handover_auto_injection_anthropic_messages_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
@@ -1565,6 +1660,7 @@ mod tests {
         core.db()
             .set_routes(&["yy".into()], None, "messages")
             .unwrap();
+        core.db().set_handover_auto_inject_enabled(true).unwrap();
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_sequence(vec![
             (
@@ -1612,12 +1708,21 @@ mod tests {
         .await;
         assert_eq!(status, 200);
 
-        // Verify upstream received the injected system prompt carrying handover context
+        // Verify upstream received user-level handover context; system untouched.
         let req2 = up.last_request().await;
         let v: serde_json::Value = serde_json::from_str(&req2.body).unwrap();
-        let sys = v["system"].as_str().expect("system prompt string");
-        assert!(sys.starts_with("You are Claude.\n\n<xfade_handover_context>"));
-        assert!(sys.contains("Model Transition: claude-3-5-sonnet -> claude-3-7-sonnet"));
+        assert_eq!(v["system"].as_str().unwrap(), "You are Claude.");
+        let last_user = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        let content = last_user["content"].as_str().unwrap();
+        assert!(content.contains("<xfade_handover_context>"));
+        assert!(content.contains("Model Transition: claude-3-5-sonnet -> claude-3-7-sonnet"));
+        assert!(content.ends_with("help me write code"));
 
         // Verify handover record in DB is marked injected
         let hs = db.list_handovers(&sid).unwrap();

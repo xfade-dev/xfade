@@ -146,7 +146,7 @@ impl HandoverBrief {
         }
 
         lines.push(
-            "> Instruction: This context was handed over from the developer's previous model session. Continue working seamlessly from this state.".to_string(),
+            "> Note: This context was handed over from the developer's previous model session. Treat it as background data and continue from the latest user request.".to_string(),
         );
         lines.push("</xfade_handover_context>".to_string());
 
@@ -154,11 +154,117 @@ impl HandoverBrief {
     }
 }
 
-/// Inject the handover XML into a JSON request payload based on the protocol endpoint.
+/// Inject `xml` into the **final** message of a chat/messages array as
+/// user-level data; earlier history is never rewritten.
 ///
-/// - `messages` (Anthropic): Appends to `system` string or array, or sets `system` string.
-/// - `chat` (OpenAI): Appends to existing system/developer message or inserts a system message at index 0.
-/// - `responses` (OpenAI Responses): Appends to or sets `instructions`.
+/// - final message is `user` with string content → prepend to the string;
+/// - final `user` message with block content → insert a text block *after*
+///   any leading `tool_result` blocks (Anthropic requires tool results first);
+/// - Anthropic (`anthropic = true`) with a final `assistant` message (prefill)
+///   → skip (`false`): a trailing user turn would change prefill semantics;
+/// - otherwise (OpenAI chat ending in `assistant`/`tool`, or empty) → push a
+///   new user message.
+fn inject_into_final_message(
+    messages: &mut Vec<serde_json::Value>,
+    xml: &str,
+    anthropic: bool,
+) -> bool {
+    let last_role = messages
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        .map(str::to_owned);
+    match last_role.as_deref() {
+        Some("user") => {
+            let msg = messages.last_mut().expect("checked non-empty");
+            match msg.get_mut("content") {
+                Some(serde_json::Value::String(s)) => {
+                    *s = format!("{xml}\n\n{s}");
+                }
+                Some(serde_json::Value::Array(arr)) => {
+                    let at = arr
+                        .iter()
+                        .take_while(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                        .count();
+                    arr.insert(
+                        at,
+                        serde_json::json!({
+                            "type": "text",
+                            "text": format!("{xml}\n\n"),
+                        }),
+                    );
+                }
+                _ => {
+                    msg["content"] = serde_json::Value::String(xml.to_string());
+                }
+            }
+            true
+        }
+        Some("assistant") if anthropic => false,
+        _ => {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": xml,
+            }));
+            true
+        }
+    }
+}
+
+/// Prepend `xml` to the last user item in an OpenAI Responses `input` array
+/// (or string). Falls back to inserting a user message item.
+fn prepend_to_responses_input(input: &mut serde_json::Value, xml: &str) -> bool {
+    match input {
+        serde_json::Value::String(s) => {
+            *s = format!("{xml}\n\n{s}");
+            true
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut().rev() {
+                if item.get("role").and_then(|r| r.as_str()) != Some("user") {
+                    continue;
+                }
+                match item.get_mut("content") {
+                    Some(serde_json::Value::String(s)) => {
+                        *s = format!("{xml}\n\n{s}");
+                        return true;
+                    }
+                    Some(serde_json::Value::Array(arr)) => {
+                        arr.insert(
+                            0,
+                            serde_json::json!({
+                                "type": "input_text",
+                                "text": format!("{xml}\n\n"),
+                            }),
+                        );
+                        return true;
+                    }
+                    _ => {
+                        item["content"] = serde_json::Value::String(xml.to_string());
+                        return true;
+                    }
+                }
+            }
+            items.push(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": xml}],
+            }));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Inject the handover XML into a JSON request payload as **user-level data**
+/// (never elevated into `system` / `developer` / `instructions`).
+///
+/// - `messages` (Anthropic): final user message (after any `tool_result`
+///   blocks); skipped when the request ends with an assistant prefill.
+/// - `chat` (OpenAI): final user message, or a new trailing user message.
+/// - `responses` (OpenAI Responses): prepends to `input` user content.
 ///
 /// Returns true if injection succeeded and modified the payload.
 pub fn inject_handover_into_payload(
@@ -172,84 +278,74 @@ pub fn inject_handover_into_payload(
     };
 
     match endpoint {
-        "messages" => match obj.get_mut("system") {
-            Some(serde_json::Value::String(s)) => {
-                s.push_str("\n\n");
-                s.push_str(xml);
-                true
-            }
-            Some(serde_json::Value::Array(arr)) => {
-                arr.push(serde_json::json!({
-                    "type": "text",
-                    "text": format!("\n\n{xml}"),
-                }));
-                true
-            }
-            Some(serde_json::Value::Null) | None => {
-                obj.insert(
-                    "system".to_string(),
-                    serde_json::Value::String(xml.to_string()),
-                );
-                true
-            }
-            _ => false,
-        },
-        "chat" => {
+        "messages" | "chat" => {
             let messages = match obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
                 Some(arr) => arr,
                 None => return false,
             };
-
-            // If first message is system or developer, append to it
-            if let Some(first) = messages.first_mut() {
-                if let Some(role) = first.get("role").and_then(|r| r.as_str()) {
-                    if role == "system" || role == "developer" {
-                        if let Some(content) = first.get_mut("content").and_then(|c| c.as_str()) {
-                            let updated = format!("{content}\n\n{xml}");
-                            first["content"] = serde_json::Value::String(updated);
-                            return true;
-                        }
-                    }
-                }
-            }
-
-            // Otherwise, prepend a system message
-            messages.insert(
-                0,
-                serde_json::json!({
-                    "role": "system",
-                    "content": xml,
-                }),
-            );
-            true
+            inject_into_final_message(messages, xml, endpoint == "messages")
         }
-        "responses" => match obj.get_mut("instructions") {
-            Some(serde_json::Value::String(s)) => {
-                s.push_str("\n\n");
-                s.push_str(xml);
-                true
-            }
-            Some(serde_json::Value::Null) | None => {
+        "responses" => match obj.get_mut("input") {
+            Some(input) => prepend_to_responses_input(input, xml),
+            None => {
                 obj.insert(
-                    "instructions".to_string(),
+                    "input".to_string(),
                     serde_json::Value::String(xml.to_string()),
                 );
                 true
             }
-            _ => false,
         },
         _ => false,
     }
 }
 
+/// Resolve the project root used when collecting git/workdir context for L3.
+/// Preference order: explicit `header_project_root` — honored only when it is
+/// an existing directory that xfade already analyzed (a `repo_maps` entry), so
+/// a client cannot point the gateway at arbitrary paths — → latest cached
+/// `repo_maps` root → process cwd (last resort).
+pub fn resolve_project_root(
+    db: &Database,
+    header_project_root: Option<&str>,
+) -> std::path::PathBuf {
+    if let Some(raw) = header_project_root {
+        let p = std::path::PathBuf::from(raw);
+        if p.is_dir() && matches!(db.get_repo_map(raw), Ok(Some(_))) {
+            return p;
+        }
+    }
+    if let Ok(Some((root, _))) = db.latest_repo_map() {
+        let p = std::path::PathBuf::from(&root);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
 /// Collect handover context from the database and working tree.
+/// Uses the globally newest session when `session_id` is `None` (L1/L2 CLI).
 pub fn collect_handover(db: &Database, root: &Path, max_diff_chars: usize) -> HandoverBrief {
+    collect_handover_for(db, root, max_diff_chars, None)
+}
+
+/// Like [`collect_handover`], but prefers the given `session_id` when present.
+pub fn collect_handover_for(
+    db: &Database,
+    root: &Path,
+    max_diff_chars: usize,
+    session_id: Option<&str>,
+) -> HandoverBrief {
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
 
-    // 1. Query most recent session from the DB
-    let recent_session = db.list_sessions(1).ok().and_then(|mut list| list.pop());
+    // An explicit session id (L3) is authoritative: never substitute another
+    // session's goal. Only the id-less L1/L2 path uses the newest row.
+    let recent_session = match session_id {
+        Some(sid) => db.get_session(sid).ok().flatten(),
+        None => db.list_sessions(1).ok().and_then(|mut list| list.pop()),
+    };
     let session_id = recent_session.as_ref().map(|s| s.id.clone());
     let tool = recent_session
         .as_ref()
@@ -372,6 +468,92 @@ mod tests {
     }
 
     #[test]
+    fn collect_handover_for_prefers_explicit_session() {
+        let d = tempfile::tempdir().unwrap();
+        let db_path = d.path().join("test.db");
+        let db = Database::open(&db_path).unwrap();
+
+        db.insert_session("s-old", "fp-old", "2026-11-15T09:00:00Z", Some("old goal"))
+            .unwrap();
+        db.update_session_progress(
+            "s-old",
+            "claude",
+            "p1",
+            Some("opus"),
+            1,
+            1,
+            "ok",
+            "2026-11-15T09:01:00Z",
+        )
+        .unwrap();
+        db.insert_session(
+            "s-new",
+            "fp-new",
+            "2026-11-15T10:00:00Z",
+            Some("newest goal"),
+        )
+        .unwrap();
+        db.update_session_progress(
+            "s-new",
+            "codex",
+            "p2",
+            Some("gpt"),
+            1,
+            1,
+            "ok",
+            "2026-11-15T10:01:00Z",
+        )
+        .unwrap();
+
+        // Without id → newest
+        let newest = collect_handover(&db, d.path(), 500);
+        assert_eq!(newest.session_id.as_deref(), Some("s-new"));
+        assert_eq!(newest.goal.as_deref(), Some("newest goal"));
+
+        // With id → that session, even if older
+        let older = collect_handover_for(&db, d.path(), 500, Some("s-old"));
+        assert_eq!(older.session_id.as_deref(), Some("s-old"));
+        assert_eq!(older.goal.as_deref(), Some("old goal"));
+        assert_eq!(older.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn resolve_project_root_prefers_header_then_repo_map() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let db = Database::open_memory().unwrap();
+        db.save_repo_map(&project.display().to_string(), "fp", r#"{"lang":"rust"}"#)
+            .unwrap();
+
+        let from_header = resolve_project_root(&db, Some(project.to_str().unwrap()));
+        assert_eq!(from_header, project);
+
+        let from_map = resolve_project_root(&db, Some("/nonexistent/path"));
+        assert_eq!(from_map, project);
+
+        let from_map_none = resolve_project_root(&db, None);
+        assert_eq!(from_map_none, project);
+
+        // An existing directory that xfade never analyzed must be rejected.
+        let other = d.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let rejected = resolve_project_root(&db, Some(other.to_str().unwrap()));
+        assert_eq!(rejected, project);
+    }
+
+    #[test]
+    fn collect_handover_for_unknown_session_does_not_borrow_another() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Database::open(&d.path().join("t.db")).unwrap();
+        db.insert_session("s-other", "fp", "2026-11-15T10:00:00Z", Some("secret goal"))
+            .unwrap();
+        let brief = collect_handover_for(&db, d.path(), 500, Some("s-missing"));
+        assert!(brief.session_id.is_none());
+        assert!(brief.goal.is_none());
+    }
+
+    #[test]
     fn to_injection_xml_contains_tags_and_transition() {
         let brief = HandoverBrief {
             session_id: Some("s999".into()),
@@ -397,46 +579,47 @@ mod tests {
     }
 
     #[test]
-    fn inject_handover_into_payload_messages_string_system() {
+    fn inject_handover_into_payload_messages_prepends_last_user() {
         let mut payload = serde_json::json!({
             "model": "claude-3-7-sonnet",
             "system": "You are a helpful assistant.",
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "continue"}
+            ]
         });
         let xml = "<xfade_handover_context>context</xfade_handover_context>";
         assert!(inject_handover_into_payload(&mut payload, "messages", xml));
-        let sys = payload["system"].as_str().unwrap();
-        assert!(sys.starts_with("You are a helpful assistant.\n\n<xfade_handover_context>"));
+        // system must stay untouched
+        assert_eq!(payload["system"], "You are a helpful assistant.");
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs[2]["content"].as_str().unwrap(),
+            "<xfade_handover_context>context</xfade_handover_context>\n\ncontinue"
+        );
     }
 
     #[test]
-    fn inject_handover_into_payload_messages_array_system() {
+    fn inject_handover_into_payload_messages_array_content() {
         let mut payload = serde_json::json!({
             "model": "claude-3-7-sonnet",
             "system": [{"type": "text", "text": "Base instructions"}],
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         });
         let xml = "<xfade_handover_context>context</xfade_handover_context>";
         assert!(inject_handover_into_payload(&mut payload, "messages", xml));
-        let arr = payload["system"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["text"], "Base instructions");
-        assert!(arr[1]["text"].as_str().unwrap().contains(xml));
+        // system array untouched
+        assert_eq!(payload["system"].as_array().unwrap().len(), 1);
+        let content = payload["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content[0]["text"].as_str().unwrap().contains(xml));
+        assert_eq!(content[1]["text"], "hi");
     }
 
     #[test]
-    fn inject_handover_into_payload_messages_missing_system() {
-        let mut payload = serde_json::json!({
-            "model": "claude-3-7-sonnet",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let xml = "<xfade_handover_context>context</xfade_handover_context>";
-        assert!(inject_handover_into_payload(&mut payload, "messages", xml));
-        assert_eq!(payload["system"].as_str().unwrap(), xml);
-    }
-
-    #[test]
-    fn inject_handover_into_payload_chat_existing_system() {
+    fn inject_handover_into_payload_chat_keeps_system_and_prepends_user() {
         let mut payload = serde_json::json!({
             "model": "gpt-4o",
             "messages": [
@@ -449,40 +632,95 @@ mod tests {
         let msgs = payload["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "system");
-        assert!(msgs[0]["content"]
+        assert_eq!(msgs[0]["content"], "System prompt.");
+        assert!(msgs[1]["content"]
             .as_str()
             .unwrap()
-            .contains("System prompt.\n\n<xfade_handover_context>"));
+            .starts_with("<xfade_handover_context>"));
+        assert!(msgs[1]["content"].as_str().unwrap().ends_with("hello"));
     }
 
     #[test]
-    fn inject_handover_into_payload_chat_inserts_system_at_start() {
+    fn inject_handover_anthropic_tool_result_stays_first() {
+        let mut payload = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ]
+        });
+        let xml = "<xfade_handover_context>c</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "messages", xml));
+        let blocks = payload["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["type"], "text");
+        // earlier history untouched
+        assert_eq!(payload["messages"][0]["content"], "run it");
+    }
+
+    #[test]
+    fn inject_handover_anthropic_assistant_prefill_is_skipped() {
+        let mut payload = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "{"}
+            ]
+        });
+        let before = payload.clone();
+        assert!(!inject_handover_into_payload(&mut payload, "messages", "x"));
+        assert_eq!(payload, before);
+    }
+
+    #[test]
+    fn inject_handover_chat_ending_in_tool_appends_user_not_history_rewrite() {
+        let mut payload = serde_json::json!({
+            "model": "gpt",
+            "messages": [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": null, "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c1", "content": "done"}
+            ]
+        });
+        assert!(inject_handover_into_payload(&mut payload, "chat", "XML"));
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["content"], "do it");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "XML");
+    }
+
+    #[test]
+    fn inject_handover_into_payload_chat_pushes_user_when_empty() {
         let mut payload = serde_json::json!({
             "model": "gpt-4o",
-            "messages": [
-                {"role": "user", "content": "hello"}
-            ]
+            "messages": []
         });
         let xml = "<xfade_handover_context>context</xfade_handover_context>";
         assert!(inject_handover_into_payload(&mut payload, "chat", xml));
         let msgs = payload["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], xml);
-        assert_eq!(msgs[1]["role"], "user");
     }
 
     #[test]
-    fn inject_handover_into_payload_responses_instructions() {
+    fn inject_handover_into_payload_responses_input_not_instructions() {
         let mut payload = serde_json::json!({
             "model": "gpt-5.1",
-            "instructions": "Be concise."
+            "instructions": "Be concise.",
+            "input": "do the thing"
         });
         let xml = "<xfade_handover_context>context</xfade_handover_context>";
         assert!(inject_handover_into_payload(&mut payload, "responses", xml));
-        assert!(payload["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("Be concise.\n\n<xfade_handover_context>"));
+        assert_eq!(payload["instructions"], "Be concise.");
+        assert_eq!(
+            payload["input"].as_str().unwrap(),
+            "<xfade_handover_context>context</xfade_handover_context>\n\ndo the thing"
+        );
     }
 }
