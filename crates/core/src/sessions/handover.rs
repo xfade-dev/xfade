@@ -88,6 +88,158 @@ impl HandoverBrief {
 
         lines.join("\n")
     }
+
+    /// Format brief as a compact XML tagged context block for prompt/system injection.
+    pub fn to_injection_xml(&self, from_model: Option<&str>, to_model: Option<&str>) -> String {
+        let mut lines = Vec::new();
+        lines.push("<xfade_handover_context>".to_string());
+        lines.push("[xfade: Active Model Handover Context]".to_string());
+
+        if from_model.is_some() || to_model.is_some() {
+            let from = from_model.unwrap_or(self.model.as_deref().unwrap_or("previous"));
+            let to = to_model.unwrap_or("current");
+            lines.push(format!("- Model Transition: {from} -> {to}"));
+        } else if let Some(m) = &self.model {
+            lines.push(format!("- Previous Model: {m}"));
+        }
+
+        if let Some(sid) = &self.session_id {
+            lines.push(format!("- Session ID: {sid}"));
+        }
+
+        if let Some(goal) = &self.goal {
+            let g = goal.trim();
+            if !g.is_empty() {
+                lines.push(format!("- Active Goal: {g}"));
+            }
+        }
+
+        if let (Some(b), Some(h)) = (&self.branch, &self.head) {
+            lines.push(format!("- Git State: {b} @ {h}"));
+        }
+
+        if !self.changed_files.is_empty() {
+            lines.push("- Working Tree Changes:".to_string());
+            for f in self.changed_files.iter().take(10) {
+                lines.push(format!("  - {f}"));
+            }
+            if self.changed_files.len() > 10 {
+                lines.push(format!(
+                    "  - ... and {} more files",
+                    self.changed_files.len() - 10
+                ));
+            }
+        }
+
+        if let Some(diff) = &self.diff_stat {
+            lines.push("- Diff Summary:".to_string());
+            for d in diff.lines().take(8) {
+                lines.push(format!("  {d}"));
+            }
+        }
+
+        if !self.recent_commits.is_empty() {
+            lines.push("- Recent Commits:".to_string());
+            for c in self.recent_commits.iter().take(3) {
+                lines.push(format!("  - {c}"));
+            }
+        }
+
+        lines.push(
+            "> Instruction: This context was handed over from the developer's previous model session. Continue working seamlessly from this state.".to_string(),
+        );
+        lines.push("</xfade_handover_context>".to_string());
+
+        lines.join("\n")
+    }
+}
+
+/// Inject the handover XML into a JSON request payload based on the protocol endpoint.
+///
+/// - `messages` (Anthropic): Appends to `system` string or array, or sets `system` string.
+/// - `chat` (OpenAI): Appends to existing system/developer message or inserts a system message at index 0.
+/// - `responses` (OpenAI Responses): Appends to or sets `instructions`.
+///
+/// Returns true if injection succeeded and modified the payload.
+pub fn inject_handover_into_payload(
+    payload: &mut serde_json::Value,
+    endpoint: &str,
+    xml: &str,
+) -> bool {
+    let obj = match payload.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    match endpoint {
+        "messages" => match obj.get_mut("system") {
+            Some(serde_json::Value::String(s)) => {
+                s.push_str("\n\n");
+                s.push_str(xml);
+                true
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                arr.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("\n\n{xml}"),
+                }));
+                true
+            }
+            Some(serde_json::Value::Null) | None => {
+                obj.insert(
+                    "system".to_string(),
+                    serde_json::Value::String(xml.to_string()),
+                );
+                true
+            }
+            _ => false,
+        },
+        "chat" => {
+            let messages = match obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                Some(arr) => arr,
+                None => return false,
+            };
+
+            // If first message is system or developer, append to it
+            if let Some(first) = messages.first_mut() {
+                if let Some(role) = first.get("role").and_then(|r| r.as_str()) {
+                    if role == "system" || role == "developer" {
+                        if let Some(content) = first.get_mut("content").and_then(|c| c.as_str()) {
+                            let updated = format!("{content}\n\n{xml}");
+                            first["content"] = serde_json::Value::String(updated);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Otherwise, prepend a system message
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": xml,
+                }),
+            );
+            true
+        }
+        "responses" => match obj.get_mut("instructions") {
+            Some(serde_json::Value::String(s)) => {
+                s.push_str("\n\n");
+                s.push_str(xml);
+                true
+            }
+            Some(serde_json::Value::Null) | None => {
+                obj.insert(
+                    "instructions".to_string(),
+                    serde_json::Value::String(xml.to_string()),
+                );
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Collect handover context from the database and working tree.
@@ -217,5 +369,120 @@ mod tests {
             brief.goal.as_deref(),
             Some("Solve quantum teleportation bug")
         );
+    }
+
+    #[test]
+    fn to_injection_xml_contains_tags_and_transition() {
+        let brief = HandoverBrief {
+            session_id: Some("s999".into()),
+            tool: Some("claude".into()),
+            model: Some("claude-opus".into()),
+            goal: Some("Optimize database indexes".into()),
+            branch: Some("feature/db".into()),
+            head: Some("abc1234".into()),
+            recent_commits: vec!["feat: add index".into()],
+            changed_files: vec!["db/schema.sql".into()],
+            diff_stat: Some("db/schema.sql | 10 ++++++++++".into()),
+            created_at: "2026-11-15T12:00:00Z".into(),
+        };
+
+        let xml = brief.to_injection_xml(Some("claude-opus"), Some("claude-sonnet"));
+        assert!(xml.starts_with("<xfade_handover_context>"));
+        assert!(xml.ends_with("</xfade_handover_context>"));
+        assert!(xml.contains("Model Transition: claude-opus -> claude-sonnet"));
+        assert!(xml.contains("Session ID: s999"));
+        assert!(xml.contains("Active Goal: Optimize database indexes"));
+        assert!(xml.contains("Git State: feature/db @ abc1234"));
+        assert!(xml.contains("db/schema.sql"));
+    }
+
+    #[test]
+    fn inject_handover_into_payload_messages_string_system() {
+        let mut payload = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "messages", xml));
+        let sys = payload["system"].as_str().unwrap();
+        assert!(sys.starts_with("You are a helpful assistant.\n\n<xfade_handover_context>"));
+    }
+
+    #[test]
+    fn inject_handover_into_payload_messages_array_system() {
+        let mut payload = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "system": [{"type": "text", "text": "Base instructions"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "messages", xml));
+        let arr = payload["system"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"], "Base instructions");
+        assert!(arr[1]["text"].as_str().unwrap().contains(xml));
+    }
+
+    #[test]
+    fn inject_handover_into_payload_messages_missing_system() {
+        let mut payload = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "messages", xml));
+        assert_eq!(payload["system"].as_str().unwrap(), xml);
+    }
+
+    #[test]
+    fn inject_handover_into_payload_chat_existing_system() {
+        let mut payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "System prompt."},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "chat", xml));
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("System prompt.\n\n<xfade_handover_context>"));
+    }
+
+    #[test]
+    fn inject_handover_into_payload_chat_inserts_system_at_start() {
+        let mut payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "chat", xml));
+        let msgs = payload["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], xml);
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn inject_handover_into_payload_responses_instructions() {
+        let mut payload = serde_json::json!({
+            "model": "gpt-5.1",
+            "instructions": "Be concise."
+        });
+        let xml = "<xfade_handover_context>context</xfade_handover_context>";
+        assert!(inject_handover_into_payload(&mut payload, "responses", xml));
+        assert!(payload["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Be concise.\n\n<xfade_handover_context>"));
     }
 }

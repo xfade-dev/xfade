@@ -1026,11 +1026,13 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 if !hs.is_empty() {
                     println!("model switches:");
                     for h in &hs {
+                        let inj = if h.injected { " (injected)" } else { "" };
                         println!(
-                            "  {}  {} -> {}",
+                            "  {}  {} -> {}{}",
                             h.ts,
                             h.from_model.as_deref().unwrap_or("-"),
-                            h.to_model.as_deref().unwrap_or("-")
+                            h.to_model.as_deref().unwrap_or("-"),
+                            inj
                         );
                     }
                 }
@@ -1596,6 +1598,7 @@ fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
     let plan = xfade_core::launch::launch_plan(&p, key.as_deref())?;
     warn_legacy_wire_api(tool);
 
+    let mut tool_args = opts.args.clone();
     if opts.handover {
         let cwd = std::env::current_dir()?;
         let brief = xfade_core::sessions::handover::collect_handover(
@@ -1612,12 +1615,32 @@ fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
             eprintln!("│ Context from previous session captured successfully.                 │");
         }
         eprintln!("╰──────────────────────────────────────────────────────────────────────╯");
+
+        match tool {
+            ToolKind::ClaudeCode | ToolKind::Codex | ToolKind::OpenCode => {
+                if tool_args.is_empty() {
+                    tool_args.push(format!("Context Handover from previous session:\n\n{md}"));
+                } else {
+                    let first = &mut tool_args[0];
+                    *first =
+                        format!("Context Handover from previous session:\n\n{md}\n\nTask: {first}");
+                }
+            }
+            ToolKind::Aider if !tool_args.iter().any(|a| a == "--message" || a == "-m") => {
+                tool_args.insert(
+                    0,
+                    format!("Context Handover from previous session:\n\n{md}"),
+                );
+                tool_args.insert(0, "--message".into());
+            }
+            _ => {}
+        }
     }
 
     let bin = xfade_core::run::resolve_command(xfade_core::run::tool_command(tool));
     let status = Command::new(&bin)
         .args(plan.args_prefix())
-        .args(&opts.args)
+        .args(&tool_args)
         .envs(plan.env().to_vec())
         .status()
         .map_err(|e| {
