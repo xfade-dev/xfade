@@ -24,8 +24,8 @@ tokio = { workspace = true }
 time = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 assert_cmd = "2"
