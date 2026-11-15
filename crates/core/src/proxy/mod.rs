@@ -1,4 +1,5 @@
 pub mod cache_injector;
+pub mod circuit_breaker;
 pub mod convert;
 pub mod forward;
 #[cfg(test)]
@@ -8,6 +9,8 @@ pub mod usage;
 
 mod auth;
 pub mod status;
+
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 
 use crate::error::Result;
 use crate::service::Core;
