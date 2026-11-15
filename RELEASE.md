@@ -10,7 +10,9 @@
 - `.github/workflows/ci.yml`: push/PR runs fmt + clippy + cargo test + frontend tsc + vitest.
 - `.github/workflows/release.yml`: triggered by `git tag vX.Y.Z`:
   - Multi-platform CLI binaries (macOS arm/intel, linux, windows) + sha256.
-  - macOS GUI `.dmg`/`.app` (including the xfade sidecar).
+  - Best-effort macOS GUI `.dmg`/`.app` (including the xfade sidecar). GUI
+    packaging does not block signed CLI security releases until Developer ID
+    signing and notarization are configured.
   - Aggregated into a GitHub Release + `SHA256SUMS`.
   - `SHA256SUMS` is signed keylessly with Sigstore; the bundle is published as
     `SHA256SUMS.sigstore.json`.

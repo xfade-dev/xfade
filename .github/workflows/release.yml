@@ -66,6 +66,10 @@ jobs:
   gui:
     name: GUI macOS (dmg)
     runs-on: macos-15
+    # The CLI is the primary distribution and carries security fixes. GUI
+    # packaging is best-effort while Developer ID/notarization is not yet
+    # configured; a Tauri packaging failure must not suppress signed CLI assets.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
