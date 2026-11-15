@@ -958,6 +958,8 @@ async fn failover_loop(
                     last_err = Some((StatusCode::BAD_REQUEST, err_body.into_owned(), None));
                     continue;
                 }
+                // Release in-flight probe reservation so HalfOpen is not permanently blocked
+                svc.circuit_breaker.release_probe(route_id);
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Body::from(err_bytes))
@@ -1006,6 +1008,11 @@ async fn failover_loop(
             continue;
         }
         // Non-qualifying 4xx: passthrough, stop failover.
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            svc.record_failure(route_id);
+        } else {
+            svc.circuit_breaker.release_probe(route_id);
+        }
         return err_resp;
     }
 
