@@ -776,7 +776,7 @@ async fn failover_loop(
 
     for entry in entries {
         let route_id = entry.route_id.as_str();
-        if svc.circuit_open(route_id) {
+        if !svc.circuit_breaker.allow_request(route_id) {
             continue;
         }
 
@@ -834,61 +834,38 @@ async fn failover_loop(
         };
         let upstream_endpoint = if convert_path { "chat" } else { endpoint };
 
-        match try_forward(
+        // When target endpoint is Anthropic (/v1/messages) or target protocol is Anthropic,
+        // run cache_injector::inject_cache_control on the payload before sending if it's JSON.
+        let is_anthropic_target = upstream_endpoint == "messages"
+            || upstream_endpoint == "/v1/messages"
+            || target_protocol == "messages"
+            || target_protocol == "anthropic";
+
+        let mut injected_body_vec: Option<Vec<u8>> = None;
+        if is_anthropic_target {
+            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(out_body) {
+                let report = super::cache_injector::inject_cache_control(&mut json_val, 4);
+                if report.injected_breakpoints > 0 {
+                    if let Ok(bytes) = serde_json::to_vec(&json_val) {
+                        injected_body_vec = Some(bytes);
+                    }
+                }
+            }
+        }
+        let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(out_body);
+
+        let mut resp = match try_forward(
             &svc.client,
             method,
             &base_url,
             upstream_endpoint,
             headers,
-            out_body,
+            sending_body,
             auth_key.as_deref(),
         )
         .await
         {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() || status.is_redirection() {
-                    return handle_success(
-                        svc,
-                        session_id,
-                        route_id,
-                        provider.tool.as_str(),
-                        resp,
-                        endpoint,
-                        model,
-                        start,
-                        convert_path,
-                        req_model.to_string(),
-                    )
-                    .await;
-                }
-                let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
-                let (err_resp, should_continue) = handle_upstream_error(
-                    svc,
-                    session_id,
-                    route_id,
-                    provider.tool.as_str(),
-                    resp,
-                    endpoint,
-                    &model,
-                    start,
-                    failover_4xx,
-                )
-                .await;
-                if should_continue {
-                    // Preserve the upstream error body (e.g. 429 budget_exceeded)
-                    // so the client sees the real reason instead of a bare status
-                    // it can only retry blindly.
-                    let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
-                        Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                        Err(_) => String::new(),
-                    };
-                    last_err = Some((status, text, retry_after));
-                    continue;
-                }
-                // Non-qualifying 4xx: passthrough, stop failover.
-                return err_resp;
-            }
+            Ok(r) => r,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
                 log_request(
@@ -907,7 +884,129 @@ async fn failover_loop(
                 last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                 continue;
             }
+        };
+
+        // If response is 400 Bad Request, attempt self-healing parameter rectification
+        if resp.status() == StatusCode::BAD_REQUEST {
+            let err_bytes = resp.bytes().await.unwrap_or_default();
+            let err_body = String::from_utf8_lossy(&err_bytes);
+            let mut rectified_bytes = None;
+            if let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(sending_body) {
+                if super::thinking_rectifier::rectify_thinking_error(&mut body_json, 400, &err_body)
+                {
+                    if let Ok(new_bytes) = serde_json::to_vec(&body_json) {
+                        rectified_bytes = Some(new_bytes);
+                    }
+                }
+            }
+
+            if let Some(new_body) = rectified_bytes {
+                // Immediately retry on current provider!
+                match try_forward(
+                    &svc.client,
+                    method,
+                    &base_url,
+                    upstream_endpoint,
+                    headers,
+                    &new_body,
+                    auth_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(retry_resp) => {
+                        resp = retry_resp;
+                    }
+                    Err(e) => {
+                        let duration_ms = start.elapsed().as_millis() as i64;
+                        log_request(
+                            svc,
+                            session_id,
+                            endpoint,
+                            &model,
+                            route_id,
+                            provider.tool.as_str(),
+                            0,
+                            Usage::default(),
+                            duration_ms,
+                            Some(e.clone()),
+                        );
+                        svc.record_failure(route_id);
+                        last_err = Some((StatusCode::BAD_GATEWAY, e, None));
+                        continue;
+                    }
+                }
+            } else {
+                // Not rectified: handle this 400 error.
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let usage = Usage::from_json(&err_bytes);
+                log_request(
+                    svc,
+                    session_id,
+                    endpoint,
+                    &model,
+                    route_id,
+                    provider.tool.as_str(),
+                    400,
+                    usage,
+                    duration_ms,
+                    None,
+                );
+                let should_continue =
+                    failover_4xx && qualifies_for_4xx_failover(StatusCode::BAD_REQUEST, &err_bytes);
+                if should_continue {
+                    svc.record_failure(route_id);
+                    last_err = Some((StatusCode::BAD_REQUEST, err_body.into_owned(), None));
+                    continue;
+                }
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(err_bytes))
+                    .unwrap();
+            }
         }
+
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return handle_success(
+                svc,
+                session_id,
+                route_id,
+                provider.tool.as_str(),
+                resp,
+                endpoint,
+                model,
+                start,
+                convert_path,
+                req_model.to_string(),
+            )
+            .await;
+        }
+        let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+        let (err_resp, should_continue) = handle_upstream_error(
+            svc,
+            session_id,
+            route_id,
+            provider.tool.as_str(),
+            resp,
+            endpoint,
+            &model,
+            start,
+            failover_4xx,
+        )
+        .await;
+        if should_continue {
+            // Preserve the upstream error body (e.g. 429 budget_exceeded)
+            // so the client sees the real reason instead of a bare status
+            // it can only retry blindly.
+            let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
+                Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                Err(_) => String::new(),
+            };
+            last_err = Some((status, text, retry_after));
+            continue;
+        }
+        // Non-qualifying 4xx: passthrough, stop failover.
+        return err_resp;
     }
 
     session_failed(svc, session_id);

@@ -49,7 +49,7 @@ impl Circuit {
 pub struct ProxyService {
     pub core: Core,
     pub client: reqwest::Client,
-    pub circuits: Arc<Mutex<HashMap<String, Circuit>>>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
     pub auth_token: Option<String>,
     pub host: String,
     pub port: u16,
@@ -85,8 +85,22 @@ impl HealthSnapshot {
 
 impl ProxyService {
     pub fn new(core: Core) -> Self {
+        let circuit_breaker = Arc::new(CircuitBreaker::default());
         // Restore persisted circuit state from database on startup.
-        let circuits = core.db().load_circuits().unwrap_or_default();
+        if let Ok(circuits) = core.db().load_circuits() {
+            let now = now_secs();
+            for (id, c) in circuits {
+                if c.is_open(now) {
+                    for _ in 0..c.fails.max(FAIL_THRESHOLD) {
+                        circuit_breaker.record_failure(&id);
+                    }
+                } else if c.fails > 0 {
+                    for _ in 0..c.fails {
+                        circuit_breaker.record_failure(&id);
+                    }
+                }
+            }
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
@@ -96,7 +110,7 @@ impl ProxyService {
         Self {
             core,
             client,
-            circuits: Arc::new(Mutex::new(circuits)),
+            circuit_breaker,
             auth_token: None,
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -172,34 +186,48 @@ impl ProxyService {
         self
     }
 
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = cb;
+        self
+    }
+
     pub fn circuit_open(&self, provider_id: &str) -> bool {
-        let circuits = self.circuits.lock().unwrap();
-        if let Some(c) = circuits.get(provider_id) {
-            return c.is_open(now_secs());
+        match self.circuit_breaker.state(provider_id) {
+            CircuitState::Closed | CircuitState::HalfOpen => false,
+            CircuitState::Open => {
+                if let Some(remaining) = self.circuit_breaker.remaining_cooldown_secs(provider_id) {
+                    remaining > 0
+                } else {
+                    false
+                }
+            }
         }
-        false
     }
 
     pub fn record_success(&self, provider_id: &str) {
-        let mut circuits = self.circuits.lock().unwrap();
-        circuits.remove(provider_id);
-        // Persist: remove from DB.
-        let _ = self.core.db().delete_circuit(provider_id);
+        self.circuit_breaker.record_success(provider_id);
+        if self.circuit_breaker.state(provider_id) == CircuitState::Closed {
+            let _ = self.core.db().delete_circuit(provider_id);
+        }
     }
 
     pub fn record_failure(&self, provider_id: &str) {
-        let mut circuits = self.circuits.lock().unwrap();
-        let now = now_secs();
-        let c = circuits.entry(provider_id.to_string()).or_insert(Circuit {
-            fails: 0,
-            cooldown_until_secs: 0,
-        });
-        c.fails += 1;
-        if c.fails >= FAIL_THRESHOLD {
-            c.cooldown_until_secs = now + COOLDOWN_SECS as i64;
-        }
-        // Persist updated circuit state.
-        let _ = self.core.db().save_circuit(provider_id, c);
+        self.circuit_breaker.record_failure(provider_id);
+        let fails = self.circuit_breaker.failure_count(provider_id);
+        let cooldown_remaining = self
+            .circuit_breaker
+            .remaining_cooldown_secs(provider_id)
+            .unwrap_or(0);
+        let cooldown_until_secs = if cooldown_remaining > 0 {
+            now_secs() + cooldown_remaining as i64
+        } else {
+            0
+        };
+        let c = Circuit {
+            fails,
+            cooldown_until_secs,
+        };
+        let _ = self.core.db().save_circuit(provider_id, &c);
     }
 
     /// Start the proxy; shut down gracefully when the `shutdown` future completes. host/port come from self fields.
@@ -1716,7 +1744,12 @@ mod tests {
         // Verify upstream received user-level handover context; system untouched.
         let req2 = up.last_request().await;
         let v: serde_json::Value = serde_json::from_str(&req2.body).unwrap();
-        assert_eq!(v["system"].as_str().unwrap(), "You are Claude.");
+        let sys_str = match &v["system"] {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Array(a) => a[0]["text"].as_str().unwrap(),
+            _ => panic!("unexpected system format"),
+        };
+        assert_eq!(sys_str, "You are Claude.");
         let last_user = v["messages"]
             .as_array()
             .unwrap()
@@ -1724,7 +1757,11 @@ mod tests {
             .rev()
             .find(|m| m["role"] == "user")
             .unwrap();
-        let content = last_user["content"].as_str().unwrap();
+        let content = match &last_user["content"] {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Array(a) => a[0]["text"].as_str().unwrap(),
+            _ => panic!("unexpected content format"),
+        };
         assert!(content.contains("<xfade_handover_context>"));
         assert!(content.contains("Model Transition: claude-3-5-sonnet -> claude-3-7-sonnet"));
         assert!(content.ends_with("help me write code"));
@@ -2143,5 +2180,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["models_merge"], true);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_auto_injects_cache_control_and_survives_circuit_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_failing = MockUpstream::spawn().await;
+        let up_backup = MockUpstream::spawn().await;
+
+        let core = test_core(
+            &dir,
+            &[
+                ("failing", &up_failing.url(), "k1"),
+                ("backup", &up_backup.url(), "k2"),
+            ],
+        );
+        core.db()
+            .set_routes(&["failing".into(), "backup".into()], None, "messages")
+            .unwrap();
+
+        let svc = ProxyService::new(core);
+        let url = spawn_service(svc).await;
+
+        // up_failing returns 500s to trip circuit breaker
+        up_failing.respond_with(500, r#"{"error":"overloaded"}"#);
+        up_backup.respond_with(
+            200,
+            r#"{"id":"resp-1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#,
+        );
+
+        // Send request through xfade proxy to Anthropic endpoint (/v1/messages)
+        let body =
+            r#"{"model":"claude-3-7-sonnet","messages":[{"role":"user","content":"hello"}]}"#;
+        let (status, text) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
+
+        assert_eq!(
+            status, 200,
+            "proxy must seamlessly fail over without client 500: {text}"
+        );
+        assert!(text.contains("resp-1"));
+
+        // Verify auto-injected cache_control was received by the backup provider
+        let backup_req = up_backup.last_request().await;
+        assert!(
+            backup_req.body.contains("cache_control"),
+            "target Anthropic messages request must have auto-injected cache_control, but got: {}",
+            backup_req.body
+        );
+
+        // Verify failing provider was called and circuit breaker tracked failure
+        assert_eq!(up_failing.call_count().await, 1);
+        assert_eq!(up_backup.call_count().await, 1);
+
+        // Send 2 more requests so failing provider reaches failure_threshold (3)
+        for _ in 0..2 {
+            let (s, _) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
+            assert_eq!(s, 200);
+        }
+        assert_eq!(up_failing.call_count().await, 3);
+        assert_eq!(up_backup.call_count().await, 3);
+
+        // 4th request: circuit is OPEN on failing provider, so it must be skipped without an HTTP call!
+        let (s4, t4) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
+        assert_eq!(s4, 200);
+        assert!(t4.contains("resp-1"));
+        assert_eq!(
+            up_failing.call_count().await,
+            3,
+            "circuit-open provider must be skipped without network call"
+        );
+        assert_eq!(up_backup.call_count().await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rectifies_thinking_error_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+
+        let core = test_core(&dir, &[("primary", &up.url(), "k1")]);
+        core.db()
+            .set_routes(&["primary".into()], None, "messages")
+            .unwrap();
+
+        let svc = ProxyService::new(core);
+        let url = spawn_service(svc).await;
+
+        // First attempt returns 400 with max_tokens budget error
+        up.respond_with(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 100 must be greater than budget_tokens: 1024"}}"#,
+        );
+        // Retry attempt on the same upstream succeeds
+        up.respond_with(
+            200,
+            r#"{"id":"resp-rectified","type":"message","role":"assistant","content":[{"type":"text","text":"healed"}]}"#,
+        );
+
+        let body = r#"{"model":"claude-3-7-sonnet","max_tokens":100,"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":"test"}]}"#;
+        let (status, text) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
+
+        assert_eq!(
+            status, 200,
+            "thinking error should be rectified and succeed: {text}"
+        );
+        assert!(text.contains("resp-rectified"));
+
+        // Verify upstream received 2 requests and the second request had rectified max_tokens
+        assert_eq!(up.call_count().await, 2);
+        let last_req = up.last_request().await;
+        assert!(
+            last_req.body.contains("\"max_tokens\":2048"),
+            "rectified request should have bumped max_tokens above budget, got: {}",
+            last_req.body
+        );
     }
 }

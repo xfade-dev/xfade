@@ -54,11 +54,18 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         .flatten()
         .unwrap_or((vec![], None, "chat".to_string()));
     let circuits = svc
-        .circuits
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(id, c)| circuit_to_dto(id, c))
+        .circuit_breaker
+        .providers()
+        .into_iter()
+        .map(|id| {
+            let fails = svc.circuit_breaker.failure_count(&id);
+            let cooldown_remaining_secs = svc.circuit_breaker.remaining_cooldown_secs(&id);
+            CircuitDto {
+                provider_id: id,
+                fails,
+                cooldown_remaining_secs,
+            }
+        })
         .collect::<Vec<_>>();
     Json(StatusDto {
         running: true,
