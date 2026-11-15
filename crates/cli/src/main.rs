@@ -122,8 +122,13 @@ enum Cmd {
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Require `Authorization: Bearer <token>` (or `x-api-key`). Visible in the
+        /// process list; prefer --auth-token-file. Mandatory for non-loopback --host.
         #[arg(long)]
         auth_token: Option<String>,
+        /// Read the auth token from a file (keeps it out of the process list)
+        #[arg(long, conflicts_with = "auth_token")]
+        auth_token_file: Option<PathBuf>,
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
     },
@@ -562,7 +567,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
                     let api_key = build_core()?.global_api_key();
                     match api_key {
-                        Some(k) => println!("api_key: {}...", &k[..k.len().min(8)]),
+                        Some(_) => println!("api_key: (set)"),
                         None => println!("api_key: (unset)"),
                     }
                     Ok(())
@@ -675,9 +680,19 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             port,
             host,
             auth_token,
+            auth_token_file,
             cmd,
         } => match cmd {
             None => {
+                let auth_token = match auth_token_file {
+                    Some(p) => {
+                        let t = std::fs::read_to_string(&p).map_err(|e| {
+                            CoreError::Proxy(format!("read --auth-token-file {}: {e}", p.display()))
+                        })?;
+                        Some(t.trim().to_string())
+                    }
+                    None => auth_token,
+                };
                 let core = build_core()?;
                 // Warm the repo_maps cache with the daemon's cwd so
                 // `xfade proxy status` can show the served project. Signal-
@@ -1074,6 +1089,27 @@ fn host_target() -> String {
     format!("{}-{os}", std::env::consts::ARCH)
 }
 
+/// Lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Find `asset`'s digest in a `sha256sum`-style listing (`<hex>  <name>`,
+/// optionally `<hex> *<name>`).
+fn expected_sha256(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let hash = it.next()?;
+        let name = it.next()?.trim_start_matches('*');
+        (name == asset && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
 /// Update xfade to the latest GitHub release: query the latest tag, download the
 /// matching platform asset, extract it with system `tar`, and swap the running binary.
 fn self_update() -> Result<(), CoreError> {
@@ -1120,6 +1156,36 @@ fn self_update() -> Result<(), CoreError> {
             .ok_or_else(|| CoreError::Proxy(format!("no asset '{asset}' in release {tag}")))?
             .to_string();
 
+        // Fail closed: the release must publish SHA256SUMS listing this asset.
+        let sums_url = resp
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|a| a.get("name").and_then(|n| n.as_str()) == Some("SHA256SUMS"))
+            })
+            .and_then(|a| a.get("browser_download_url").and_then(|u| u.as_str()))
+            .ok_or_else(|| {
+                CoreError::Proxy(format!(
+                    "release {tag} has no SHA256SUMS; refusing to install an unverified binary"
+                ))
+            })?
+            .to_string();
+        let sums = client
+            .get(&sums_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| CoreError::Proxy(format!("download SHA256SUMS: {e}")))?
+            .text()
+            .await
+            .map_err(|e| CoreError::Proxy(format!("download SHA256SUMS: {e}")))?;
+        let expected = expected_sha256(&sums, &asset).ok_or_else(|| {
+            CoreError::Proxy(format!(
+                "'{asset}' is not listed in SHA256SUMS; refusing to install"
+            ))
+        })?;
+
         println!("xfade: updating {current} -> {tag} ({asset})");
         let bytes = client
             .get(&url)
@@ -1129,6 +1195,14 @@ fn self_update() -> Result<(), CoreError> {
             .bytes()
             .await
             .map_err(|e| CoreError::Proxy(format!("download: {e}")))?;
+
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(CoreError::Proxy(format!(
+                "checksum mismatch for {asset}: expected {expected}, got {actual}; aborting update"
+            )));
+        }
+        println!("xfade: checksum verified");
 
         let tmp = std::env::temp_dir().join(format!("xfade-update-{}", std::process::id()));
         std::fs::create_dir_all(&tmp)?;
@@ -1735,6 +1809,34 @@ fn print_table(list: &[Provider]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn expected_sha256_parses_sha256sum_listings() {
+        let h1 = "a".repeat(64);
+        let h2 = "B".repeat(64);
+        let sums = format!(
+            "{h1}  xfade-x86_64-unknown-linux-gnu.tar.gz\n{h2} *xfade-aarch64-apple-darwin.tar.gz\nnot-a-hash  xfade-bad.tar.gz\n"
+        );
+        assert_eq!(
+            expected_sha256(&sums, "xfade-x86_64-unknown-linux-gnu.tar.gz"),
+            Some(h1)
+        );
+        assert_eq!(
+            expected_sha256(&sums, "xfade-aarch64-apple-darwin.tar.gz"),
+            Some("b".repeat(64))
+        );
+        assert_eq!(expected_sha256(&sums, "xfade-bad.tar.gz"), None);
+        assert_eq!(expected_sha256(&sums, "missing.tar.gz"), None);
+        assert_eq!(expected_sha256("", "x"), None);
+    }
+
     use super::*;
 
     fn names(ids: &[&str]) -> Vec<String> {

@@ -4,7 +4,7 @@
 
 Queries the proxy daemon run state, route config, and per-provider circuit status.
 
-- **Auth**: if the daemon set an `auth_token`, `Authorization: Bearer <token>` is required; otherwise it's open. `/health` is auth-free.
+- **Auth**: if the daemon set an `auth_token`, `Authorization: Bearer <token>` or `x-api-key: <token>` is required; otherwise it's open. `/health` is auth-free. A non-loopback `--host` requires a token. On a loopback listener, requests with a non-loopback `Host` or `Origin` header get 403 (DNS-rebinding / cross-site defence).
 - **Response** `200`:
 
 ```json

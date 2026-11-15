@@ -31,7 +31,8 @@ pub fn backup_file(path: &Path, backup_dir: &Path) -> Result<Option<PathBuf>> {
     let mut dest_name = name.to_os_string();
     dest_name.push(format!(".{}", nanos));
     let dest = backup_dir.join(dest_name);
-    fs::copy(path, &dest)?;
+    // Backups of client configs may contain API keys: keep them owner-only.
+    crate::fsutil::copy_private(path, &dest)?;
     rotate(backup_dir, KEEP)?;
     Ok(Some(dest))
 }
@@ -51,7 +52,7 @@ fn rotate(dir: &Path, keep: usize) -> Result<()> {
 }
 
 pub fn restore(backup: &Path, target: &Path) -> Result<()> {
-    fs::copy(backup, target)?;
+    crate::fsutil::copy_private(backup, target)?;
     Ok(())
 }
 

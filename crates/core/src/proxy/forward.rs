@@ -24,10 +24,21 @@ use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// Inbound headers never forwarded upstream. Besides hop-by-hop headers this
+/// includes every credential-carrying header a client might send: the route's
+/// own key is injected afterwards, so a client credential (or a browser
+/// cookie) must never reach a provider, least of all one reached via failover.
 const STRIP_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "x-auth-token",
+    "cookie",
+    "set-cookie",
     "connection",
     "transfer-encoding",
     "anthropic-version",
@@ -1505,6 +1516,51 @@ pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap
 mod tests {
     use super::*;
     use futures::{stream, StreamExt};
+
+    #[test]
+    fn upstream_request_drops_all_inbound_credentials() {
+        let mut headers = HeaderMap::new();
+        for (k, v) in [
+            ("authorization", "Bearer client-secret"),
+            ("proxy-authorization", "Basic abc"),
+            ("x-api-key", "client-anthropic-key"),
+            ("api-key", "client-azure-key"),
+            ("x-goog-api-key", "client-google-key"),
+            ("x-auth-token", "client-token"),
+            ("cookie", "session=browser"),
+            ("x-custom", "keep-me"),
+        ] {
+            headers.insert(
+                axum::http::HeaderName::from_static(k),
+                axum::http::HeaderValue::from_static(v),
+            );
+        }
+        let client = reqwest::Client::new();
+        let req = build_upstream_request(
+            &client,
+            "POST",
+            "http://127.0.0.1:1",
+            "chat",
+            &headers,
+            b"{}",
+            Some("route-key"),
+        )
+        .build()
+        .unwrap();
+        let h = req.headers();
+        assert_eq!(h.get("authorization").unwrap(), "Bearer route-key");
+        for k in [
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-auth-token",
+            "cookie",
+        ] {
+            assert!(h.get(k).is_none(), "{k} leaked upstream");
+        }
+        assert_eq!(h.get("x-custom").unwrap(), "keep-me");
+    }
 
     #[test]
     fn qualifies_for_4xx_failover_auth_statuses() {
