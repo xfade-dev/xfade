@@ -1,3 +1,4 @@
+pub mod cache_injector;
 pub mod convert;
 pub mod forward;
 #[cfg(test)]
