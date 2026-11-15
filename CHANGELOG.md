@@ -2,6 +2,17 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+- **fix(deps)**: v0.11.0 binaries were built with TLS and runtime crates that have published advisories. Updated `rustls` 0.23.42 → 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349), `rustls-webpki` 0.103.13 → 0.103.17 (RUSTSEC-2026-0382), `webpki-roots` 1.0.9 → 1.0.12 (RUSTSEC-2026-0381, distrusted emSign roots), `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386), `rustix` 1.1.4 → 1.1.6 (RUSTSEC-2026-0486).
+- **fix(deps)**: `rusqlite` 0.32 → 0.41 (bundled SQLite 3.54, fixes RUSTSEC-2026-0459 / CVE-2026-119375, WAL page-size mismatch returning uninitialized memory).
+- **chore(deps)**: `ratatui` 0.29 → 0.30 and `crossterm` 0.28 → 0.29 (one crossterm in the tree; drops `paste`, fixes `lru` unsoundness RUSTSEC-2026-0253 / -0002).
+- **feat(supply-chain)**: `cargo-deny` is now a CI hard gate (`deny.toml`, `.github/workflows/supply-chain.yml`, also run daily). Releases additionally publish a CycloneDX SBOM (`xfade.cdx.json`) covered by `SHA256SUMS`, the Sigstore signature and the provenance attestation.
+
+### Known gaps
+- `serde_yaml` (via `unsafe-libyaml`, unmaintained) and GUI-only tauri/gtk3 crates are recorded as reasoned ignores in `deny.toml`.
+
 ## v0.11.0 — 2026-11-15
 
 ### Security

@@ -1,0 +1,66 @@
+# cargo-deny policy. Enforced in CI (`supply-chain` job in .github/workflows/ci.yml).
+#
+# Rule: a vulnerability or yanked crate fails the build. Every ignore below
+# must carry a reason and be removed as soon as an upgrade path exists.
+
+[graph]
+# Check the whole workspace including the Tauri GUI crate: it ships in the
+# release when its (best-effort) packaging succeeds.
+all-features = false
+
+[advisories]
+yanked = "deny"
+# Check the whole dependency graph, not just direct dependencies: cargo-deny
+# defaults to the workspace-only scope for these two, which would hide
+# transitive unsoundness (e.g. lru via ratatui).
+unmaintained = "all"
+unsound = "all"
+# Vulnerabilities always fail. Only crates with no fix and no reachable
+# attack surface are listed below.
+ignore = [
+    # CLI + GUI: direct dependency of xfade-core (provider/config YAML).
+    # Migration to a maintained parser is tracked separately; parsed files are
+    # user-owned local config, not network input.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml: parses local user-owned config only" },
+    # GUI only (tauri / gtk3 bindings). Not part of the signed CLI release.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time macro via gtk-rs 0.18 (GUI only)" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 VariantStrIter unsoundness: GUI only (tauri/gtk3); fixed only in glib >=0.20, blocked on tauri" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property: build-time via tauri-utils/urlpattern (GUI only)" },
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range: build-time via tauri-utils/urlpattern (GUI only)" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common: build-time via tauri-utils/urlpattern (GUI only)" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: build-time via tauri-utils/urlpattern (GUI only)" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: build-time via tauri-utils/urlpattern (GUI only)" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate versions are common through tauri/windows-sys; surface, don't fail.
+multiple-versions = "warn"
+# Workspace members depend on each other by path without a version
+# requirement; the crates are not published to crates.io, so the wildcard
+# check adds noise only.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -111,6 +111,18 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      # SBOM is generated before checksums so it is covered by SHA256SUMS, the
+      # Sigstore signature and the build provenance attestation.
+      - name: Generate CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 0.5.10 cargo-cyclonedx
+          mkdir -p release
+          scripts/gen-sbom.sh release/xfade.cdx.json
+
       - name: Assemble release assets and checksums
         shell: bash
         run: |
@@ -152,5 +164,6 @@ jobs:
           files: |
             release/xfade-*
             release/*.dmg
+            release/xfade.cdx.json
             release/SHA256SUMS
             release/SHA256SUMS.sigstore.json
