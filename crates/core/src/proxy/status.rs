@@ -2,13 +2,15 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::{Circuit, ProxyService};
+use super::{circuit_breaker::CircuitState, Circuit, ProxyService};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CircuitDto {
     pub provider_id: String,
     pub fails: u32,
     pub cooldown_remaining_secs: Option<u64>,
+    #[serde(default)]
+    pub state: CircuitState,
 }
 
 /// `Circuit` → `CircuitDto`: convert `cooldown_until_secs` into remaining cooldown seconds.
@@ -20,10 +22,16 @@ pub fn circuit_to_dto(provider_id: &str, c: &Circuit) -> CircuitDto {
     } else {
         None
     };
+    let state = if c.is_open(now) {
+        CircuitState::Open
+    } else {
+        CircuitState::Closed
+    };
     CircuitDto {
         provider_id: provider_id.to_string(),
         fails: c.fails,
         cooldown_remaining_secs,
+        state,
     }
 }
 
@@ -53,17 +61,23 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         .ok()
         .flatten()
         .unwrap_or((vec![], None, "chat".to_string()));
-    let circuits = svc
-        .circuit_breaker
-        .providers()
+    let mut provider_ids: Vec<String> = svc.circuit_breaker.providers();
+    for r in &routes {
+        if !provider_ids.contains(r) {
+            provider_ids.push(r.clone());
+        }
+    }
+    let circuits = provider_ids
         .into_iter()
         .map(|id| {
             let fails = svc.circuit_breaker.failure_count(&id);
             let cooldown_remaining_secs = svc.circuit_breaker.remaining_cooldown_secs(&id);
+            let state = svc.circuit_breaker.state(&id);
             CircuitDto {
                 provider_id: id,
                 fails,
                 cooldown_remaining_secs,
+                state,
             }
         })
         .collect::<Vec<_>>();
@@ -78,4 +92,31 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         models_merge: svc.core.db().models_merge_enabled().unwrap_or(false),
         circuits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_circuit_dto_serialization_with_state() {
+        let dto = CircuitDto {
+            provider_id: "upstream-1".to_string(),
+            fails: 2,
+            cooldown_remaining_secs: Some(15),
+            state: CircuitState::HalfOpen,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        assert!(s.contains("\"state\":\"HalfOpen\""));
+
+        let deserialized: CircuitDto = serde_json::from_str(&s).unwrap();
+        assert_eq!(deserialized, dto);
+    }
+
+    #[test]
+    fn test_circuit_dto_deserialization_default_state() {
+        let json = r#"{"provider_id":"p1","fails":0,"cooldown_remaining_secs":null}"#;
+        let dto: CircuitDto = serde_json::from_str(json).unwrap();
+        assert_eq!(dto.state, CircuitState::Closed);
+    }
 }

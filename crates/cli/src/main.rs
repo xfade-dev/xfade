@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use xfade_core::proxy::circuit_breaker::CircuitState;
 use xfade_core::proxy::ProxyService;
 use xfade_core::store::db::StatsGroupBy;
 use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
@@ -70,6 +71,8 @@ enum Cmd {
     },
     /// Show the currently-active provider per tool
     Current,
+    /// View current status (daemon, routes, and circuit breaker status)
+    Status,
     /// Edit a provider
     Edit {
         name: String,
@@ -543,6 +546,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
+        Cmd::Status => {
+            let core = build_core()?;
+            cmd_status(&core)?;
+            Ok(())
+        }
         Cmd::Rm { name, tool } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
@@ -856,64 +864,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             ProxyCmd::Status => {
                 let core = build_core()?;
-                match core.db().get_routes()? {
-                    None => println!("routes: (none)"),
-                    Some((routes, model_override, target_protocol)) => {
-                        let main = &routes[0];
-                        let backups: Vec<&str> =
-                            routes.iter().skip(1).map(|s| s.as_str()).collect();
-                        if backups.is_empty() {
-                            println!("routes: {main}");
-                        } else {
-                            println!("routes: {main} -> {}", backups.join(" -> "));
-                        }
-                        match model_override.as_deref() {
-                            Some(m) => println!("model: {m}"),
-                            None => println!("model: (passthrough)"),
-                        }
-                        println!("target: {target_protocol}");
-                    }
-                }
-                let smart = if core.db().smart_enabled()? {
-                    "on"
-                } else {
-                    "off"
-                };
-                println!("smart fader: {smart}");
-                let route_models = core.db().get_route_models()?;
-                if route_models.is_empty() {
-                    println!("route models: (none)");
-                } else {
-                    println!("route models:");
-                    for (id, m) in &route_models {
-                        println!("  {id} = {m}");
-                    }
-                }
-                let failover_4xx = if core.db().get_failover_4xx()? {
-                    "on"
-                } else {
-                    "off"
-                };
-                println!("failover 4xx: {failover_4xx}");
-                let models_merge = if core.db().models_merge_enabled()? {
-                    "on"
-                } else {
-                    "off"
-                };
-                println!("models merge: {models_merge}");
-                let handover_inject = if core.db().handover_auto_inject_enabled()? {
-                    "on"
-                } else {
-                    "off"
-                };
-                println!("handover inject: {handover_inject}");
-                if let Some((root, map_json)) = core.db().latest_repo_map()? {
-                    let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
-                    let lang = v["lang"].as_str().unwrap_or("?");
-                    let branch = v["git"]["branch"].as_str().unwrap_or("-");
-                    println!("project: {root} (lang {lang}, branch {branch})");
-                }
-                println!("note: circuit status is only visible inside the serve process (a fresh CLI process sees empty circuits)");
+                cmd_status(&core)?;
                 Ok(())
             }
             ProxyCmd::Clear => {
@@ -1349,6 +1300,137 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
             "clipboard command exited with status {status}"
         )))
     }
+}
+
+fn format_circuit_badge(state: CircuitState, cooldown: Option<u64>) -> String {
+    use crossterm::style::Stylize;
+    match state {
+        CircuitState::Closed => format!("{}", "[closed]".green()),
+        CircuitState::HalfOpen => format!("{}", "[HALF-OPEN]".yellow()),
+        CircuitState::Open => {
+            if let Some(secs) = cooldown {
+                format!("{}", format!("[OPEN (cooldown: {secs}s)]").red())
+            } else {
+                format!("{}", "[OPEN]".red())
+            }
+        }
+    }
+}
+
+fn cmd_status(core: &Core) -> Result<(), CoreError> {
+    let routes_opt = core.db().get_routes()?;
+    match &routes_opt {
+        None => println!("routes: (none)"),
+        Some((routes, model_override, target_protocol)) => {
+            let main = &routes[0];
+            let backups: Vec<&str> = routes.iter().skip(1).map(|s| s.as_str()).collect();
+            if backups.is_empty() {
+                println!("routes: {main}");
+            } else {
+                println!("routes: {main} -> {}", backups.join(" -> "));
+            }
+            match model_override.as_deref() {
+                Some(m) => println!("model: {m}"),
+                None => println!("model: (passthrough)"),
+            }
+            println!("target: {target_protocol}");
+        }
+    }
+    let smart = if core.db().smart_enabled()? {
+        "on"
+    } else {
+        "off"
+    };
+    println!("smart fader: {smart}");
+    let route_models = core.db().get_route_models()?;
+    if route_models.is_empty() {
+        println!("route models: (none)");
+    } else {
+        println!("route models:");
+        for (id, m) in &route_models {
+            println!("  {id} = {m}");
+        }
+    }
+    let failover_4xx = if core.db().get_failover_4xx()? {
+        "on"
+    } else {
+        "off"
+    };
+    println!("failover 4xx: {failover_4xx}");
+    let models_merge = if core.db().models_merge_enabled()? {
+        "on"
+    } else {
+        "off"
+    };
+    println!("models merge: {models_merge}");
+    let handover_inject = if core.db().handover_auto_inject_enabled()? {
+        "on"
+    } else {
+        "off"
+    };
+    println!("handover inject: {handover_inject}");
+    if let Some((root, map_json)) = core.db().latest_repo_map()? {
+        let v: serde_json::Value = serde_json::from_str(&map_json).unwrap_or_default();
+        let lang = v["lang"].as_str().unwrap_or("?");
+        let branch = v["git"]["branch"].as_str().unwrap_or("-");
+        println!("project: {root} (lang {lang}, branch {branch})");
+    }
+
+    let mut daemon_circuits = None;
+    if let Ok(home) = std::env::var("HOME") {
+        let dd = xfade_core::daemon::data_dir(std::path::Path::new(&home));
+        if let Some(cfg) = xfade_core::daemon::read(&dd) {
+            let url = format!("http://{}:{}/__xfade/status", cfg.host, cfg.port);
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+            {
+                let mut req = client.get(&url);
+                if let Some(t) = &cfg.auth_token {
+                    req = req.header("Authorization", format!("Bearer {t}"));
+                }
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    if let Ok(resp) = rt.block_on(req.send()) {
+                        if resp.status().is_success() {
+                            if let Ok(dto) =
+                                rt.block_on(resp.json::<xfade_core::proxy::status::StatusDto>())
+                            {
+                                daemon_circuits = Some(dto.circuits);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("circuits:");
+    if let Some(circuits) = daemon_circuits {
+        if circuits.is_empty() {
+            println!("  (none)");
+        } else {
+            for c in circuits {
+                let badge = format_circuit_badge(c.state, c.cooldown_remaining_secs);
+                println!("  {}: {badge}", c.provider_id);
+            }
+        }
+    } else if let Some((routes, _, _)) = routes_opt {
+        if routes.is_empty() {
+            println!("  (none)");
+        } else {
+            for id in routes {
+                let badge = format_circuit_badge(CircuitState::Closed, None);
+                println!("  {id}: {badge}");
+            }
+        }
+    } else {
+        println!("  (none)");
+    }
+
+    Ok(())
 }
 
 fn cmd_handover(copy: bool, raw: bool) -> Result<(), CoreError> {
