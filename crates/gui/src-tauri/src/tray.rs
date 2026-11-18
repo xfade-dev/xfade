@@ -178,7 +178,7 @@ fn on_menu_event(app: &AppHandle, e: MenuEvent) {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let state = app.state::<AppState>();
-                    let _ = state.core.use_provider(tool, &id);
+                    let _ = state.core.use_provider(tool, &id, false);
                 });
             }
         }

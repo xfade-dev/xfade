@@ -58,6 +58,9 @@ enum Cmd {
         name: String,
         #[arg(long)]
         tool: Option<ToolKind>,
+        /// Direct mode: write raw upstream API key into client config on disk instead of using the local gateway
+        #[arg(long)]
+        direct: bool,
     },
     /// Run a tool CLI with a provider injected via env vars (claude / aider only, no config changes; shorthand: `xfade claude <name>`)
     Run {
@@ -456,7 +459,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Cline(o) => cmd_run_instant(ToolKind::Cline, o),
         Cmd::Hermes(o) => cmd_run_instant(ToolKind::Hermes, o),
         Cmd::OpenClaw(o) => cmd_run_instant(ToolKind::OpenClaw, o),
-        Cmd::Use { name, tool } => {
+        Cmd::Use { name, tool, direct } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;
             // Special case: provider doesn't exist but matches a preset → auto-create from the preset.
@@ -528,7 +531,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     }
                 }
             }
-            core.use_provider(tool, &name)?;
+            core.use_provider(tool, &name, direct)?;
             println!("switched {tool} -> {name}");
             Ok(())
         }

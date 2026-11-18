@@ -81,6 +81,10 @@ pub fn ensure_gateway_running(port: u16) -> Result<()> {
         ProbeResult::Unreachable => {}
     }
 
+    if std::env::var("XFADE_TEST_SKIP_SPAWN").is_ok() {
+        return Ok(());
+    }
+
     let current_exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(current_exe);
     cmd.args(["serve", "--port", &port.to_string()])

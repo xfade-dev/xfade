@@ -221,7 +221,7 @@ impl App {
         let Some(id) = self.selected_provider().map(|p| p.id.clone()) else {
             return;
         };
-        self.message = Some(match core.use_provider(self.tool, &id) {
+        self.message = Some(match core.use_provider(self.tool, &id, false) {
             Ok(()) => {
                 self.flash_until = Some(Instant::now() + FLASH_DURATION);
                 format!("Switched to {id}")
@@ -322,7 +322,8 @@ impl App {
         // If the edited provider is the active route, re-apply the adapter so
         // the tool's live config tracks the change immediately.
         if was_active {
-            if let Err(err) = core.use_provider(self.tool, &e.provider_id) {
+            let direct = core.is_direct(self.tool).unwrap_or(false);
+            if let Err(err) = core.use_provider(self.tool, &e.provider_id, direct) {
                 self.message = Some(format!("Saved, but re-apply failed: {err}"));
             }
         }
@@ -405,6 +406,7 @@ mod tests {
     use xfade_core::store::secrets::FileStore;
 
     fn test_core(dir: &tempfile::TempDir) -> Core {
+        std::env::set_var("XFADE_TEST_SKIP_SPAWN", "1");
         let home = dir.path().join("home");
         let data = dir.path().join("data");
         std::fs::create_dir_all(&home).unwrap();
@@ -456,7 +458,7 @@ mod tests {
         let core = test_core(&dir);
         add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
         add(&core, ToolKind::ClaudeCode, "b", Some("http://y"));
-        core.use_provider(ToolKind::ClaudeCode, "b").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "b", true).unwrap();
         let app = App::new(ToolKind::ClaudeCode, &core);
         assert_eq!(app.selected_provider().map(|p| p.id.as_str()), Some("b"));
     }
@@ -493,7 +495,8 @@ mod tests {
         add(&core, ToolKind::ClaudeCode, "z", Some("http://z"));
         add(&core, ToolKind::Codex, "dup", Some("http://new"));
         add(&core, ToolKind::Codex, "active-cx", Some("http://a"));
-        core.use_provider(ToolKind::Codex, "active-cx").unwrap();
+        core.use_provider(ToolKind::Codex, "active-cx", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         assert_eq!(app.selected_provider().map(|p| p.id.as_str()), Some("dup"));
         app.next_tool(&core); // claude -> codex
@@ -546,7 +549,8 @@ mod tests {
             "glm",
             Some("http://gw.example:3000"),
         );
-        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         // The knob starts centered, not snapped to the cloud target, and the
         // intro fade is scheduled to run.
@@ -582,7 +586,8 @@ mod tests {
             "localy",
             Some("http://127.0.0.1:11434"),
         );
-        core.use_provider(ToolKind::ClaudeCode, "cloudy").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "cloudy", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.intro_until = None; // isolate the switch slide from the open intro
         app.next(); // select localy
@@ -638,7 +643,8 @@ mod tests {
             "glm",
             Some("http://gw.example:3000"),
         );
-        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         assert!(app.intro_until.is_some(), "intro must be running");
         // Before interaction: one tick advances the knob by the slow factor.
@@ -850,7 +856,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir);
         add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
-        core.use_provider(ToolKind::ClaudeCode, "a").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "a", true).unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.start_edit();
         {

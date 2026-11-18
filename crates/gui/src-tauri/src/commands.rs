@@ -89,7 +89,7 @@ pub async fn remove_provider(
 #[tauri::command]
 pub async fn use_provider(state: State<'_, AppState>, tool: ToolKind, id: String) -> CmdResult<()> {
     let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || core.use_provider(tool, &id))
+    tauri::async_runtime::spawn_blocking(move || core.use_provider(tool, &id, false))
         .await
         .map_err(err)?
         .map_err(err)

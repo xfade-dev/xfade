@@ -231,6 +231,11 @@ impl Core {
         Ok(self.db.list(Some(tool))?.into_iter().find(|p| p.is_active))
     }
 
+    /// Whether the tool's active provider was configured in direct mode (rather than gateway proxy mode).
+    pub fn is_direct(&self, tool: ToolKind) -> Result<bool> {
+        Ok(self.db.get_tool_routes(tool.as_str())?.is_none())
+    }
+
     pub fn remove(&self, tool: ToolKind, id: &str) -> Result<()> {
         let p = self
             .db
@@ -244,7 +249,10 @@ impl Core {
     }
 
     /// Switch provider: backup → write tool config → mark active.
-    pub fn use_provider(&self, tool: ToolKind, id: &str) -> Result<()> {
+    /// When `direct` is false (the default), routes via the local loopback gateway with a dedicated
+    /// client token and ensures the gateway daemon is running, eliminating raw keys from client configs.
+    /// When `direct` is true, writes the raw upstream API key directly into the tool config on disk.
+    pub fn use_provider(&self, tool: ToolKind, id: &str, direct: bool) -> Result<()> {
         self.ensure_imported(tool)?;
         let previous = self.current(tool)?;
         let p = self
@@ -252,21 +260,52 @@ impl Core {
             .get(tool, id)?
             .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{id}")))?;
 
-        let key = if p.is_official() {
-            None
-        } else {
-            Some(self.secrets.get(&p.key_ref)?)
-        };
-
         let adapter = self.adapter(tool);
         let backup_dir = self.data_dir.join("backups").join(tool.as_str());
+        let mut backed_up = Vec::new();
         for path in adapter.config_paths() {
-            backup_file(&path, &backup_dir)?;
+            if let Some(backup_path) = backup_file(&path, &backup_dir)? {
+                backed_up.push((path, backup_path));
+            }
         }
 
         let p = self.patch_official_removal(tool, p)?;
         let p = self.patch_original_capture(tool, p)?;
-        adapter.apply(&p, key.as_deref())?;
+
+        if p.is_official() {
+            if let Err(e) = adapter.apply(&p, None) {
+                Self::rollback_backups(&backed_up);
+                return Err(e);
+            }
+        } else if direct {
+            let key = self.secrets.get(&p.key_ref)?;
+            if let Err(e) = adapter.apply(&p, Some(&key)) {
+                Self::rollback_backups(&backed_up);
+                return Err(e);
+            }
+            let _ = self.db.set_tool_routes(tool.as_str(), &[], None, "chat");
+        } else {
+            let port = crate::daemon::read(&self.data_dir)
+                .map(|cfg| cfg.port)
+                .unwrap_or(24860);
+
+            if let Err(e) = crate::daemon_spawner::ensure_gateway_running(port) {
+                Self::rollback_backups(&backed_up);
+                return Err(e);
+            }
+
+            let tm = crate::store::tokens::TokenManager::new(Arc::new(self.db.clone()));
+            let local_token = tm.get_or_create(tool)?;
+
+            if let Err(e) = adapter.apply_gateway(&p, &local_token, port) {
+                Self::rollback_backups(&backed_up);
+                return Err(e);
+            }
+
+            self.db
+                .set_tool_routes(tool.as_str(), &[id.to_string()], None, "chat")?;
+        }
+
         self.db.set_active(tool, id)?;
         // Session timeline: record the config-level switch. The handover row's
         // session_id stays NULL — the proxy pipeline backfills it from the next
@@ -282,6 +321,12 @@ impl Core {
             );
         }
         Ok(())
+    }
+
+    fn rollback_backups(backed_up: &[(PathBuf, PathBuf)]) {
+        for (target, backup) in backed_up {
+            let _ = std::fs::copy(backup, target);
+        }
     }
 
     /// When switching OpenCode back to official, write the current active custom
@@ -473,6 +518,7 @@ mod tests {
     use serde_json::json;
 
     fn setup() -> (tempfile::TempDir, Core) {
+        std::env::set_var("XFADE_TEST_SKIP_SPAWN", "1");
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let data = dir.path().join("data");
@@ -481,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn add_and_use_claude_provider() {
+    fn add_and_use_claude_provider_direct() {
         let (dir, core) = setup();
         let p = Provider::new(
             "kimi",
@@ -489,7 +535,8 @@ mod tests {
             Some("https://api.moonshot.cn/anthropic".into()),
         );
         core.add_provider(p, Some("sk-test")).unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", true)
+            .unwrap();
 
         let s = std::fs::read_to_string(dir.path().join("home/.claude/settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -497,6 +544,31 @@ mod tests {
 
         let cur = core.current(ToolKind::ClaudeCode).unwrap().unwrap();
         assert_eq!(cur.id, "kimi");
+    }
+
+    #[test]
+    fn add_and_use_claude_provider_gateway_default() {
+        let (dir, core) = setup();
+        let p = Provider::new(
+            "kimi",
+            ToolKind::ClaudeCode,
+            Some("https://api.moonshot.cn/anthropic".into()),
+        );
+        core.add_provider(p, Some("sk-test")).unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", false)
+            .unwrap();
+
+        let s = std::fs::read_to_string(dir.path().join("home/.claude/settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(doc["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:24860");
+        assert!(doc["env"]["ANTHROPIC_AUTH_TOKEN"]
+            .as_str()
+            .unwrap()
+            .starts_with("xfade-local-claude-"));
+        assert!(!s.contains("sk-test"));
+
+        let routes = core.db().get_tool_routes("claude").unwrap().unwrap();
+        assert_eq!(routes.0, vec!["kimi".to_string()]);
     }
 
     #[test]
@@ -510,7 +582,8 @@ mod tests {
 
         let p = Provider::new("kimi", ToolKind::ClaudeCode, Some("https://x".into()));
         core.add_provider(p, Some("sk-new")).unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", true)
+            .unwrap();
 
         let imported = core
             .list(Some(ToolKind::ClaudeCode))
@@ -520,7 +593,8 @@ mod tests {
             .unwrap();
         assert_eq!(imported.base_url.as_deref(), Some("https://relay"));
 
-        core.use_provider(ToolKind::ClaudeCode, "imported").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "imported", true)
+            .unwrap();
         let s = std::fs::read_to_string(dir.path().join("home/.claude/settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(doc["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-old");
@@ -536,8 +610,10 @@ mod tests {
         .unwrap();
         core.add_provider(Provider::new("official", ToolKind::ClaudeCode, None), None)
             .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "official").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", true)
+            .unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "official", false)
+            .unwrap();
 
         let s = std::fs::read_to_string(dir.path().join("home/.claude/settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -552,7 +628,7 @@ mod tests {
             Some("k"),
         )
         .unwrap();
-        core.use_provider(ToolKind::Codex, "kimi").unwrap();
+        core.use_provider(ToolKind::Codex, "kimi", true).unwrap();
         let err = core.remove(ToolKind::Codex, "kimi").unwrap_err();
         assert!(matches!(err, CoreError::ActiveProviderRemoval(_)));
     }
@@ -567,7 +643,8 @@ mod tests {
             Some("k"),
         )
         .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", true)
+            .unwrap();
         let backups = std::fs::read_dir(dir.path().join("data/backups/claude")).unwrap();
         assert_eq!(backups.count(), 1);
     }
@@ -575,7 +652,7 @@ mod tests {
     #[test]
     fn use_unknown_provider_errors() {
         let (_dir, core) = setup();
-        assert!(core.use_provider(ToolKind::Codex, "nope").is_err());
+        assert!(core.use_provider(ToolKind::Codex, "nope", false).is_err());
     }
 
     #[test]
@@ -588,8 +665,9 @@ mod tests {
         .unwrap();
         core.add_provider(Provider::new("official", ToolKind::OpenCode, None), None)
             .unwrap();
-        core.use_provider(ToolKind::OpenCode, "kimi").unwrap();
-        core.use_provider(ToolKind::OpenCode, "official").unwrap();
+        core.use_provider(ToolKind::OpenCode, "kimi", true).unwrap();
+        core.use_provider(ToolKind::OpenCode, "official", false)
+            .unwrap();
 
         let doc: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("home/.config/opencode/opencode.json"))
@@ -642,7 +720,7 @@ mod tests {
         let mut p = Provider::new("kimi", ToolKind::Pi, Some("http://x".into()));
         p.extra = json!({"model": "gpt-4o"});
         core.add_provider(p, Some("sk-test")).unwrap();
-        core.use_provider(ToolKind::Pi, "kimi").unwrap();
+        core.use_provider(ToolKind::Pi, "kimi", true).unwrap();
 
         // After switching to third-party: defaultProvider should be set to xfade
         assert_eq!(read_settings_pi(&dir)["defaultProvider"], "xfade");
@@ -658,7 +736,7 @@ mod tests {
         // Add + switch to official
         core.add_provider(Provider::new("official", ToolKind::Pi, None), None)
             .unwrap();
-        core.use_provider(ToolKind::Pi, "official").unwrap();
+        core.use_provider(ToolKind::Pi, "official", false).unwrap();
 
         // After switching to official: defaultProvider should restore to anthropic
         assert_eq!(
@@ -683,8 +761,8 @@ mod tests {
         b.extra = json!({"model": "gpt-4o"});
         core.add_provider(b, Some("k2")).unwrap();
 
-        core.use_provider(ToolKind::Pi, "a").unwrap();
-        core.use_provider(ToolKind::Pi, "b").unwrap();
+        core.use_provider(ToolKind::Pi, "a", true).unwrap();
+        core.use_provider(ToolKind::Pi, "b", true).unwrap();
 
         let stored_b = core
             .list(Some(ToolKind::Pi))
@@ -700,7 +778,7 @@ mod tests {
         // Switch to official to restore
         core.add_provider(Provider::new("official", ToolKind::Pi, None), None)
             .unwrap();
-        core.use_provider(ToolKind::Pi, "official").unwrap();
+        core.use_provider(ToolKind::Pi, "official", false).unwrap();
         assert_eq!(read_settings_pi(&dir)["defaultProvider"], "anthropic");
     }
 
@@ -717,7 +795,7 @@ mod tests {
         let mut p = Provider::new("kimi", ToolKind::OhMyPi, Some("http://x".into()));
         p.extra = json!({"model": "gpt-4o"});
         core.add_provider(p, Some("sk-test")).unwrap();
-        core.use_provider(ToolKind::OhMyPi, "kimi").unwrap();
+        core.use_provider(ToolKind::OhMyPi, "kimi", true).unwrap();
 
         let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -725,7 +803,8 @@ mod tests {
 
         core.add_provider(Provider::new("official", ToolKind::OhMyPi, None), None)
             .unwrap();
-        core.use_provider(ToolKind::OhMyPi, "official").unwrap();
+        core.use_provider(ToolKind::OhMyPi, "official", false)
+            .unwrap();
 
         let s = std::fs::read_to_string(dir.path().join("home/.omp/agent/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -742,7 +821,8 @@ mod tests {
             Some("k"),
         )
         .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "kimi").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "kimi", true)
+            .unwrap();
         let stored = core
             .list(Some(ToolKind::ClaudeCode))
             .unwrap()
@@ -770,7 +850,7 @@ mod tests {
         let mut p = Provider::new("glm", ToolKind::Codex, Some("https://x/v1".into()));
         p.extra = json!({"model": "glm-5-2-260617"});
         core.add_provider(p, Some("k")).unwrap();
-        core.use_provider(ToolKind::Codex, "glm").unwrap();
+        core.use_provider(ToolKind::Codex, "glm", true).unwrap();
 
         // The capture must have been persisted on the third-party provider.
         let stored = core
@@ -783,7 +863,8 @@ mod tests {
 
         core.add_provider(Provider::new("official", ToolKind::Codex, None), None)
             .unwrap();
-        core.use_provider(ToolKind::Codex, "official").unwrap();
+        core.use_provider(ToolKind::Codex, "official", false)
+            .unwrap();
 
         let cfg = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
         assert!(
@@ -811,11 +892,12 @@ mod tests {
         );
         p.extra = json!({"model": "glm-5-2-260617"});
         core.add_provider(p, Some("k")).unwrap();
-        core.use_provider(ToolKind::Cline, "glm").unwrap();
+        core.use_provider(ToolKind::Cline, "glm", true).unwrap();
 
         core.add_provider(Provider::new("official", ToolKind::Cline, None), None)
             .unwrap();
-        core.use_provider(ToolKind::Cline, "official").unwrap();
+        core.use_provider(ToolKind::Cline, "official", false)
+            .unwrap();
 
         let doc: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(settings_dir.join("providers.json")).unwrap(),
