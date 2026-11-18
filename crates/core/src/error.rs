@@ -38,6 +38,9 @@ pub enum CoreError {
     #[error("`xfade run` doesn't support {0} (config-file driven; use `xfade use` instead)")]
     RunUnsupported(String),
 
+    #[error("port {0} is occupied by another non-xfade process")]
+    PortConflict(u16),
+
     #[error("proxy error: {0}")]
     Proxy(String),
 }
