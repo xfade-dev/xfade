@@ -483,6 +483,7 @@ mod tests {
     use xfade_core::{Core, Provider, ToolKind};
 
     fn test_core(dir: &tempfile::TempDir) -> Core {
+        std::env::set_var("XFADE_TEST_SKIP_SPAWN", "1");
         let home = dir.path().join("home");
         let data = dir.path().join("data");
         std::fs::create_dir_all(&home).unwrap();
@@ -513,7 +514,8 @@ mod tests {
             Some("sk-test"),
         )
         .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "glmcc").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glmcc", true)
+            .unwrap();
         let app = App::new(ToolKind::ClaudeCode, &core);
 
         let backend = TestBackend::new(80, 20);
@@ -644,7 +646,8 @@ mod tests {
             Some("sk-test"),
         )
         .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.probing.insert("glm".to_string());
 
@@ -704,7 +707,8 @@ mod tests {
             Some("sk-test"),
         )
         .unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "glm").unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "glm", true)
+            .unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.probes.insert("glm".into(), ProbeResult::Ms(12));
         let stats = vec![StatsRow {

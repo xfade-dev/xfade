@@ -43,7 +43,9 @@ fn add_ls_use_current_flow() {
         .success();
 
     let settings = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
-    assert!(settings.contains("api.moonshot.cn"));
+    assert!(settings.contains("http://127.0.0.1:24860"));
+    assert!(settings.contains("xfade-local-claude-"));
+    assert!(!settings.contains("sk-"));
 
     xfade(home.path())
         .args(["current"])
@@ -113,11 +115,11 @@ fn switch_back_to_imported_snapshot() {
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "kimi", "--tool", "claude"])
+        .args(["use", "kimi", "--tool", "claude", "--direct"])
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "imported", "--tool", "claude"])
+        .args(["use", "imported", "--tool", "claude", "--direct"])
         .assert()
         .success();
 
@@ -143,7 +145,7 @@ fn codex_end_to_end() {
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "kimi", "--tool", "codex"])
+        .args(["use", "kimi", "--tool", "codex", "--direct"])
         .assert()
         .success();
 
@@ -194,7 +196,7 @@ fn edit_updates_base_url_and_extra() {
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "kimi", "--tool", "claude"])
+        .args(["use", "kimi", "--tool", "claude", "--direct"])
         .assert()
         .success();
     let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
@@ -478,7 +480,7 @@ fn add_uses_global_defaults() {
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "g", "--tool", "claude"])
+        .args(["use", "g", "--tool", "claude", "--direct"])
         .assert()
         .success();
 
@@ -530,7 +532,7 @@ fn aider_end_to_end() {
         .assert()
         .success();
     xfade(home.path())
-        .args(["use", "kimi", "--tool", "aider"])
+        .args(["use", "kimi", "--tool", "aider", "--direct"])
         .assert()
         .success();
 
