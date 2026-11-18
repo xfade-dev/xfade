@@ -10,10 +10,12 @@ pub mod usage;
 mod auth;
 pub mod status;
 
+pub use auth::ClientIdentity;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 
 use crate::error::Result;
 use crate::service::Core;
+use crate::store::tokens::TokenManager;
 use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
@@ -48,6 +50,7 @@ impl Circuit {
 
 pub struct ProxyService {
     pub core: Core,
+    pub token_manager: Arc<TokenManager>,
     pub client: reqwest::Client,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub auth_token: Option<String>,
@@ -105,8 +108,10 @@ impl ProxyService {
             .pool_max_idle_per_host(4)
             .build()
             .expect("reqwest Client::builder should not fail");
+        let token_manager = Arc::new(TokenManager::new(Arc::new(core.db().clone())));
         Self {
             core,
+            token_manager,
             client,
             circuit_breaker,
             auth_token: None,
@@ -2383,5 +2388,70 @@ mod tests {
         // Verify the expired circuit was cleaned from the database
         let loaded = core.db().load_circuits().unwrap();
         assert!(!loaded.contains_key("expired_provider"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_tool_route_isolation_via_client_tokens() {
+        use crate::models::ToolKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let up_claude = MockUpstream::spawn().await;
+        let up_codex = MockUpstream::spawn().await;
+
+        let core = test_core(
+            &dir,
+            &[
+                ("prov-claude", &up_claude.url(), "key-claude"),
+                ("prov-codex", &up_codex.url(), "key-codex"),
+            ],
+        );
+
+        // Set tool routes: Claude Code -> prov-claude, Codex -> prov-codex
+        core.db()
+            .set_tool_routes("claude", &["prov-claude".into()], None, "chat")
+            .unwrap();
+        core.db()
+            .set_tool_routes("codex", &["prov-codex".into()], None, "chat")
+            .unwrap();
+
+        let svc = ProxyService::new(core);
+        let token_claude = svc
+            .token_manager
+            .get_or_create(ToolKind::ClaudeCode)
+            .unwrap();
+        let token_codex = svc.token_manager.get_or_create(ToolKind::Codex).unwrap();
+
+        let url = spawn_service(svc).await;
+
+        up_claude.respond_with(200, r#"{"from":"claude"}"#);
+        up_codex.respond_with(200, r#"{"from":"codex"}"#);
+
+        // Request with Claude's token goes to up_claude
+        let (s1, b1) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &format!("Bearer {token_claude}"),
+        )
+        .await;
+        assert_eq!(s1, 200);
+        assert!(
+            b1.contains("claude"),
+            "expected response from claude, got {b1}"
+        );
+
+        // Request with Codex's token goes to up_codex
+        let (s2, b2) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &format!("Bearer {token_codex}"),
+        )
+        .await;
+        assert_eq!(s2, 200);
+        assert!(
+            b2.contains("codex"),
+            "expected response from codex, got {b2}"
+        );
     }
 }

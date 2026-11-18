@@ -9,8 +9,10 @@
 //! forwarding scenario is inherently parameter-heavy:
 #![allow(clippy::too_many_arguments)]
 
+use super::auth::ClientIdentity;
 use super::usage::Usage;
 use super::ProxyService;
+use crate::models::ToolKind;
 use crate::store::db::RequestLog;
 use axum::{
     body::{Body, Bytes},
@@ -174,6 +176,10 @@ fn build_upstream_request(
 
     if let Some(key) = auth_key {
         req = req.header("Authorization", format!("Bearer {key}"));
+        if endpoint == "messages" || endpoint == "/v1/messages" {
+            req = req.header("x-api-key", key);
+            req = req.header("anthropic-version", "2023-06-01");
+        }
     }
 
     if method != "GET" {
@@ -305,17 +311,25 @@ struct PreparedBodies {
 fn resolve_routes<'a>(
     svc: &'a ProxyService,
     providers: &'a [crate::models::Provider],
+    client_tool: Option<ToolKind>,
 ) -> Result<ResolvedRoutes<'a>, Box<Response>> {
-    let (routes, model_override, target_protocol) = match svc.core.db().get_routes() {
-        Ok(Some(r)) if !r.0.is_empty() => r,
-        _ => {
-            return Err(Box::new(
-                Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body("no routes configured; use `xfade proxy use <name>`".into())
-                    .unwrap(),
-            ));
-        }
+    let tool_routes = match client_tool {
+        Some(tool) => svc.core.db().get_tool_routes(tool.as_str()).ok().flatten(),
+        None => None,
+    };
+    let (routes, model_override, target_protocol) = match tool_routes {
+        Some(r) if !r.0.is_empty() => r,
+        _ => match svc.core.db().get_routes() {
+            Ok(Some(r)) if !r.0.is_empty() => r,
+            _ => {
+                return Err(Box::new(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body("no routes configured; use `xfade proxy use <name>`".into())
+                        .unwrap(),
+                ));
+            }
+        },
     };
     let provider_map: std::collections::HashMap<String, &crate::models::Provider> =
         providers.iter().map(|p| (p.id.clone(), p)).collect();
@@ -1044,6 +1058,7 @@ async fn forward_with_failover(
     parsed: Option<&serde_json::Value>,
     model: Option<String>,
     session_id: Option<&str>,
+    client_tool: Option<ToolKind>,
 ) -> Response {
     let start = Instant::now();
 
@@ -1056,7 +1071,7 @@ async fn forward_with_failover(
         provider_map,
         route_models,
         failover_4xx,
-    } = match resolve_routes(svc, &providers) {
+    } = match resolve_routes(svc, &providers, client_tool) {
         Ok(r) => r,
         Err(resp) => {
             session_failed(svc, session_id);
@@ -1430,10 +1445,12 @@ impl futures::Stream for TailLogStream {
 
 pub async fn handle(
     State(svc): State<Arc<ProxyService>>,
+    identity: Option<axum::extract::Extension<ClientIdentity>>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let client_tool = identity.map(|axum::extract::Extension(ClientIdentity(t))| t);
     let endpoint = endpoint_from_path(uri.path());
     let mut body = body;
     // Parse the body once; model extraction and the session engine share it.
@@ -1507,6 +1524,7 @@ pub async fn handle(
         parsed.as_ref(),
         model,
         session_id.as_deref(),
+        client_tool,
     )
     .await;
     if let Some(id) = injected_handover {
@@ -1537,13 +1555,17 @@ struct ModelProbe {
 /// when unambiguous; ids exposed by more than one route get a `<route_id>/`
 /// prefix so a client-selected id can be mapped back to exactly one provider.
 /// Circuit state is deliberately not mutated by these discovery probes.
-async fn aggregate_models(svc: &ProxyService, headers: &HeaderMap) -> Response {
+async fn aggregate_models(
+    svc: &ProxyService,
+    headers: &HeaderMap,
+    client_tool: Option<ToolKind>,
+) -> Response {
     let providers = svc.core.list(None).unwrap_or_default();
     let ResolvedRoutes {
         routes,
         provider_map,
         ..
-    } = match resolve_routes(svc, &providers) {
+    } = match resolve_routes(svc, &providers, client_tool) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
@@ -1654,7 +1676,18 @@ async fn aggregate_models(svc: &ProxyService, headers: &HeaderMap) -> Response {
     if merged.is_empty() {
         // No usable catalog: degrade to the pre-feature first-success forward
         // and keep the last-known map so existing pinning still works.
-        return forward_with_failover(svc, "GET", "models", headers, &[], None, None, None).await;
+        return forward_with_failover(
+            svc,
+            "GET",
+            "models",
+            headers,
+            &[],
+            None,
+            None,
+            None,
+            client_tool,
+        )
+        .await;
     }
 
     let _ = svc.core.db().set_model_routes(&map);
@@ -1667,13 +1700,29 @@ async fn aggregate_models(svc: &ProxyService, headers: &HeaderMap) -> Response {
         .unwrap()
 }
 
-pub async fn handle_get(State(svc): State<Arc<ProxyService>>, headers: HeaderMap) -> Response {
+pub async fn handle_get(
+    State(svc): State<Arc<ProxyService>>,
+    identity: Option<axum::extract::Extension<ClientIdentity>>,
+    headers: HeaderMap,
+) -> Response {
+    let client_tool = identity.map(|axum::extract::Extension(ClientIdentity(t))| t);
     // Read per request so `xfade proxy models-merge on/off` reaches a running
     // daemon immediately. Off keeps the exact pre-feature first-success path.
     if svc.core.db().models_merge_enabled().unwrap_or(false) {
-        return aggregate_models(&svc, &headers).await;
+        return aggregate_models(&svc, &headers, client_tool).await;
     }
-    forward_with_failover(&svc, "GET", "models", &headers, &[], None, None, None).await
+    forward_with_failover(
+        &svc,
+        "GET",
+        "models",
+        &headers,
+        &[],
+        None,
+        None,
+        None,
+        client_tool,
+    )
+    .await
 }
 
 #[cfg(test)]

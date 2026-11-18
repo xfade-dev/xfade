@@ -9,6 +9,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use super::ProxyService;
+use crate::models::ToolKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIdentity(pub ToolKind);
 
 /// True for `localhost` and any loopback IP literal (`127.0.0.0/8`, `::1`),
 /// with or without IPv6 brackets.
@@ -103,11 +107,27 @@ pub async fn host_origin_guard(
 /// through. Applies to /v1/* and /__xfade/status; /health does not mount this layer.
 pub async fn auth_guard(
     State(svc): State<Arc<ProxyService>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    let presented = presented_token(req.headers());
+    if let Some(tok) = presented {
+        if let Some(tool) = svc.token_manager.validate(tok) {
+            req.extensions_mut().insert(ClientIdentity(tool));
+            req.headers_mut().remove(header::AUTHORIZATION);
+            req.headers_mut().remove("x-api-key");
+            return next.run(req).await;
+        }
+        if tok.starts_with("xfade-local-") {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized: invalid client token",
+            )
+                .into_response();
+        }
+    }
     if let Some(token) = &svc.auth_token {
-        let ok = presented_token(req.headers()).is_some_and(|p| token_matches(token, p));
+        let ok = presented.is_some_and(|p| token_matches(token, p));
         if !ok {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
@@ -160,5 +180,124 @@ mod tests {
         assert!(!token_matches("abc", "abd"));
         assert!(!token_matches("abc", "abcd"));
         assert!(!token_matches("abc", ""));
+    }
+
+    async fn test_auth_call_with_token(
+        tm: Arc<crate::store::tokens::TokenManager>,
+        token: &str,
+    ) -> (StatusCode, Option<ClientIdentity>) {
+        use axum::middleware::from_fn_with_state;
+        use axum::routing::post;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::proxy::testsupport::test_core(&dir, &[]);
+        let mut svc = ProxyService::new(core);
+        svc.token_manager = tm;
+        let svc = Arc::new(svc);
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new()
+            .route(
+                "/test",
+                post(|req: axum::extract::Request| async move {
+                    let id = req.extensions().get::<ClientIdentity>().copied();
+                    *captured_clone.lock().unwrap() = id;
+                    StatusCode::OK
+                }),
+            )
+            .layer(from_fn_with_state(svc, auth_guard));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let id = captured.lock().unwrap().take();
+        (status, id)
+    }
+
+    #[tokio::test]
+    async fn test_auth_guard_accepts_client_token_and_tags_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::store::Db::open_in_dir(dir.path()).unwrap());
+        let tm = Arc::new(crate::store::tokens::TokenManager::new(db));
+        let token = tm.get_or_create(ToolKind::ClaudeCode).unwrap();
+
+        let (status, identity) = test_auth_call_with_token(tm.clone(), &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(identity, Some(ClientIdentity(ToolKind::ClaudeCode)));
+    }
+
+    #[tokio::test]
+    async fn test_auth_guard_accepts_x_api_key_and_strips_headers() {
+        use axum::middleware::from_fn_with_state;
+        use axum::routing::post;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::store::Db::open_in_dir(dir.path()).unwrap());
+        let tm = Arc::new(crate::store::tokens::TokenManager::new(db));
+        let token = tm.get_or_create(ToolKind::Codex).unwrap();
+
+        let core = crate::proxy::testsupport::test_core(&dir, &[]);
+        let mut svc = ProxyService::new(core);
+        svc.token_manager = tm.clone();
+        let svc = Arc::new(svc);
+
+        let captured_headers = Arc::new(std::sync::Mutex::new(None));
+        let captured_clone = captured_headers.clone();
+
+        let app = Router::new()
+            .route(
+                "/test",
+                post(|req: axum::extract::Request| async move {
+                    *captured_clone.lock().unwrap() = Some(req.headers().clone());
+                    StatusCode::OK
+                }),
+            )
+            .layer(from_fn_with_state(svc, auth_guard));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("x-api-key", &token)
+            .header("x-other-header", "keep-me")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let hdrs = captured_headers.lock().unwrap().take().unwrap();
+        assert!(
+            !hdrs.contains_key("x-api-key"),
+            "x-api-key must be stripped"
+        );
+        assert!(
+            !hdrs.contains_key("authorization"),
+            "authorization must be stripped"
+        );
+        assert_eq!(hdrs.get("x-other-header").unwrap(), "keep-me");
+    }
+
+    #[tokio::test]
+    async fn test_auth_guard_rejects_invalid_local_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::store::Db::open_in_dir(dir.path()).unwrap());
+        let tm = Arc::new(crate::store::tokens::TokenManager::new(db));
+
+        let (status, identity) =
+            test_auth_call_with_token(tm, "xfade-local-claude-fake123456").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(identity, None);
     }
 }
