@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod analyzer;
 pub mod backup;
 pub mod daemon;
+pub mod daemon_spawner;
 pub mod error;
 pub mod fsutil;
 pub mod launch;

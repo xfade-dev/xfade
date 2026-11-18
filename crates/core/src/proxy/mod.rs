@@ -275,7 +275,15 @@ impl ProxyService {
                 auth::auth_guard,
             ));
         Router::<Arc<ProxyService>>::new()
-            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "app": "xfade"
+                    }))
+                }),
+            )
             .merge(protected)
             .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
             .layer(axum::middleware::from_fn_with_state(
