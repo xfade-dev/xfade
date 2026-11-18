@@ -13,6 +13,14 @@ categories.workspace = true
 name = "xfade"
 path = "src/main.rs"
 
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"
+
 [dependencies]
 xfade-core = { path = "../core" }
 serde = { workspace = true }

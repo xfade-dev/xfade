@@ -19,8 +19,9 @@ pub const STATE_OPEN: u8 = 1;
 pub const STATE_HALF_OPEN: u8 = 2;
 
 /// Three-state representation of upstream provider availability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CircuitState {
+    #[default]
     Closed,
     Open,
     HalfOpen,
