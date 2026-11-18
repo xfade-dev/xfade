@@ -20,6 +20,17 @@ pub trait ToolAdapter: Send + Sync {
     /// Write the provider into the tool config.
     /// `provider.base_url == None` means switch back to official (clear/restore snapshot); api_key is ignored.
     fn apply(&self, provider: &Provider, api_key: Option<&str>) -> Result<()>;
+
+    /// Apply the provider in gateway mode: point the tool to the local loopback proxy
+    /// (`http://127.0.0.1:<port>`) and write only the local tool token as credential.
+    /// Eliminates raw upstream API keys from client configuration files on disk.
+    fn apply_gateway(&self, provider: &Provider, local_token: &str, port: u16) -> Result<()> {
+        let loopback_url = format!("http://127.0.0.1:{port}");
+        let mut gateway_p = provider.clone();
+        gateway_p.base_url = Some(loopback_url);
+        self.apply(&gateway_p, Some(local_token))
+    }
+
     /// Read the tool's currently-active config (used for the first import); returns Ok(None) when there's no third-party config.
     /// Returns (provider, api_key); api_key may be None (when the secret can't be read).
     fn read_current(&self) -> Result<Option<(Provider, Option<String>)>>;

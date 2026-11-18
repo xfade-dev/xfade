@@ -279,4 +279,28 @@ mod tests {
         assert_eq!(got.base_url.as_deref(), Some("https://x/v1"));
         assert_eq!(key.as_deref(), Some("sk-9"));
     }
+
+    #[test]
+    fn test_opencode_apply_gateway_contains_zero_raw_key() {
+        let home = tempfile::tempdir().unwrap();
+        let adapter = OpenCodeAdapter::new(home.path());
+        let p = Provider::new(
+            "groq",
+            ToolKind::OpenCode,
+            Some("https://api.groq.com/openai/v1".into()),
+        );
+
+        adapter
+            .apply_gateway(&p, "xfade-local-opencode-test12345678", 24860)
+            .unwrap();
+
+        let cfg =
+            std::fs::read_to_string(home.path().join(".config/opencode/opencode.json")).unwrap();
+        let auth =
+            std::fs::read_to_string(home.path().join(".local/share/opencode/auth.json")).unwrap();
+        assert!(cfg.contains("http://127.0.0.1:24860/v1"));
+        assert!(auth.contains("xfade-local-opencode-test12345678"));
+        assert!(!cfg.contains("api.groq.com"));
+        assert!(!auth.contains("sk-"));
+    }
 }

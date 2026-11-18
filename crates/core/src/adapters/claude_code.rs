@@ -386,4 +386,25 @@ mod tests {
         assert!(p.extra.get("haiku_model").is_none());
         assert!(p.extra.get("model").is_none());
     }
+
+    #[test]
+    fn test_claude_apply_gateway_contains_zero_raw_key() {
+        let home = tempfile::tempdir().unwrap();
+        let adapter = ClaudeCodeAdapter::new(home.path());
+        let p = Provider::new(
+            "kimi",
+            ToolKind::ClaudeCode,
+            Some("https://api.moonshot.cn/anthropic".into()),
+        );
+
+        adapter
+            .apply_gateway(&p, "xfade-local-claude-test12345678", 24860)
+            .unwrap();
+
+        let settings = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+        assert!(settings.contains("http://127.0.0.1:24860"));
+        assert!(settings.contains("xfade-local-claude-test12345678"));
+        assert!(!settings.contains("api.moonshot.cn"));
+        assert!(!settings.contains("sk-"));
+    }
 }
