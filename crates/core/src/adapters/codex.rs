@@ -485,4 +485,26 @@ mod tests {
         let (got, _key) = ad.read_current().unwrap().unwrap();
         assert_eq!(got.extra["wire_api"], "responses");
     }
+
+    #[test]
+    fn test_codex_apply_gateway_contains_zero_raw_key() {
+        let home = tempfile::tempdir().unwrap();
+        let adapter = CodexAdapter::new(home.path());
+        let p = Provider::new(
+            "deepseek",
+            ToolKind::Codex,
+            Some("https://api.deepseek.com".into()),
+        );
+
+        adapter
+            .apply_gateway(&p, "xfade-local-codex-test12345678", 24860)
+            .unwrap();
+
+        let cfg = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        let auth = std::fs::read_to_string(home.path().join(".codex/auth.json")).unwrap();
+        assert!(cfg.contains("http://127.0.0.1:24860/v1"));
+        assert!(auth.contains("xfade-local-codex-test12345678"));
+        assert!(!cfg.contains("api.deepseek.com"));
+        assert!(!auth.contains("sk-"));
+    }
 }
