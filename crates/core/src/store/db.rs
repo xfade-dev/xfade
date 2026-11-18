@@ -113,6 +113,8 @@ pub struct ModelRoute {
 /// Exposed model id → owning route. Rebuilt on each aggregated `/v1/models`.
 pub type ModelRoutes = BTreeMap<String, ModelRoute>;
 
+pub type ClientTokenRow = (String, String, u64, Option<u64>);
+
 impl Database {
     /// Get the lock-protected connection, handling poison errors (recover and log a warning on poison).
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -142,6 +144,10 @@ impl Database {
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    pub fn open_in_dir(dir: &Path) -> Result<Self> {
+        Self::open(&dir.join("xfade.db"))
     }
 
     pub fn open_memory() -> Result<Self> {
@@ -212,6 +218,19 @@ impl Database {
                 ts TEXT NOT NULL,
                 injected INTEGER NOT NULL DEFAULT 0,
                 injected_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS client_tokens (
+                tool TEXT PRIMARY KEY,
+                token TEXT NOT NULL,
+                created_at_secs INTEGER NOT NULL,
+                last_used_secs INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS tool_routes (
+                tool TEXT PRIMARY KEY,
+                routes TEXT NOT NULL,
+                model_override TEXT,
+                target_protocol TEXT NOT NULL DEFAULT 'chat',
+                updated_at TEXT NOT NULL
             );",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
@@ -519,6 +538,115 @@ impl Database {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn set_tool_routes(
+        &self,
+        tool: &str,
+        routes: &[String],
+        model_override: Option<&str>,
+        target_protocol: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        let routes_json = serde_json::to_string(routes)?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
+        conn.execute(
+            "INSERT INTO tool_routes (tool, routes, model_override, target_protocol, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(tool) DO UPDATE SET
+                routes = excluded.routes,
+                model_override = excluded.model_override,
+                target_protocol = excluded.target_protocol,
+                updated_at = excluded.updated_at",
+            params![tool, routes_json, model_override, target_protocol, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tool_routes(&self, tool: &str) -> Result<Option<RoutesConfig>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT routes, model_override, target_protocol FROM tool_routes WHERE tool = ?1",
+        )?;
+        let mut rows = stmt.query(params![tool])?;
+        match rows.next()? {
+            Some(row) => {
+                let s: String = row.get(0)?;
+                let routes: Vec<String> = serde_json::from_str(&s)?;
+                if routes.is_empty() {
+                    return Ok(None);
+                }
+                let model_override: Option<String> = row.get(1)?;
+                let target_protocol: String = row.get(2)?;
+                Ok(Some((routes, model_override, target_protocol)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_client_token(&self, tool: &str, token: &str, created_at_secs: u64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO client_tokens (tool, token, created_at_secs, last_used_secs)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(tool) DO UPDATE SET token = excluded.token, created_at_secs = excluded.created_at_secs",
+            params![tool, token, created_at_secs as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_client_token(&self, tool: &str) -> Result<Option<(String, u64, Option<u64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT token, created_at_secs, last_used_secs FROM client_tokens WHERE tool = ?1",
+        )?;
+        let mut rows = stmt.query(params![tool])?;
+        if let Some(row) = rows.next()? {
+            let token: String = row.get(0)?;
+            let created_at: i64 = row.get(1)?;
+            let last_used: Option<i64> = row.get(2)?;
+            Ok(Some((
+                token,
+                created_at as u64,
+                last_used.map(|x| x as u64),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_client_tokens(&self) -> Result<Vec<ClientTokenRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT tool, token, created_at_secs, last_used_secs FROM client_tokens ORDER BY tool",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tool: String = row.get(0)?;
+            let token: String = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            let last_used: Option<i64> = row.get(3)?;
+            Ok((tool, token, created_at as u64, last_used.map(|x| x as u64)))
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    pub fn update_client_token_last_used(&self, tool: &str, last_used_secs: u64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE client_tokens SET last_used_secs = ?1 WHERE tool = ?2",
+            params![last_used_secs as i64, tool],
+        )?;
+        Ok(())
     }
 
     /// Clear the route set and the cached aggregated model→route map without
