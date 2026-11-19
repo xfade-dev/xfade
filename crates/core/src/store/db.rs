@@ -241,6 +241,7 @@ impl Database {
                 id TEXT NOT NULL,
                 base_url TEXT,
                 key_ref TEXT NOT NULL,
+                protocol TEXT NOT NULL DEFAULT 'chat',
                 extra TEXT NOT NULL DEFAULT 'null',
                 is_active INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (tool, id)
@@ -423,6 +424,28 @@ impl Database {
         if !existing_handover_cols.contains("injected_at") {
             conn.execute("ALTER TABLE handovers ADD COLUMN injected_at TEXT", [])?;
         }
+        let provider_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(providers)")?;
+            let mut rows = stmt.query([])?;
+            let mut cols = std::collections::HashSet::new();
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                cols.insert(name);
+            }
+            cols
+        };
+        if !provider_cols.contains("protocol") {
+            conn.execute(
+                "ALTER TABLE providers ADD COLUMN protocol TEXT NOT NULL DEFAULT 'chat'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE providers SET protocol = 'messages' 
+                 WHERE (tool = 'claude' AND base_url IS NULL) 
+                    OR base_url LIKE '%anthropic.com%'",
+                [],
+            )?;
+        }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS repo_maps (
                 root_path TEXT PRIMARY KEY,
@@ -438,17 +461,19 @@ impl Database {
     /// Insert or update (does not touch is_active).
     pub fn upsert(&self, p: &Provider) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO providers (tool, id, base_url, key_ref, extra, is_active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO providers (tool, id, base_url, key_ref, protocol, extra, is_active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (tool, id) DO UPDATE SET
                 base_url = excluded.base_url,
                 key_ref = excluded.key_ref,
+                protocol = excluded.protocol,
                 extra = excluded.extra",
             params![
                 p.tool.as_str(),
                 p.id,
                 p.base_url,
                 p.key_ref,
+                p.protocol.as_str(),
                 serde_json::to_string(&p.extra)?,
                 p.is_active as i64,
             ],
@@ -459,7 +484,7 @@ impl Database {
     pub fn get(&self, tool: ToolKind, id: &str) -> Result<Option<Provider>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT tool, id, base_url, key_ref, extra, is_active FROM providers
+            "SELECT tool, id, base_url, key_ref, extra, is_active, protocol FROM providers
              WHERE tool = ?1 AND id = ?2",
         )?;
         let mut rows = stmt.query(params![tool.as_str(), id])?;
@@ -472,12 +497,12 @@ impl Database {
     pub fn list(&self, tool: Option<ToolKind>) -> Result<Vec<Provider>> {
         let (sql, param): (&str, Option<String>) = match tool {
             Some(t) => (
-                "SELECT tool, id, base_url, key_ref, extra, is_active FROM providers
+                "SELECT tool, id, base_url, key_ref, extra, is_active, protocol FROM providers
                  WHERE tool = ?1 ORDER BY id",
                 Some(t.as_str().to_string()),
             ),
             None => (
-                "SELECT tool, id, base_url, key_ref, extra, is_active FROM providers
+                "SELECT tool, id, base_url, key_ref, extra, is_active, protocol FROM providers
                  ORDER BY tool, id",
                 None,
             ),
@@ -1589,6 +1614,11 @@ impl Database {
 fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
     let tool_str: String = row.get(0)?;
     let extra_str: String = row.get(4)?;
+    let protocol_str: Option<String> = row.get(6).ok();
+    let protocol = protocol_str
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::models::ProviderProtocol::Chat);
     Ok(Provider {
         tool: tool_str.parse().map_err(|e: String| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -1603,6 +1633,7 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
         id: row.get(1)?,
         base_url: row.get(2)?,
         key_ref: row.get(3)?,
+        protocol,
         extra: serde_json::from_str(&extra_str).unwrap_or_else(|e| {
             eprintln!(
                 "[xfade] WARNING: invalid JSON in provider extra field for id={}: {e}",
@@ -1617,7 +1648,57 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Provider, ToolKind};
+    use crate::models::{Provider, ProviderProtocol, ToolKind};
+
+    #[test]
+    fn test_migration_and_backfill_provider_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Simulate v0.12 schema without protocol column
+        conn.execute(
+            "CREATE TABLE providers (
+                tool TEXT NOT NULL,
+                id TEXT NOT NULL,
+                base_url TEXT,
+                key_ref TEXT NOT NULL,
+                extra TEXT NOT NULL DEFAULT 'null',
+                is_active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tool, id)
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO providers (tool, id, base_url, key_ref, extra, is_active)
+             VALUES ('claude', 'official', NULL, 'ref1', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO providers (tool, id, base_url, key_ref, extra, is_active)
+             VALUES ('claude', 'thirdparty', 'https://api.deepseek.com', 'ref2', '{}', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO providers (tool, id, base_url, key_ref, extra, is_active)
+             VALUES ('claude', 'anthropic_proxy', 'https://api.anthropic.com/v1', 'ref3', '{}', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::open(&db_path).unwrap();
+        let p_off = db.get(ToolKind::ClaudeCode, "official").unwrap().unwrap();
+        assert_eq!(p_off.protocol, ProviderProtocol::Messages);
+
+        let p_tp = db.get(ToolKind::ClaudeCode, "thirdparty").unwrap().unwrap();
+        assert_eq!(p_tp.protocol, ProviderProtocol::Chat);
+
+        let p_ap = db.get(ToolKind::ClaudeCode, "anthropic_proxy").unwrap().unwrap();
+        assert_eq!(p_ap.protocol, ProviderProtocol::Messages);
+    }
 
     fn sample(id: &str, tool: ToolKind) -> Provider {
         Provider::new(id, tool, Some("https://api.example.com".into()))
