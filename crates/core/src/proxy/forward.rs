@@ -527,6 +527,10 @@ pub fn prepare_body_for_provider(
     original_body: &[u8],
     model_override: Option<&str>,
 ) -> Result<(&'static str, Vec<u8>), Box<Response>> {
+    if endpoint == "models" {
+        return Ok(("models", original_body.to_vec()));
+    }
+
     let inbound_proto = endpoint_to_inbound_protocol(endpoint);
     let outbound_proto = provider.protocol;
 
@@ -2575,5 +2579,13 @@ data: [DONE]\n\n";
         assert_eq!(ep3, "responses");
         let val3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
         assert!(val3.get("input").is_some());
+    }
+
+    #[test]
+    fn test_prepare_body_for_models_endpoint_preserves_models() {
+        let p = crate::models::Provider::new("p1", ToolKind::ClaudeCode, None)
+            .with_protocol(crate::models::ProviderProtocol::Messages);
+        let (ep, _) = prepare_body_for_provider("models", &p, b"", None).unwrap();
+        assert_eq!(ep, "models");
     }
 }

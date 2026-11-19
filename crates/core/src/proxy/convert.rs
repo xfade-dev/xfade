@@ -1835,7 +1835,7 @@ fn process_responses_sse_event(
     let event_name = ev.event.as_deref().unwrap_or("");
     match event_name {
         "response.output_item.added" => {
-            if let Some(item) = data.get("item") {
+            if let Some(item) = data.get("item").or_else(|| data.get("output_item")) {
                 if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                     let item_id = item
                         .get("id")
@@ -1885,7 +1885,7 @@ fn process_responses_sse_event(
             )));
         }
         "response.output_item.done" => {
-            if let Some(item) = data.get("item") {
+            if let Some(item) = data.get("item").or_else(|| data.get("output_item")) {
                 if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                     let item_id = item
                         .get("id")
@@ -1980,6 +1980,7 @@ pub fn request_chat_to_anthropic(body: &[u8], model_override: Option<&str>) -> R
 
     let max_tokens = obj
         .get("max_tokens")
+        .or_else(|| obj.get("max_completion_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(4096);
     out.insert("max_tokens".into(), json!(max_tokens));
@@ -2007,26 +2008,120 @@ pub fn request_chat_to_anthropic(body: &[u8], model_override: Option<&str>) -> R
                 continue;
             }
 
+            if role == "tool" {
+                // OpenAI tool role -> Anthropic user message with tool_result block
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content_str = match msg.get("content") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let tool_result_block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": content_str,
+                });
+
+                if let Some(last) = anthropic_messages.last_mut() {
+                    if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                            arr.push(tool_result_block);
+                            continue;
+                        } else if let Some(last_str) = last
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            let mut blocks = Vec::new();
+                            if !last_str.is_empty() {
+                                blocks.push(json!({"type": "text", "text": last_str}));
+                            }
+                            blocks.push(tool_result_block);
+                            last["content"] = Value::Array(blocks);
+                            continue;
+                        }
+                    }
+                }
+
+                anthropic_messages.push(json!({
+                    "role": "user",
+                    "content": [tool_result_block],
+                }));
+                continue;
+            }
+
             let anthropic_role = if role == "assistant" {
                 "assistant"
             } else {
                 "user"
             };
-            let content_str = match msg.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(arr)) => arr
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
+
+            let mut blocks = Vec::new();
+
+            if let Some(content) = msg.get("content") {
+                match content {
+                    Value::String(s) if !s.is_empty() => {
+                        blocks.push(json!({"type": "text", "text": s}));
+                    }
+                    Value::Array(arr) => {
+                        for p in arr {
+                            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    blocks.push(json!({"type": "text", "text": t}));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if anthropic_role == "assistant" {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tool_calls {
+                        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let func = tc.get("function");
+                        let name = func
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let args_val = func
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .unwrap_or(json!({}));
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": args_val,
+                        }));
+                    }
+                }
+            }
+
+            if blocks.is_empty() {
+                blocks.push(json!({"type": "text", "text": ""}));
+            }
 
             if let Some(last) = anthropic_messages.last_mut() {
                 if last.get("role").and_then(|r| r.as_str()) == Some(anthropic_role) {
-                    if let Some(last_content) = last.get_mut("content").and_then(|c| c.as_str()) {
-                        let merged = format!("{last_content}\n{content_str}");
-                        *last.get_mut("content").unwrap() = Value::String(merged);
+                    if let Some(arr) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                        arr.extend(blocks);
+                        continue;
+                    } else if let Some(last_str) = last
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        let mut prev_blocks = Vec::new();
+                        if !last_str.is_empty() {
+                            prev_blocks.push(json!({"type": "text", "text": last_str}));
+                        }
+                        prev_blocks.extend(blocks);
+                        last["content"] = Value::Array(prev_blocks);
                         continue;
                     }
                 }
@@ -2034,7 +2129,7 @@ pub fn request_chat_to_anthropic(body: &[u8], model_override: Option<&str>) -> R
 
             anthropic_messages.push(json!({
                 "role": anthropic_role,
-                "content": content_str,
+                "content": blocks,
             }));
         }
     }
@@ -2048,6 +2143,24 @@ pub fn request_chat_to_anthropic(body: &[u8], model_override: Option<&str>) -> R
                     "content": "Hello",
                 }),
             );
+        }
+    }
+
+    // Simplify content: if a message only contains text blocks and no tool blocks,
+    // serialize content as a plain string for clean representation and compatibility.
+    for msg in &mut anthropic_messages {
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            if arr
+                .iter()
+                .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            {
+                let joined = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                msg["content"] = Value::String(joined);
+            }
         }
     }
 
@@ -2990,5 +3103,74 @@ mod tests {
         assert!(joined.contains("Hello from "));
         assert!(joined.contains("Claude"));
         assert!(joined.contains("[DONE]"));
+    }
+
+    #[test]
+    fn test_request_chat_to_anthropic_tool_calls_and_results() {
+        let chat_req = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Checking weather",
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"Berlin\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": "21C and sunny"
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get city weather",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                    }
+                }
+            ]
+        });
+
+        let anthropic_bytes =
+            request_chat_to_anthropic(&serde_json::to_vec(&chat_req).unwrap(), None).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&anthropic_bytes).unwrap();
+
+        // 1. First message must be prepended "Hello" user message because first was assistant
+        assert_eq!(val["messages"][0]["role"], "user");
+
+        // 2. Assistant message has tool_use block
+        let asst_msg = &val["messages"][1];
+        assert_eq!(asst_msg["role"], "assistant");
+        let asst_blocks = asst_msg["content"].as_array().unwrap();
+        assert_eq!(asst_blocks[0]["type"], "text");
+        assert_eq!(asst_blocks[0]["text"], "Checking weather");
+        assert_eq!(asst_blocks[1]["type"], "tool_use");
+        assert_eq!(asst_blocks[1]["id"], "call_abc");
+        assert_eq!(asst_blocks[1]["name"], "get_weather");
+        assert_eq!(asst_blocks[1]["input"]["city"], "Berlin");
+
+        // 3. Tool result converted to user turn with tool_result block
+        let tool_msg = &val["messages"][2];
+        assert_eq!(tool_msg["role"], "user");
+        let tool_blocks = tool_msg["content"].as_array().unwrap();
+        assert_eq!(tool_blocks[0]["type"], "tool_result");
+        assert_eq!(tool_blocks[0]["tool_use_id"], "call_abc");
+        assert_eq!(tool_blocks[0]["content"], "21C and sunny");
+
+        // 4. Tools converted to Anthropic schema
+        let tools = val["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
     }
 }
