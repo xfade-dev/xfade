@@ -74,8 +74,17 @@ enum Cmd {
     },
     /// Show the currently-active provider per tool
     Current,
-    /// View current status (daemon, routes, and circuit breaker status)
+    /// View current status (daemon, routes, circuit breaker, and trust status)
     Status,
+    /// Run security health check and credential hygiene audit
+    Doctor {
+        /// Run deep security inspection across client configurations, permissions, and gateway bindings
+        #[arg(long, default_value_t = true)]
+        security: bool,
+        /// Automatically remediate file permissions and convert exposed configs to loopback gateway
+        #[arg(long)]
+        fix: bool,
+    },
     /// Edit a provider
     Edit {
         name: String,
@@ -552,6 +561,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Status => {
             let core = build_core()?;
             cmd_status(&core)?;
+            Ok(())
+        }
+        Cmd::Doctor { security: _, fix } => {
+            let core = build_core()?;
+            cmd_doctor(&core, fix)?;
             Ok(())
         }
         Cmd::Rm { name, tool } => {
@@ -1320,7 +1334,68 @@ fn format_circuit_badge(state: CircuitState, cooldown: Option<u64>) -> String {
     }
 }
 
+fn cmd_doctor(core: &Core, fix: bool) -> Result<(), CoreError> {
+    if fix {
+        let actions = core.security_doctor_fix()?;
+        if actions.is_empty() {
+            println!("No security issues found to fix.");
+        } else {
+            println!("Remediated {} security issue(s):", actions.len());
+            for a in &actions {
+                println!("  ✓ {a}");
+            }
+            println!();
+        }
+    }
+
+    let report = core.security_doctor()?;
+    println!("=== xfade Security Doctor ===");
+    println!(
+        "Trust Status: {}",
+        match report.overall_trust {
+            xfade_core::security::TrustState::Guarded => "GUARDED (Zero-Raw-Key Gateway Isolated)",
+            xfade_core::security::TrustState::Direct => "DIRECT (Direct Upstream Connection)",
+            xfade_core::security::TrustState::Exposed => {
+                "EXPOSED (Insecure Key or Permissions Detected)"
+            }
+        }
+    );
+    println!();
+
+    println!("Tools:");
+    for t in &report.tool_trust {
+        let icon = match t.trust {
+            xfade_core::security::TrustState::Guarded => "[GUARDED]",
+            xfade_core::security::TrustState::Direct => "[DIRECT ]",
+            xfade_core::security::TrustState::Exposed => "[EXPOSED]",
+        };
+        println!("  {:<10} {:<10} - {}", t.tool, icon, t.summary);
+    }
+    println!();
+
+    println!("Security Checks:");
+    for c in &report.checks {
+        let badge = match c.status {
+            xfade_core::security::CheckStatus::Pass => "PASS",
+            xfade_core::security::CheckStatus::Warn => "WARN",
+            xfade_core::security::CheckStatus::Fail => "FAIL",
+        };
+        println!("  [{badge}] {:<35} - {}", c.name, c.details);
+    }
+
+    if report.overall_trust == xfade_core::security::TrustState::Exposed && !fix {
+        println!();
+        println!("Hint: Run `xfade doctor --security --fix` to automatically remediate permissions and sanitize configs.");
+    }
+
+    Ok(())
+}
+
 fn cmd_status(core: &Core) -> Result<(), CoreError> {
+    let trust = core
+        .trust_state()
+        .unwrap_or(xfade_core::security::TrustState::Guarded);
+    println!("trust: {trust}");
     let routes_opt = core.db().get_routes()?;
     match &routes_opt {
         None => println!("routes: (none)"),

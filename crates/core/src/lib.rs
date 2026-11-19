@@ -11,6 +11,7 @@ pub mod presets;
 pub mod proxy;
 pub mod router;
 pub mod run;
+pub mod security;
 pub mod service;
 pub mod sessions;
 pub mod store;
