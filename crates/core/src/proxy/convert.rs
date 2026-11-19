@@ -11,6 +11,7 @@
 //!   `response_chat_to_responses` and `stream_chat_to_responses`.
 
 use crate::error::{CoreError, Result};
+use crate::models::ProviderProtocol;
 use axum::body::Bytes;
 use futures::Stream;
 use serde_json::{json, Map, Value};
@@ -1956,6 +1957,465 @@ fn process_responses_sse_event(
     }
 }
 
+/// Convert an OpenAI Chat request body into an Anthropic `/v1/messages` request body.
+pub fn request_chat_to_anthropic(body: &[u8], model_override: Option<&str>) -> Result<Bytes> {
+    let input: Value = serde_json::from_slice(body)?;
+    let obj = input
+        .as_object()
+        .ok_or_else(|| CoreError::Proxy("chat request body is not a JSON object".into()))?;
+
+    let mut out = Map::new();
+
+    let model = model_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            obj.get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    if let Some(m) = model {
+        out.insert("model".into(), Value::String(m));
+    }
+
+    let max_tokens = obj
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(4096);
+    out.insert("max_tokens".into(), json!(max_tokens));
+
+    for key in ["temperature", "top_p", "stream"] {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+
+    let mut system_parts = Vec::new();
+    let mut anthropic_messages: Vec<Value> = Vec::new();
+
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            if role == "system" {
+                if let Some(c) = msg.get("content") {
+                    if let Some(s) = c.as_str() {
+                        if !s.is_empty() {
+                            system_parts.push(s.to_string());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let anthropic_role = if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            let content_str = match msg.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+
+            if let Some(last) = anthropic_messages.last_mut() {
+                if last.get("role").and_then(|r| r.as_str()) == Some(anthropic_role) {
+                    if let Some(last_content) = last.get_mut("content").and_then(|c| c.as_str()) {
+                        let merged = format!("{last_content}\n{content_str}");
+                        *last.get_mut("content").unwrap() = Value::String(merged);
+                        continue;
+                    }
+                }
+            }
+
+            anthropic_messages.push(json!({
+                "role": anthropic_role,
+                "content": content_str,
+            }));
+        }
+    }
+
+    if let Some(first) = anthropic_messages.first() {
+        if first.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            anthropic_messages.insert(
+                0,
+                json!({
+                    "role": "user",
+                    "content": "Hello",
+                }),
+            );
+        }
+    }
+
+    if !system_parts.is_empty() {
+        out.insert("system".into(), Value::String(system_parts.join("\n\n")));
+    }
+    out.insert("messages".into(), Value::Array(anthropic_messages));
+
+    if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
+        let mut anthropic_tools = Vec::new();
+        for t in tools {
+            if let Some(f) = t.get("function") {
+                let name = f.get("name").unwrap_or(&Value::Null);
+                let desc = f.get("description").unwrap_or(&Value::Null);
+                let default_schema = json!({"type": "object"});
+                let schema = f.get("parameters").unwrap_or(&default_schema);
+                anthropic_tools.push(json!({
+                    "name": name,
+                    "description": desc,
+                    "input_schema": schema,
+                }));
+            }
+        }
+        if !anthropic_tools.is_empty() {
+            out.insert("tools".into(), Value::Array(anthropic_tools));
+        }
+    }
+
+    Ok(Bytes::from(serde_json::to_vec(&Value::Object(out))?))
+}
+
+/// Convert an Anthropic `/v1/messages` JSON response into an OpenAI Chat Completions JSON response.
+pub fn response_anthropic_to_chat(body: &[u8], req_model: &str) -> Result<Bytes> {
+    let v: Value = serde_json::from_slice(body)?;
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("chatcmpl-xfade");
+    let model = v.get("model").and_then(|x| x.as_str()).unwrap_or(req_model);
+
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    if let Some(content_blocks) = v.get("content").and_then(|c| c.as_array()) {
+        for block in content_blocks {
+            let b_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match b_type {
+                "text" => {
+                    if let Some(t) = block.get("text").and_then(|s| s.as_str()) {
+                        content_parts.push(t.to_string());
+                    }
+                }
+                "tool_use" => {
+                    let tc_id = block.get("id").and_then(|s| s.as_str()).unwrap_or("");
+                    let name = block.get("name").and_then(|s| s.as_str()).unwrap_or("");
+                    let default_input = json!({});
+                    let input_val = block.get("input").unwrap_or(&default_input);
+                    let args =
+                        serde_json::to_string(input_val).unwrap_or_else(|_| "{}".to_string());
+                    tool_calls.push(json!({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args,
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let finish_reason = match v.get("stop_reason").and_then(|s| s.as_str()) {
+        Some("tool_use") => "tool_calls",
+        Some("max_tokens") => "length",
+        _ => {
+            if !tool_calls.is_empty() {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+    };
+
+    let content_val = if content_parts.is_empty() && !tool_calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(content_parts.join(""))
+    };
+
+    let mut message = Map::new();
+    message.insert("role".into(), Value::String("assistant".into()));
+    message.insert("content".into(), content_val);
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+
+    let usage = v
+        .get("usage")
+        .map(|u| {
+            let inp = u.get("input_tokens").and_then(|t| t.as_i64()).unwrap_or(0);
+            let out = u.get("output_tokens").and_then(|t| t.as_i64()).unwrap_or(0);
+            json!({
+                "prompt_tokens": inp,
+                "completion_tokens": out,
+                "total_tokens": inp + out,
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            })
+        });
+
+    let resp = json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    });
+
+    Ok(Bytes::from(serde_json::to_vec(&resp)?))
+}
+
+#[derive(Debug, Default)]
+struct AnthropicToChatStreamState {
+    resp_id: String,
+    model: String,
+    tool_indices: std::collections::HashMap<String, usize>,
+    next_tool_index: usize,
+    finished: bool,
+}
+
+pub fn stream_anthropic_to_chat<S>(
+    upstream: S,
+    req_model: String,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    struct UnfoldState {
+        upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+        st: AnthropicToChatStreamState,
+        pending: std::collections::VecDeque<std::io::Result<Bytes>>,
+    }
+
+    let init = UnfoldState {
+        upstream: Box::pin(upstream),
+        st: AnthropicToChatStreamState {
+            resp_id: "chatcmpl-xfade".into(),
+            model: req_model,
+            ..Default::default()
+        },
+        pending: std::collections::VecDeque::new(),
+    };
+
+    futures::stream::unfold(init, |mut st| async move {
+        loop {
+            if let Some(chunk) = st.pending.pop_front() {
+                return Some((chunk, st));
+            }
+            if st.st.finished {
+                return None;
+            }
+            use futures::StreamExt;
+            match st.upstream.next().await {
+                None => {
+                    if !st.st.finished {
+                        let finish = if st.st.next_tool_index > 0 {
+                            "tool_calls"
+                        } else {
+                            "stop"
+                        };
+                        st.pending.push_back(Ok(sse_chat_delta(
+                            &st.st.resp_id,
+                            &st.st.model,
+                            json!({}),
+                            Some(finish),
+                        )));
+                        st.pending.push_back(Ok(Bytes::from("data: [DONE]\n\n")));
+                        st.st.finished = true;
+                    }
+                    continue;
+                }
+                Some(Err(e)) => {
+                    st.st.finished = true;
+                    return Some((Err(e), st));
+                }
+                Some(Ok(chunk)) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    let events = parse_sse_events(&text);
+                    for ev in events {
+                        if st.st.finished {
+                            break;
+                        }
+                        process_anthropic_sse_event(&mut st.st, &ev, &mut st.pending);
+                    }
+                    continue;
+                }
+            }
+        }
+    })
+}
+
+fn process_anthropic_sse_event(
+    st: &mut AnthropicToChatStreamState,
+    ev: &SseEvent,
+    pending: &mut std::collections::VecDeque<std::io::Result<Bytes>>,
+) {
+    let Ok(data) = serde_json::from_str::<Value>(&ev.data) else {
+        return;
+    };
+
+    let event_name = ev.event.as_deref().unwrap_or("");
+    match event_name {
+        "message_start" => {
+            if let Some(msg) = data.get("message") {
+                if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                    st.resp_id = id.to_string();
+                }
+            }
+        }
+        "content_block_start" => {
+            if let Some(block) = data.get("content_block") {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let idx = st.next_tool_index;
+                    st.next_tool_index += 1;
+                    st.tool_indices.insert(id.clone(), idx);
+                    pending.push_back(Ok(sse_chat_delta(
+                        &st.resp_id,
+                        &st.model,
+                        json!({
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": id,
+                                "type": "function",
+                                "function": { "name": name, "arguments": "" }
+                            }]
+                        }),
+                        None,
+                    )));
+                }
+            }
+        }
+        "content_block_delta" => {
+            if let Some(delta) = data.get("delta") {
+                let d_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if d_type == "text_delta" {
+                    if let Some(t) = delta.get("text").and_then(|s| s.as_str()) {
+                        pending.push_back(Ok(sse_chat_delta(
+                            &st.resp_id,
+                            &st.model,
+                            json!({ "content": t }),
+                            None,
+                        )));
+                    }
+                } else if d_type == "input_json_delta" {
+                    if let Some(p) = delta.get("partial_json").and_then(|s| s.as_str()) {
+                        let idx = st.next_tool_index.saturating_sub(1);
+                        pending.push_back(Ok(sse_chat_delta(
+                            &st.resp_id,
+                            &st.model,
+                            json!({
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "function": { "arguments": p }
+                                }]
+                            }),
+                            None,
+                        )));
+                    }
+                }
+            }
+        }
+        "message_delta" => {
+            if let Some(delta) = data.get("delta") {
+                if let Some(reason) = delta.get("stop_reason").and_then(|s| s.as_str()) {
+                    let finish = match reason {
+                        "tool_use" => "tool_calls",
+                        "max_tokens" => "length",
+                        _ => "stop",
+                    };
+                    pending.push_back(Ok(sse_chat_delta(
+                        &st.resp_id,
+                        &st.model,
+                        json!({}),
+                        Some(finish),
+                    )));
+                }
+            }
+        }
+        "message_stop" => {
+            pending.push_back(Ok(Bytes::from("data: [DONE]\n\n")));
+            st.finished = true;
+        }
+        _ => {}
+    }
+}
+
+/// Transcode raw upstream error JSON bytes into the client's expected protocol error format.
+pub fn transcode_error_body(
+    raw_bytes: &[u8],
+    from: ProviderProtocol,
+    to: ProviderProtocol,
+) -> Vec<u8> {
+    if from == to {
+        return raw_bytes.to_vec();
+    }
+    let val: Value = serde_json::from_slice(raw_bytes).unwrap_or_else(|_| {
+        let msg = String::from_utf8_lossy(raw_bytes);
+        json!({"error": {"message": msg, "type": "api_error"}})
+    });
+
+    let message = val
+        .pointer("/error/message")
+        .or_else(|| val.pointer("/error/msg"))
+        .or_else(|| val.pointer("/message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Upstream error");
+
+    let err_type = val
+        .pointer("/error/type")
+        .or_else(|| val.pointer("/type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("api_error");
+
+    match to {
+        ProviderProtocol::Messages => serde_json::to_vec(&json!({
+            "type": "error",
+            "error": {
+                "type": err_type,
+                "message": message,
+            }
+        }))
+        .unwrap_or_else(|_| raw_bytes.to_vec()),
+        ProviderProtocol::Chat => serde_json::to_vec(&json!({
+            "error": {
+                "message": message,
+                "type": err_type,
+                "code": Value::Null,
+            }
+        }))
+        .unwrap_or_else(|_| raw_bytes.to_vec()),
+        ProviderProtocol::Responses => serde_json::to_vec(&json!({
+            "error": {
+                "message": message,
+                "type": err_type,
+            }
+        }))
+        .unwrap_or_else(|_| raw_bytes.to_vec()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2438,5 +2898,97 @@ mod tests {
         let results: Vec<std::io::Result<Bytes>> = out.collect().await;
         assert!(results[0].is_ok());
         assert!(results[1].is_err());
+    }
+
+    #[test]
+    fn test_request_chat_to_anthropic_invariants() {
+        let chat_req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Sys prompt"},
+                {"role": "user", "content": "Question 1"},
+                {"role": "user", "content": "Question 2 (adjacent)"}
+            ]
+        });
+        let bytes = serde_json::to_vec(&chat_req).unwrap();
+        let anthropic_bytes = request_chat_to_anthropic(&bytes, Some("claude-3-7-sonnet")).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&anthropic_bytes).unwrap();
+
+        assert_eq!(val["model"], "claude-3-7-sonnet");
+        assert_eq!(val["system"], "Sys prompt");
+        assert_eq!(val["max_tokens"], 4096); // Injected default
+        let msgs = val["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1); // Coalesced adjacent user turns
+        assert!(msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Question 1\nQuestion 2"));
+    }
+
+    #[test]
+    fn test_transcode_error_body_chat_to_anthropic() {
+        let chat_err = serde_json::json!({
+            "error": {
+                "message": "Model quota exceeded",
+                "type": "insufficient_quota"
+            }
+        });
+        let bytes = serde_json::to_vec(&chat_err).unwrap();
+        let out = transcode_error_body(&bytes, ProviderProtocol::Chat, ProviderProtocol::Messages);
+        let val: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(val["type"], "error");
+        assert_eq!(val["error"]["message"], "Model quota exceeded");
+    }
+
+    #[test]
+    fn test_response_anthropic_to_chat_conversion() {
+        let anthropic_resp = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Anthropic response"},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "rust"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20
+            }
+        });
+        let bytes = serde_json::to_vec(&anthropic_resp).unwrap();
+        let chat_bytes = response_anthropic_to_chat(&bytes, "claude-3-7-sonnet").unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&chat_bytes).unwrap();
+        assert_eq!(val["id"], "msg_123");
+        assert_eq!(
+            val["choices"][0]["message"]["content"],
+            "Anthropic response"
+        );
+        assert_eq!(val["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            val["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "search"
+        );
+        assert_eq!(val["usage"]["prompt_tokens"], 10);
+        assert_eq!(val["usage"]["completion_tokens"], 20);
+    }
+
+    #[tokio::test]
+    async fn test_stream_anthropic_to_chat_conversion() {
+        use futures::StreamExt;
+        let frames = vec![
+            "event: message_start\ndata: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_start_1\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Hello from \"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Claude\"}}\n\n",
+            "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n",
+        ];
+        let stream = futures::stream::iter(frames.into_iter().map(|s| Ok(Bytes::from(s))));
+        let out = stream_anthropic_to_chat(stream, "claude-3-7-sonnet".into());
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let binding = chunks.concat();
+        let joined = String::from_utf8_lossy(&binding);
+        assert!(joined.contains("Hello from "));
+        assert!(joined.contains("Claude"));
+        assert!(joined.contains("[DONE]"));
     }
 }
