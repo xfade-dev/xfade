@@ -1498,25 +1498,37 @@ async fn forward_with_failover(
     }
 
     // Stage 2b: resolve each route's effective model override. The router
-    // plans with the single global override; here a per-provider entry
-    // (`--route-model id=model`) takes precedence, falling back to the
-    // global. `failover_loop` already caches prepared bodies keyed by each
+    // plans with the single global override; here:
+    // 1. Explicit model mappings (e.g. `sonnet` -> anthropic=claude-3-7-sonnet, deepseek=deepseek-chat)
+    // 2. Per-provider override (`--route-model id=model`)
+    // 3. Global override (`--model`)
+    // 4. Passthrough (None)
+    // `failover_loop` already caches prepared bodies keyed by each
     // entry's model_override, so heterogeneous upstreams each get their own
     // correctly rewritten request body.
+    let client_mappings = if let Some(sel) = model.as_deref() {
+        svc.core
+            .db()
+            .get_mappings_for_client_model(sel)
+            .ok()
+            .filter(|m| !m.is_empty())
+    } else {
+        None
+    };
     for entry in &mut plan.entries {
-        entry.model_override = crate::router::decision::resolve_model_for(
+        entry.model_override = crate::router::decision::resolve_effective_model(
             &entry.route_id,
+            model.as_deref(),
+            client_mappings.as_ref(),
             &route_models,
             model_override.as_deref(),
         );
     }
 
     // Stage 2c: model→route pinning (aggregated `/v1/models`). Off by default.
-    // A recognized client-selected model wins over `--route-model` / the global
-    // `--model` / Smart Fader ordering for the primary entry only; the other
-    // routes stay as failover with their Stage 2b overrides intact. An
-    // unrecognized (legacy) model leaves the plan completely unchanged.
-    if svc.core.db().models_merge_enabled().unwrap_or(false) {
+    // If the request matched an explicit client model mapping alias, Stage 2c is strictly
+    // bypassed so all planned failover routes are preserved with their respective mapped models.
+    if client_mappings.is_none() && svc.core.db().models_merge_enabled().unwrap_or(false) {
         if let Some(sel) = model.as_deref() {
             let mr = svc.core.db().model_route_for(sel).unwrap_or_default();
             if let Some(mr) = mr {
@@ -2113,6 +2125,23 @@ async fn aggregate_models(
     }
 
     let _ = svc.core.db().set_model_routes(&map);
+
+    // In models_merge mode: query all configured client model aliases and inject them
+    // into the returned catalog list (with owned_by: "xfade").
+    // NOTE: Aliases are purposely NOT added to `map` (model_routes), so that client
+    // requests using an alias are not locked to a single provider in Stage 2c.
+    if let Ok(mappings) = svc.core.db().get_model_mappings() {
+        let now_secs = crate::proxy::circuit_breaker::now_secs();
+        for alias in mappings.keys() {
+            merged.push(serde_json::json!({
+                "id": alias,
+                "object": "model",
+                "created": now_secs,
+                "owned_by": "xfade",
+                "permission": []
+            }));
+        }
+    }
 
     let body = serde_json::json!({ "object": "list", "data": merged });
     Response::builder()
