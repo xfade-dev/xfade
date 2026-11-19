@@ -1429,6 +1429,533 @@ fn chat_to_responses_finish(st: &mut ResponsesStreamState) -> Vec<Bytes> {
     out
 }
 
+/// Convert an OpenAI Chat request body into an OpenAI `/v1/responses` request body.
+pub fn request_chat_to_responses(body: &[u8], model_override: Option<&str>) -> Result<Bytes> {
+    let input: Value = serde_json::from_slice(body)?;
+    let obj = input
+        .as_object()
+        .ok_or_else(|| CoreError::Proxy("chat request body is not a JSON object".into()))?;
+
+    let mut out = Map::new();
+
+    let model = model_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            obj.get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    if let Some(m) = model {
+        out.insert("model".into(), Value::String(m));
+    }
+
+    for key in ["stream", "temperature", "top_p", "parallel_tool_calls"] {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(v) = obj
+        .get("max_tokens")
+        .or_else(|| obj.get("max_output_tokens"))
+    {
+        out.insert("max_output_tokens".into(), v.clone());
+    }
+    if let Some(v) = obj.get("tool_choice") {
+        out.insert("tool_choice".into(), v.clone());
+    }
+
+    let mut responses_input = Vec::new();
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = msg.get("content").cloned().unwrap_or(Value::Null);
+            match role {
+                "system" => {
+                    responses_input.push(json!({
+                        "role": "system",
+                        "content": content,
+                    }));
+                }
+                "assistant" => {
+                    if !content.is_null() && content != "" {
+                        responses_input.push(json!({
+                            "role": "assistant",
+                            "content": content,
+                        }));
+                    }
+                    if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args = tc
+                                .pointer("/function/arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}");
+                            responses_input.push(json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": args,
+                            }));
+                        }
+                    }
+                }
+                "tool" => {
+                    let call_id = msg
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    responses_input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": content,
+                    }));
+                }
+                _ => {
+                    responses_input.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            }
+        }
+    }
+    out.insert("input".into(), Value::Array(responses_input));
+
+    if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
+        let mapped_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                if let Some(f) = t.get("function") {
+                    let mut m = Map::new();
+                    m.insert("type".into(), Value::String("function".into()));
+                    if let Some(name) = f.get("name") {
+                        m.insert("name".into(), name.clone());
+                    }
+                    if let Some(desc) = f.get("description") {
+                        m.insert("description".into(), desc.clone());
+                    }
+                    if let Some(params) = f.get("parameters") {
+                        m.insert("parameters".into(), params.clone());
+                    }
+                    Value::Object(m)
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        out.insert("tools".into(), Value::Array(mapped_tools));
+    }
+
+    Ok(Bytes::from(serde_json::to_vec(&Value::Object(out))?))
+}
+
+/// Convert an OpenAI Responses JSON response body into a Chat Completions response object.
+pub fn response_responses_to_chat(body: &[u8], req_model: &str) -> Result<Bytes> {
+    let v: Value = serde_json::from_slice(body)?;
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("chatcmpl-xfade")
+        .to_string();
+    let model = v
+        .get("model")
+        .and_then(|x| x.as_str())
+        .unwrap_or(req_model)
+        .to_string();
+
+    let mut content_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    if let Some(output) = v.get("output").and_then(|o| o.as_array()) {
+        for item in output {
+            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match item_type {
+                "message" => {
+                    if let Some(content) = item.get("content") {
+                        if let Some(text) = content.as_str() {
+                            content_parts.push(text.to_string());
+                        } else if let Some(arr) = content.as_array() {
+                            for part in arr {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    content_parts.push(text.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let name = item.get("name").and_then(|s| s.as_str()).unwrap_or("");
+                    let args = item
+                        .get("arguments")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("{}");
+                    tool_calls.push(json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": args,
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
+    let content_val = if content_parts.is_empty() && !tool_calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(content_parts.join(""))
+    };
+
+    let mut message = Map::new();
+    message.insert("role".into(), Value::String("assistant".into()));
+    message.insert("content".into(), content_val);
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+
+    let usage = v
+        .get("usage")
+        .map(|u| {
+            json!({
+                "prompt_tokens": u.get("input_tokens").unwrap_or(&json!(0)),
+                "completion_tokens": u.get("output_tokens").unwrap_or(&json!(0)),
+                "total_tokens": u.get("total_tokens").unwrap_or(&json!(0)),
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            })
+        });
+
+    let resp = json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    });
+
+    Ok(Bytes::from(serde_json::to_vec(&resp)?))
+}
+
+#[derive(Debug, Clone)]
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+fn parse_sse_events(text: &str) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    let mut current_event: Option<String> = None;
+    let mut current_data = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if !current_data.is_empty() || current_event.is_some() {
+                events.push(SseEvent {
+                    event: current_event.take(),
+                    data: current_data.join("\n"),
+                });
+                current_data.clear();
+            }
+        } else if let Some(ev) = line.strip_prefix("event:") {
+            current_event = Some(ev.trim().to_string());
+        } else if let Some(d) = line.strip_prefix("data:") {
+            current_data.push(d.trim().to_string());
+        }
+    }
+    if !current_data.is_empty() || current_event.is_some() {
+        events.push(SseEvent {
+            event: current_event,
+            data: current_data.join("\n"),
+        });
+    }
+    events
+}
+
+fn sse_chat_delta(id: &str, model: &str, delta: Value, finish_reason: Option<&str>) -> Bytes {
+    let payload = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    });
+    Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&payload).unwrap()
+    ))
+}
+
+#[derive(Debug, Default)]
+struct ResponsesToChatStreamState {
+    resp_id: String,
+    model: String,
+    tool_indices: std::collections::HashMap<String, usize>,
+    next_tool_index: usize,
+    finished: bool,
+}
+
+pub fn stream_responses_to_chat<S>(
+    upstream: S,
+    req_model: String,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    struct UnfoldState {
+        upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
+        st: ResponsesToChatStreamState,
+        pending: std::collections::VecDeque<std::io::Result<Bytes>>,
+    }
+
+    let init = UnfoldState {
+        upstream: Box::pin(upstream),
+        st: ResponsesToChatStreamState {
+            resp_id: "chatcmpl-xfade".into(),
+            model: req_model,
+            ..Default::default()
+        },
+        pending: std::collections::VecDeque::new(),
+    };
+
+    futures::stream::unfold(init, |mut st| async move {
+        loop {
+            if let Some(chunk) = st.pending.pop_front() {
+                return Some((chunk, st));
+            }
+            if st.st.finished {
+                return None;
+            }
+            use futures::StreamExt;
+            match st.upstream.next().await {
+                None => {
+                    if !st.st.finished {
+                        let finish = if st.st.next_tool_index > 0 {
+                            "tool_calls"
+                        } else {
+                            "stop"
+                        };
+                        st.pending.push_back(Ok(sse_chat_delta(
+                            &st.st.resp_id,
+                            &st.st.model,
+                            json!({}),
+                            Some(finish),
+                        )));
+                        st.pending.push_back(Ok(Bytes::from("data: [DONE]\n\n")));
+                        st.st.finished = true;
+                    }
+                    continue;
+                }
+                Some(Err(e)) => {
+                    st.st.finished = true;
+                    return Some((Err(e), st));
+                }
+                Some(Ok(chunk)) => {
+                    let text = String::from_utf8_lossy(&chunk);
+                    let events = parse_sse_events(&text);
+                    for ev in events {
+                        if st.st.finished {
+                            break;
+                        }
+                        process_responses_sse_event(&mut st.st, &ev, &mut st.pending);
+                    }
+                    continue;
+                }
+            }
+        }
+    })
+}
+
+fn process_responses_sse_event(
+    st: &mut ResponsesToChatStreamState,
+    ev: &SseEvent,
+    pending: &mut std::collections::VecDeque<std::io::Result<Bytes>>,
+) {
+    if ev.data == "[DONE]" {
+        let finish = if st.next_tool_index > 0 {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        pending.push_back(Ok(sse_chat_delta(
+            &st.resp_id,
+            &st.model,
+            json!({}),
+            Some(finish),
+        )));
+        pending.push_back(Ok(Bytes::from("data: [DONE]\n\n")));
+        st.finished = true;
+        return;
+    }
+
+    let Ok(data) = serde_json::from_str::<Value>(&ev.data) else {
+        return;
+    };
+
+    if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+        st.resp_id = id.to_string();
+    } else if let Some(id) = data.pointer("/response/id").and_then(|v| v.as_str()) {
+        st.resp_id = id.to_string();
+    }
+
+    let event_name = ev.event.as_deref().unwrap_or("");
+    match event_name {
+        "response.output_item.added" => {
+            if let Some(item) = data.get("item") {
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    let item_id = item
+                        .get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let idx = st.next_tool_index;
+                    st.next_tool_index += 1;
+                    st.tool_indices.insert(item_id.clone(), idx);
+                    pending.push_back(Ok(sse_chat_delta(
+                        &st.resp_id,
+                        &st.model,
+                        json!({
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": item_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": ""
+                                }
+                            }]
+                        }),
+                        None,
+                    )));
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+            let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let idx = st.tool_indices.get(item_id).copied().unwrap_or(0);
+            pending.push_back(Ok(sse_chat_delta(
+                &st.resp_id,
+                &st.model,
+                json!({
+                    "tool_calls": [{
+                        "index": idx,
+                        "function": {
+                            "arguments": delta
+                        }
+                    }]
+                }),
+                None,
+            )));
+        }
+        "response.output_item.done" => {
+            if let Some(item) = data.get("item") {
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    let item_id = item
+                        .get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !st.tool_indices.contains_key(item_id) {
+                        let idx = st.next_tool_index;
+                        st.next_tool_index += 1;
+                        st.tool_indices.insert(item_id.to_string(), idx);
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        pending.push_back(Ok(sse_chat_delta(
+                            &st.resp_id,
+                            &st.model,
+                            json!({
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "id": item_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": args
+                                    }
+                                }]
+                            }),
+                            None,
+                        )));
+                    }
+                }
+            }
+        }
+        "response.content_part.delta" | "response.output_text.delta" => {
+            let text = data
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .or_else(|| data.pointer("/delta/text").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            if !text.is_empty() {
+                pending.push_back(Ok(sse_chat_delta(
+                    &st.resp_id,
+                    &st.model,
+                    json!({
+                        "content": text
+                    }),
+                    None,
+                )));
+            }
+        }
+        "response.done" | "response.completed" => {
+            let finish = if st.next_tool_index > 0 {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            pending.push_back(Ok(sse_chat_delta(
+                &st.resp_id,
+                &st.model,
+                json!({}),
+                Some(finish),
+            )));
+            pending.push_back(Ok(Bytes::from("data: [DONE]\n\n")));
+            st.finished = true;
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1814,5 +2341,102 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         out
+    }
+
+    #[test]
+    fn test_request_chat_to_responses_conversion() {
+        let chat_req = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Be concise"},
+                {"role": "user", "content": "Hello"}
+            ],
+            "temperature": 0.7,
+            "stream": true
+        });
+        let bytes = serde_json::to_vec(&chat_req).unwrap();
+        let res_bytes = request_chat_to_responses(&bytes, Some("gpt-4o-mini")).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&res_bytes).unwrap();
+        assert_eq!(val["model"], "gpt-4o-mini");
+        assert!(val.get("input").is_some());
+        assert_eq!(val["input"][0]["role"], "system");
+        assert_eq!(val["input"][1]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_response_responses_to_chat_conversion() {
+        let resp_json = serde_json::json!({
+            "id": "resp-123",
+            "model": "gpt-4o",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Hello world!"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc-1",
+                    "call_id": "call_abc",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"test\"}"
+                }
+            ],
+            "usage": {
+                "input_tokens": 15,
+                "output_tokens": 25,
+                "total_tokens": 40
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let chat_bytes = response_responses_to_chat(&bytes, "gpt-4o").unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&chat_bytes).unwrap();
+        assert_eq!(val["id"], "resp-123");
+        assert_eq!(val["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(val["choices"][0]["message"]["content"], "Hello world!");
+        assert_eq!(val["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            val["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(val["usage"]["prompt_tokens"], 15);
+        assert_eq!(val["usage"]["completion_tokens"], 25);
+    }
+
+    #[tokio::test]
+    async fn test_stream_responses_to_chat_with_incremental_tool_deltas() {
+        use futures::StreamExt;
+        let frames = vec![
+            "event: response.output_item.added\ndata: {\"item\": {\"id\": \"call_1\", \"type\": \"function_call\", \"name\": \"get_weather\"}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"item_id\": \"call_1\", \"delta\": \"{\\\"loc\"}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"item_id\": \"call_1\", \"delta\": \"\\\": \\\"Tokyo\\\"}\"}\n\n",
+            "event: response.output_item.done\ndata: {\"item\": {\"id\": \"call_1\", \"type\": \"function_call\", \"arguments\": \"{\\\"loc\\\": \\\"Tokyo\\\"}\"}}\n\n",
+            "event: response.done\ndata: {\"response\": {\"status\": \"completed\"}}\n\n",
+        ];
+        let stream = futures::stream::iter(frames.into_iter().map(|s| Ok(Bytes::from(s))));
+        let out = stream_responses_to_chat(stream, "gpt-4o".into());
+        let chunks: Vec<Bytes> = out.map(|r| r.unwrap()).collect().await;
+        let all_bytes = chunks.concat();
+        let joined = String::from_utf8_lossy(&all_bytes);
+        assert!(joined.contains("\"name\":\"get_weather\""));
+        assert!(joined.contains("\"arguments\":\"{\\\"loc"));
+        assert!(joined.contains("\"arguments\":\"\\\": \\\"Tokyo\\\"}\""));
+    }
+
+    #[tokio::test]
+    async fn test_stream_responses_to_chat_propagates_io_error() {
+        use futures::StreamExt;
+        let err_stream = futures::stream::iter(vec![
+            Ok(Bytes::from(
+                "event: response.content_part.delta\ndata: {\"delta\": \"hi\"}\n\n",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection dropped",
+            )),
+        ]);
+        let out = stream_responses_to_chat(err_stream, "gpt-4o".into());
+        let results: Vec<std::io::Result<Bytes>> = out.collect().await;
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err());
     }
 }
