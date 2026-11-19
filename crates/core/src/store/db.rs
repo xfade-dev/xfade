@@ -190,6 +190,8 @@ pub type ModelRoutes = BTreeMap<String, ModelRoute>;
 
 pub type ClientTokenRow = (String, String, u64, Option<u64>);
 
+pub use crate::models::{ModelMappings, ProviderModelMap};
+
 impl Database {
     /// Get the lock-protected connection, handling poison errors (recover and log a warning on poison).
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -332,7 +334,14 @@ impl Database {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 policy TEXT NOT NULL DEFAULT 'registered'
             );
-            INSERT OR IGNORE INTO egress_policy (id, policy) VALUES (1, 'registered');",
+            INSERT OR IGNORE INTO egress_policy (id, policy) VALUES (1, 'registered');
+            CREATE TABLE IF NOT EXISTS model_mappings (
+                client_model TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                upstream_model TEXT NOT NULL,
+                PRIMARY KEY (client_model, provider_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_mappings_client ON model_mappings(client_model);",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -951,6 +960,113 @@ impl Database {
 
     pub fn set_model_routes(&self, map: &ModelRoutes) -> Result<()> {
         self.upsert_proxy_state_column("model_routes", serde_json::to_string(map)?)
+    }
+
+    /// Retrieve all configured client model aliases and their per-provider mappings.
+    pub fn get_model_mappings(&self) -> Result<ModelMappings> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT client_model, provider_id, upstream_model FROM model_mappings ORDER BY client_model, provider_id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = ModelMappings::new();
+        while let Some(row) = rows.next()? {
+            let client_model: String = row.get(0)?;
+            let provider_id: String = row.get(1)?;
+            let upstream_model: String = row.get(2)?;
+            out.entry(client_model)
+                .or_default()
+                .insert(provider_id, upstream_model);
+        }
+        Ok(out)
+    }
+
+    /// Retrieve per-provider mappings for a specific client model alias.
+    pub fn get_mappings_for_client_model(&self, client_model: &str) -> Result<ProviderModelMap> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, upstream_model FROM model_mappings WHERE client_model = ?1 ORDER BY provider_id",
+        )?;
+        let mut rows = stmt.query(params![client_model])?;
+        let mut out = ProviderModelMap::new();
+        while let Some(row) = rows.next()? {
+            let provider_id: String = row.get(0)?;
+            let upstream_model: String = row.get(1)?;
+            out.insert(provider_id, upstream_model);
+        }
+        Ok(out)
+    }
+
+    /// Add or update a single model mapping entry: (client_model, provider_id) -> upstream_model.
+    pub fn set_model_mapping(
+        &self,
+        client_model: &str,
+        provider_id: &str,
+        upstream_model: &str,
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO model_mappings (client_model, provider_id, upstream_model)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(client_model, provider_id) DO UPDATE SET upstream_model = excluded.upstream_model",
+            params![client_model.trim(), provider_id.trim(), upstream_model.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// Add or update multiple model mapping entries for a client model alias in a transaction.
+    pub fn set_model_mappings_batch(
+        &self,
+        client_model: &str,
+        mappings: &[(String, String)],
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO model_mappings (client_model, provider_id, upstream_model)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(client_model, provider_id) DO UPDATE SET upstream_model = excluded.upstream_model",
+            )?;
+            for (provider_id, upstream_model) in mappings {
+                stmt.execute(params![
+                    client_model.trim(),
+                    provider_id.trim(),
+                    upstream_model.trim()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove a mapping for a client model alias.
+    /// If `provider_id` is Some, deletes only that provider mapping.
+    /// If `provider_id` is None, deletes all provider mappings under that alias.
+    /// Returns true if at least one row was deleted.
+    pub fn remove_model_mapping(
+        &self,
+        client_model: &str,
+        provider_id: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let affected = match provider_id {
+            Some(pid) => conn.execute(
+                "DELETE FROM model_mappings WHERE client_model = ?1 AND provider_id = ?2",
+                params![client_model.trim(), pid.trim()],
+            )?,
+            None => conn.execute(
+                "DELETE FROM model_mappings WHERE client_model = ?1",
+                params![client_model.trim()],
+            )?,
+        };
+        Ok(affected > 0)
+    }
+
+    /// Clear all model mappings across all client model aliases.
+    pub fn clear_model_mappings(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM model_mappings", [])?;
+        Ok(())
     }
 
     /// Cache a repo map (analyzer fingerprint + payload) keyed by root path.
@@ -2026,6 +2142,58 @@ mod tests {
         let (root, map) = db.latest_repo_map().unwrap().unwrap();
         assert_eq!(root, "/a");
         assert_eq!(map, r#"{"lang":"rust"}"#);
+    }
+
+    #[test]
+    fn test_model_mappings_crud_and_preservation() {
+        let db = Database::open_memory().unwrap();
+        assert!(db.get_model_mappings().unwrap().is_empty());
+        assert!(db.get_mappings_for_client_model("sonnet").unwrap().is_empty());
+
+        // Single set
+        db.set_model_mapping("sonnet", "anthropic", "claude-3-7-sonnet-20250219")
+            .unwrap();
+        let map = db.get_mappings_for_client_model("sonnet").unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("anthropic").unwrap(), "claude-3-7-sonnet-20250219");
+
+        // Additive batch set
+        db.set_model_mappings_batch(
+            "sonnet",
+            &[
+                ("deepseek".into(), "deepseek-chat".into()),
+                ("*".into(), "claude-3-7-sonnet".into()),
+            ],
+        )
+        .unwrap();
+        let map2 = db.get_mappings_for_client_model("sonnet").unwrap();
+        assert_eq!(map2.len(), 3);
+        assert_eq!(map2.get("anthropic").unwrap(), "claude-3-7-sonnet-20250219");
+        assert_eq!(map2.get("deepseek").unwrap(), "deepseek-chat");
+        assert_eq!(map2.get("*").unwrap(), "claude-3-7-sonnet");
+
+        // Verify full dictionary
+        let all = db.get_model_mappings().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all.get("sonnet").unwrap().len(), 3);
+
+        // Verify clear_routes does not erase model_mappings
+        db.clear_routes().unwrap();
+        assert_eq!(db.get_mappings_for_client_model("sonnet").unwrap().len(), 3);
+
+        // Remove single provider mapping
+        assert!(db.remove_model_mapping("sonnet", Some("deepseek")).unwrap());
+        assert_eq!(db.get_mappings_for_client_model("sonnet").unwrap().len(), 2);
+        assert!(!db.remove_model_mapping("sonnet", Some("nonexistent")).unwrap());
+
+        // Remove whole alias
+        assert!(db.remove_model_mapping("sonnet", None).unwrap());
+        assert!(db.get_mappings_for_client_model("sonnet").unwrap().is_empty());
+
+        // Clear all
+        db.set_model_mapping("haiku", "anthropic", "claude-3-5-haiku").unwrap();
+        db.clear_model_mappings().unwrap();
+        assert!(db.get_model_mappings().unwrap().is_empty());
     }
 
     #[test]

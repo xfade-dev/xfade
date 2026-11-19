@@ -94,6 +94,13 @@ pub enum ProviderProtocol {
     Responses,
 }
 
+/// Mapping from provider ID (or "*") to upstream model name.
+pub type ProviderModelMap = std::collections::BTreeMap<String, String>;
+
+/// Global client model alias mapping dictionary: client_model -> (provider_id -> upstream_model).
+pub type ModelMappings = std::collections::BTreeMap<String, ProviderModelMap>;
+
+
 impl ProviderProtocol {
     pub fn as_str(&self) -> &'static str {
         match self {
