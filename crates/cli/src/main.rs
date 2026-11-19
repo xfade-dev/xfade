@@ -110,6 +110,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<EgressCmd>,
     },
+    /// Explicit model mappings across upstreams
+    #[command(name = "model-map", alias = "mm")]
+    ModelMap {
+        #[command(subcommand)]
+        cmd: ModelMapCmd,
+    },
     /// Edit a provider
     Edit {
         name: String,
@@ -368,6 +374,30 @@ enum EgressCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ModelMapCmd {
+    /// Set mappings for a client model alias: xfade model-map set <alias> <provider>=<upstream_model>...
+    Set {
+        alias: String,
+        /// Repeatable provider=model mappings (e.g. anthropic=claude-3-7-sonnet deepseek=deepseek-chat *=claude-3-7-sonnet)
+        #[arg(required = true, value_parser = parse_kv)]
+        mappings: Vec<(String, String)>,
+        /// Allow mapping provider names not currently registered in xfade
+        #[arg(long)]
+        force: bool,
+    },
+    /// List all configured client model aliases and their upstream mappings
+    #[command(alias = "list")]
+    Ls,
+    /// Remove a model mapping (omit provider to remove all mappings for the alias)
+    Rm {
+        alias: String,
+        provider: Option<String>,
+    },
+    /// Clear all model mappings across all aliases
+    Clear,
+}
+
 fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -504,6 +534,14 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             let core = build_core()?;
             let list = core.list(tool)?;
             print_table(&list);
+            if tool.is_none() {
+                if let Ok(mappings) = core.db().get_model_mappings() {
+                    if !mappings.is_empty() {
+                        let aliases: Vec<String> = mappings.keys().cloned().collect();
+                        println!("\nModel mappings configured: {}", aliases.join(", "));
+                    }
+                }
+            }
             Ok(())
         }
         Cmd::Run { name, tool, args } => cmd_run(&name, tool, &args),
@@ -629,6 +667,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Egress { cmd } => {
             let core = build_core()?;
             cmd_egress(&core, cmd)?;
+            Ok(())
+        }
+        Cmd::ModelMap { cmd } => {
+            let core = build_core()?;
+            cmd_model_map(&core, cmd)?;
             Ok(())
         }
         Cmd::Rm { name, tool } => {
@@ -1610,6 +1653,77 @@ fn cmd_egress(core: &Core, cmd: Option<EgressCmd>) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
+    match cmd {
+        ModelMapCmd::Set {
+            alias,
+            mappings,
+            force,
+        } => {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                return Err(CoreError::ConfigParse {
+                    path: "model-map".into(),
+                    msg: "model alias cannot be empty".into(),
+                });
+            }
+            if !force {
+                let known: std::collections::HashSet<String> =
+                    core.list(None)?.into_iter().map(|p| p.id).collect();
+                for (p, _) in &mappings {
+                    if p != "*" && !known.contains(p) {
+                        return Err(CoreError::ProviderNotFound(format!(
+                            "'{p}' (not in any tool; run `xfade ls` to list, or use `--force`)"
+                        )));
+                    }
+                }
+            }
+            core.db().set_model_mappings_batch(alias, &mappings)?;
+            println!("Updated model mapping for alias '{alias}':");
+            for (p, m) in &mappings {
+                println!("  {p} => {m}");
+            }
+            Ok(())
+        }
+        ModelMapCmd::Ls => {
+            let mappings = core.db().get_model_mappings()?;
+            if mappings.is_empty() {
+                println!("(no model mappings configured; use `xfade model-map set <alias> <provider>=<model>...`)");
+                return Ok(());
+            }
+            println!("{:<15} {:<15} {}", "ALIAS", "PROVIDER", "UPSTREAM MODEL");
+            println!("{}", "─".repeat(55));
+            for (alias, prov_map) in mappings {
+                for (prov, target) in prov_map {
+                    println!("{:<15} {:<15} {}", alias, prov, target);
+                }
+            }
+            Ok(())
+        }
+        ModelMapCmd::Rm { alias, provider } => {
+            let alias = alias.trim();
+            let removed = core.db().remove_model_mapping(alias, provider.as_deref())?;
+            if removed {
+                match provider {
+                    Some(p) => println!("Removed mapping for provider '{p}' from alias '{alias}'."),
+                    None => println!("Removed all mappings for alias '{alias}'."),
+                }
+            } else {
+                match provider {
+                    Some(p) => println!("No mapping found for provider '{p}' under alias '{alias}'."),
+                    None => println!("No mappings found for alias '{alias}'."),
+                }
+            }
+            Ok(())
+        }
+        ModelMapCmd::Clear => {
+            core.db().clear_model_mappings()?;
+            println!("Cleared all model mappings.");
+            Ok(())
+        }
+    }
+}
+
 fn cmd_status(core: &Core) -> Result<(), CoreError> {
     let trust = core
         .trust_state()
@@ -1646,6 +1760,16 @@ fn cmd_status(core: &Core) -> Result<(), CoreError> {
         println!("route models:");
         for (id, m) in &route_models {
             println!("  {id} = {m}");
+        }
+    }
+    let model_mappings = core.db().get_model_mappings()?;
+    if model_mappings.is_empty() {
+        println!("model mappings: (none)");
+    } else {
+        println!("model mappings:");
+        for (alias, prov_map) in &model_mappings {
+            let entries: Vec<String> = prov_map.iter().map(|(p, m)| format!("{p}={m}")).collect();
+            println!("  {alias} => {}", entries.join(", "));
         }
     }
     let failover_4xx = if core.db().get_failover_4xx()? {
@@ -2423,5 +2547,152 @@ mod tests {
         assert!(model_hit("Kimi", None, "kimi-k2.5"));
         assert!(model_hit("x", Some("Moonshot-K2"), "moonshot-k2"));
         assert!(!model_hit("kimi", None, "gpt-5.1"));
+    }
+
+    #[test]
+    fn test_cli_model_map_subcommand_parsing() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "xfade",
+            "model-map",
+            "set",
+            "sonnet",
+            "anthropic=claude-3-7-sonnet",
+            "*=claude-3-7-sonnet",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::ModelMap {
+                cmd: ModelMapCmd::Set {
+                    alias,
+                    mappings,
+                    force,
+                },
+            }) => {
+                assert_eq!(alias, "sonnet");
+                assert_eq!(mappings.len(), 2);
+                assert!(!force);
+            }
+            _ => panic!("expected ModelMapCmd::Set"),
+        }
+
+        // Test mm alias and ls
+        let cli_ls = Cli::try_parse_from(["xfade", "mm", "ls"]).unwrap();
+        match cli_ls.cmd {
+            Some(Cmd::ModelMap {
+                cmd: ModelMapCmd::Ls,
+            }) => {}
+            _ => panic!("expected ModelMapCmd::Ls"),
+        }
+
+        // Test rm with and without provider
+        let cli_rm_prov =
+            Cli::try_parse_from(["xfade", "model-map", "rm", "sonnet", "anthropic"]).unwrap();
+        match cli_rm_prov.cmd {
+            Some(Cmd::ModelMap {
+                cmd: ModelMapCmd::Rm { alias, provider },
+            }) => {
+                assert_eq!(alias, "sonnet");
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+            }
+            _ => panic!("expected ModelMapCmd::Rm with provider"),
+        }
+
+        let cli_rm_all = Cli::try_parse_from(["xfade", "model-map", "rm", "sonnet"]).unwrap();
+        match cli_rm_all.cmd {
+            Some(Cmd::ModelMap {
+                cmd: ModelMapCmd::Rm { alias, provider },
+            }) => {
+                assert_eq!(alias, "sonnet");
+                assert_eq!(provider, None);
+            }
+            _ => panic!("expected ModelMapCmd::Rm without provider"),
+        }
+
+        // Test clear
+        let cli_clear = Cli::try_parse_from(["xfade", "model-map", "clear"]).unwrap();
+        match cli_clear.cmd {
+            Some(Cmd::ModelMap {
+                cmd: ModelMapCmd::Clear,
+            }) => {}
+            _ => panic!("expected ModelMapCmd::Clear"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_model_map_execution_and_validation() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let data = dir.path().join("data");
+        let core = Core::with_paths(
+            &home,
+            &data,
+            Arc::new(xfade_core::store::secrets::MockStore::default()),
+        )
+        .unwrap();
+
+        // 1. Without registered provider, set fails unless force or wildcard
+        let err = cmd_model_map(
+            &core,
+            ModelMapCmd::Set {
+                alias: "sonnet".into(),
+                mappings: vec![("ghost".into(), "model-g".into())],
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not in any tool"));
+
+        // 2. Setting with force succeeds
+        cmd_model_map(
+            &core,
+            ModelMapCmd::Set {
+                alias: "sonnet".into(),
+                mappings: vec![("ghost".into(), "model-g".into())],
+                force: true,
+            },
+        )
+        .unwrap();
+
+        // 3. Setting with wildcard succeeds without force
+        cmd_model_map(
+            &core,
+            ModelMapCmd::Set {
+                alias: "sonnet".into(),
+                mappings: vec![("*".into(), "fallback-sonnet".into())],
+                force: false,
+            },
+        )
+        .unwrap();
+
+        let mappings = core.db().get_mappings_for_client_model("sonnet").unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings.get("ghost").unwrap(), "model-g");
+        assert_eq!(mappings.get("*").unwrap(), "fallback-sonnet");
+
+        // 4. Listing works
+        cmd_model_map(&core, ModelMapCmd::Ls).unwrap();
+
+        // 5. Removing specific provider
+        cmd_model_map(
+            &core,
+            ModelMapCmd::Rm {
+                alias: "sonnet".into(),
+                provider: Some("ghost".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            core.db()
+                .get_mappings_for_client_model("sonnet")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 6. Clearing all
+        cmd_model_map(&core, ModelMapCmd::Clear).unwrap();
+        assert!(core.db().get_model_mappings().unwrap().is_empty());
     }
 }
