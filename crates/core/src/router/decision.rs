@@ -93,19 +93,40 @@ impl Router for DefaultRouter {
     }
 }
 
-/// Resolve the effective model override for one route: a per-provider entry
-/// (`--route-model id=model`) wins, otherwise the global `--model` fallback
-/// applies. A route with neither entry falls back to `None` (passthrough of
-/// the client's model), which is exactly the pre-feature behavior.
+/// Resolve the effective model override for one route:
+/// 1. If a client model alias is requested and has an explicit mapping for this route, use it.
+/// 2. If the alias has a wildcard ("*") mapping, use that fallback.
+/// 3. Otherwise a per-provider entry (`--route-model id=model`) wins.
+/// 4. Otherwise the global `--model` fallback applies.
+/// 5. A route with none of the above falls back to `None` (passthrough of client's model).
+pub fn resolve_effective_model(
+    route_id: &str,
+    client_model: Option<&str>,
+    client_mappings: Option<&std::collections::BTreeMap<String, String>>,
+    route_models: &std::collections::BTreeMap<String, String>,
+    global: Option<&str>,
+) -> Option<String> {
+    if let (Some(_), Some(mappings)) = (client_model, client_mappings) {
+        if let Some(target) = mappings.get(route_id) {
+            return Some(target.clone());
+        }
+        if let Some(wildcard) = mappings.get("*") {
+            return Some(wildcard.clone());
+        }
+    }
+    route_models
+        .get(route_id)
+        .cloned()
+        .or_else(|| global.map(String::from))
+}
+
+/// Convenience wrapper for legacy/simple resolution without client alias mappings.
 pub fn resolve_model_for(
     route_id: &str,
     route_models: &std::collections::BTreeMap<String, String>,
     global: Option<&str>,
 ) -> Option<String> {
-    route_models
-        .get(route_id)
-        .cloned()
-        .or_else(|| global.map(String::from))
+    resolve_effective_model(route_id, None, None, route_models, global)
 }
 
 /// Determine a provider's tier: explicit `extra.tier` wins; otherwise a
@@ -365,6 +386,71 @@ mod tests {
             Some("m-x".to_string())
         );
         assert_eq!(resolve_model_for("yy", &map, None), None);
+    }
+
+    #[test]
+    fn test_resolve_effective_model_precedence_hierarchy() {
+        let mut mappings = std::collections::BTreeMap::new();
+        mappings.insert("anthropic".to_string(), "claude-3-7-sonnet".to_string());
+        mappings.insert("*".to_string(), "wildcard-sonnet".to_string());
+
+        let mut route_models = std::collections::BTreeMap::new();
+        route_models.insert("anthropic".to_string(), "fixed-route-claude".to_string());
+        route_models.insert("deepseek".to_string(), "fixed-route-deepseek".to_string());
+
+        let global = Some("global-fallback");
+
+        // 1. Exact alias mapping beats route_model and global
+        let res1 = resolve_effective_model(
+            "anthropic",
+            Some("sonnet"),
+            Some(&mappings),
+            &route_models,
+            global,
+        );
+        assert_eq!(res1.as_deref(), Some("claude-3-7-sonnet"));
+
+        // 2. Wildcard mapping beats route_model and global when provider is unmapped
+        let res2 = resolve_effective_model(
+            "deepseek",
+            Some("sonnet"),
+            Some(&mappings),
+            &route_models,
+            global,
+        );
+        assert_eq!(res2.as_deref(), Some("wildcard-sonnet"));
+
+        // 3. When alias mapping has no exact and no wildcard, route_model wins
+        let mut mappings_no_wildcard = std::collections::BTreeMap::new();
+        mappings_no_wildcard.insert("anthropic".to_string(), "claude-3-7-sonnet".to_string());
+        let res3 = resolve_effective_model(
+            "deepseek",
+            Some("sonnet"),
+            Some(&mappings_no_wildcard),
+            &route_models,
+            global,
+        );
+        assert_eq!(res3.as_deref(), Some("fixed-route-deepseek"));
+
+        // 4. When no route_model, global wins
+        let res4 = resolve_effective_model(
+            "openrouter",
+            Some("sonnet"),
+            Some(&mappings_no_wildcard),
+            &route_models,
+            global,
+        );
+        assert_eq!(res4.as_deref(), Some("global-fallback"));
+
+        // 5. When no global and no mapping, passthrough (None)
+        let res5 = resolve_effective_model(
+            "openrouter",
+            Some("sonnet"),
+            Some(&mappings_no_wildcard),
+            &route_models,
+            None,
+        );
+        assert_eq!(res5, None);
     }
 
     #[test]
