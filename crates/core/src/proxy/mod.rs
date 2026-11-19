@@ -2483,4 +2483,148 @@ mod tests {
             "expected response from codex, got {b2}"
         );
     }
+
+    #[tokio::test]
+    async fn test_proxy_explicit_model_mapping_cascades_across_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let up1 = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(
+            &dir,
+            &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")],
+        );
+        core.db()
+            .set_routes(&["p1".into(), "p2".into()], None, "chat")
+            .unwrap();
+        core.db()
+            .set_model_mapping("sonnet", "p1", "claude-3-7-sonnet")
+            .unwrap();
+        core.db()
+            .set_model_mapping("sonnet", "p2", "deepseek-chat")
+            .unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        up1.respond_with(500, "boom");
+        up2.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            up1.last_request()
+                .await
+                .body
+                .contains(r#""model":"claude-3-7-sonnet""#),
+            "primary p1 did not receive its mapped model"
+        );
+        assert!(
+            up2.last_request()
+                .await
+                .body
+                .contains(r#""model":"deepseek-chat""#),
+            "fallback p2 did not receive its mapped model"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_explicit_model_mapping_bypasses_stage_2c_pinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let up1 = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(
+            &dir,
+            &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")],
+        );
+        core.db()
+            .set_routes(&["p1".into(), "p2".into()], None, "chat")
+            .unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+
+        // Seed model_routes to simulate "sonnet" was pinned to p2
+        let mut seed = crate::store::db::ModelRoutes::new();
+        seed.insert(
+            "sonnet".to_string(),
+            crate::store::db::ModelRoute {
+                route_id: "p2".to_string(),
+                upstream_model: "pinned-p2-model".to_string(),
+            },
+        );
+        core.db().set_model_routes(&seed).unwrap();
+
+        // Configure explicit model mapping for sonnet
+        core.db()
+            .set_model_mapping("sonnet", "p1", "claude-3-7-sonnet")
+            .unwrap();
+        core.db()
+            .set_model_mapping("sonnet", "p2", "deepseek-chat")
+            .unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        up1.respond_with(
+            200,
+            r#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        // p1 must be called (NOT pinned to p2!)
+        assert_eq!(up1.call_count().await, 1, "p1 should have been called first");
+        assert_eq!(up2.call_count().await, 0, "p2 should not have been called");
+        assert!(
+            up1.last_request()
+                .await
+                .body
+                .contains(r#""model":"claude-3-7-sonnet""#),
+            "p1 should have received its mapped model"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_models_includes_aliases_without_polluting_model_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let up1 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up1.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+        core.db()
+            .set_model_mapping("sonnet", "p1", "claude-3-7-sonnet")
+            .unwrap();
+
+        up1.respond_with(200, &models_catalog(&["model-from-up1"]));
+
+        let url = spawn_service(ProxyService::new(core.clone())).await;
+        let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
+        assert_eq!(status, 200);
+
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let data = v["data"].as_array().expect("data array");
+
+        // Verify sonnet alias is present and owned_by xfade
+        let sonnet = data.iter().find(|m| m["id"] == "sonnet");
+        assert!(sonnet.is_some(), "sonnet alias must be in /v1/models: {v}");
+        assert_eq!(sonnet.unwrap()["owned_by"], "xfade");
+
+        // Verify alias is NOT cached in model_routes
+        let cached = core.db().model_route_for("sonnet").unwrap();
+        assert!(
+            cached.is_none(),
+            "aliases must not be saved to model_routes cache"
+        );
+    }
 }
