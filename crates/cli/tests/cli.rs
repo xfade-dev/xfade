@@ -951,3 +951,63 @@ fn doctor_security_command_checks_and_fixes() {
     assert!(!settings.contains("sk-ant-api03-leaked-key-12345"));
     assert!(settings.contains("xfade-local-claude-"));
 }
+
+#[test]
+fn audit_command_and_export() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Empty audit log
+    xfade(home.path())
+        .args(["audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No audit records found"));
+
+    // Insert an audit log entry directly via SQLite
+    let data_dir = home.path().join(".xfade-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db = xfade_core::store::Db::open(&data_dir.join("xfade.db")).unwrap();
+    db.insert_audit_log(&xfade_core::store::db::AuditLog {
+        id: 0,
+        ts: 1700000000000,
+        client_tool: "claude".into(),
+        client_token_id: "token:claude".into(),
+        provider_id: "kimi".into(),
+        upstream_domain: "api.moonshot.cn".into(),
+        upstream_model: "kimi-k2.5".into(),
+        key_ref: "ref:kimi#sha256:abcd1234".into(),
+        status_code: 200,
+        duration_ms: 120,
+        prompt_tokens: 30,
+        completion_tokens: 15,
+        failover_path: None,
+    })
+    .unwrap();
+
+    // Table view
+    xfade(home.path())
+        .args(["audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api.moonshot.cn"))
+        .stdout(predicate::str::contains("ref:kimi#sha256:abcd1234"))
+        .stdout(predicate::str::contains("200"));
+
+    // JSON export
+    xfade(home.path())
+        .args(["audit", "--export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"upstream_domain\": \"api.moonshot.cn\"",
+        ));
+
+    // CSV export
+    xfade(home.path())
+        .args(["audit", "--export", "--format", "csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "api.moonshot.cn,kimi-k2.5,ref:kimi#sha256:abcd1234,200",
+        ));
+}

@@ -172,6 +172,21 @@ impl Core {
         Ok(report.overall_trust)
     }
 
+    pub fn recent_audit_logs(
+        &self,
+        limit: usize,
+        tool: Option<ToolKind>,
+    ) -> Result<Vec<crate::store::db::AuditLog>> {
+        self.db.recent_audit_logs(limit, tool.map(|t| t.as_str()))
+    }
+
+    pub fn export_audit_logs(
+        &self,
+        since_ts: Option<u64>,
+    ) -> Result<Vec<crate::store::db::AuditLog>> {
+        self.db.export_audit_logs(since_ts)
+    }
+
     fn adapter(&self, tool: ToolKind) -> Box<dyn ToolAdapter> {
         adapter_for(tool, &self.home)
     }

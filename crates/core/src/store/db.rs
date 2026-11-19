@@ -49,6 +49,23 @@ pub struct SessionRow {
     pub first_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AuditLog {
+    pub id: i64,
+    pub ts: u64,
+    pub client_tool: String,
+    pub client_token_id: String,
+    pub provider_id: String,
+    pub upstream_domain: String,
+    pub upstream_model: String,
+    pub key_ref: String,
+    pub status_code: u16,
+    pub duration_ms: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub failover_path: Option<String>,
+}
+
 /// A model/route switch recorded on the session timeline. `session_id` is
 /// NULL at switch time (a config-level switch has no request context) and is
 /// backfilled by the forward pipeline from the next matching request.
@@ -231,7 +248,23 @@ impl Database {
                 model_override TEXT,
                 target_protocol TEXT NOT NULL DEFAULT 'chat',
                 updated_at TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                client_tool TEXT NOT NULL,
+                client_token_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                upstream_domain TEXT NOT NULL,
+                upstream_model TEXT NOT NULL,
+                key_ref TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                prompt_tokens INTEGER DEFAULT 0,
+                completion_tokens INTEGER DEFAULT 0,
+                failover_path TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -975,6 +1008,108 @@ impl Database {
             });
         }
         Ok(out)
+    }
+
+    /// Insert an immutable audit record for an outgoing proxied request.
+    pub fn insert_audit_log(&self, log: &AuditLog) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO audit_logs (ts, client_tool, client_token_id, provider_id, upstream_domain, upstream_model, key_ref, status_code, duration_ms, prompt_tokens, completion_tokens, failover_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                log.ts as i64,
+                log.client_tool,
+                log.client_token_id,
+                log.provider_id,
+                log.upstream_domain,
+                log.upstream_model,
+                log.key_ref,
+                log.status_code as i64,
+                log.duration_ms as i64,
+                log.prompt_tokens as i64,
+                log.completion_tokens as i64,
+                log.failover_path,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read the most recent `limit` audit logs, optionally filtered by `tool`.
+    pub fn recent_audit_logs(&self, limit: usize, tool: Option<&str>) -> Result<Vec<AuditLog>> {
+        let conn = self.conn();
+        let (sql, param) = match tool {
+            Some(t) => (
+                "SELECT id, ts, client_tool, client_token_id, provider_id, upstream_domain, upstream_model, key_ref, status_code, duration_ms, prompt_tokens, completion_tokens, failover_path
+                 FROM audit_logs WHERE client_tool = ?1 ORDER BY id DESC LIMIT ?2",
+                Some(t.to_string()),
+            ),
+            None => (
+                "SELECT id, ts, client_tool, client_token_id, provider_id, upstream_domain, upstream_model, key_ref, status_code, duration_ms, prompt_tokens, completion_tokens, failover_path
+                 FROM audit_logs ORDER BY id DESC LIMIT ?1",
+                None,
+            ),
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match param {
+            Some(t) => stmt.query(params![t, limit as i64])?,
+            None => stmt.query(params![limit as i64])?,
+        };
+
+        let mut res = Vec::new();
+        while let Some(row) = rows.next()? {
+            res.push(AuditLog {
+                id: row.get(0)?,
+                ts: row.get::<_, i64>(1)? as u64,
+                client_tool: row.get(2)?,
+                client_token_id: row.get(3)?,
+                provider_id: row.get(4)?,
+                upstream_domain: row.get(5)?,
+                upstream_model: row.get(6)?,
+                key_ref: row.get(7)?,
+                status_code: row.get::<_, i64>(8)? as u16,
+                duration_ms: row.get::<_, i64>(9)? as u64,
+                prompt_tokens: row.get::<_, i64>(10)? as u64,
+                completion_tokens: row.get::<_, i64>(11)? as u64,
+                failover_path: row.get(12)?,
+            });
+        }
+        Ok(res)
+    }
+
+    /// Export audit logs optionally starting from a timestamp.
+    pub fn export_audit_logs(&self, since_ts: Option<u64>) -> Result<Vec<AuditLog>> {
+        let conn = self.conn();
+        let sql = match since_ts {
+            Some(_) => "SELECT id, ts, client_tool, client_token_id, provider_id, upstream_domain, upstream_model, key_ref, status_code, duration_ms, prompt_tokens, completion_tokens, failover_path
+                        FROM audit_logs WHERE ts >= ?1 ORDER BY id ASC",
+            None => "SELECT id, ts, client_tool, client_token_id, provider_id, upstream_domain, upstream_model, key_ref, status_code, duration_ms, prompt_tokens, completion_tokens, failover_path
+                     FROM audit_logs ORDER BY id ASC",
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match since_ts {
+            Some(ts) => stmt.query(params![ts as i64])?,
+            None => stmt.query([])?,
+        };
+        let mut res = Vec::new();
+        while let Some(row) = rows.next()? {
+            res.push(AuditLog {
+                id: row.get(0)?,
+                ts: row.get::<_, i64>(1)? as u64,
+                client_tool: row.get(2)?,
+                client_token_id: row.get(3)?,
+                provider_id: row.get(4)?,
+                upstream_domain: row.get(5)?,
+                upstream_model: row.get(6)?,
+                key_ref: row.get(7)?,
+                status_code: row.get::<_, i64>(8)? as u16,
+                duration_ms: row.get::<_, i64>(9)? as u64,
+                prompt_tokens: row.get::<_, i64>(10)? as u64,
+                completion_tokens: row.get::<_, i64>(11)? as u64,
+                failover_path: row.get(12)?,
+            });
+        }
+        Ok(res)
     }
 
     // ── Sessions & handovers ──────────────────────────────────────────────
@@ -2198,5 +2333,56 @@ mod tests {
         assert_eq!(s1.requests, 2);
         assert_eq!(s1.prompt_tokens, 3); // 1 + 2
         assert!(rows.iter().any(|r| r.group == "(detached)"));
+    }
+
+    #[test]
+    fn test_audit_logs_crud_and_query() {
+        let db = Database::open_memory().unwrap();
+        let log1 = AuditLog {
+            id: 0,
+            ts: 1000,
+            client_tool: "claude".into(),
+            client_token_id: "xfade-local-claude-test".into(),
+            provider_id: "kimi".into(),
+            upstream_domain: "api.moonshot.cn".into(),
+            upstream_model: "kimi-k2.5".into(),
+            key_ref: "provider:kimi#sha256:abcd".into(),
+            status_code: 200,
+            duration_ms: 150,
+            prompt_tokens: 50,
+            completion_tokens: 20,
+            failover_path: None,
+        };
+        let log2 = AuditLog {
+            id: 0,
+            ts: 2000,
+            client_tool: "codex".into(),
+            client_token_id: "xfade-local-codex-test".into(),
+            provider_id: "deepseek".into(),
+            upstream_domain: "api.deepseek.com".into(),
+            upstream_model: "deepseek-coder".into(),
+            key_ref: "provider:deepseek#sha256:ef01".into(),
+            status_code: 502,
+            duration_ms: 300,
+            prompt_tokens: 100,
+            completion_tokens: 0,
+            failover_path: Some(r#"[{"provider":"deepseek","status":502}]"#.into()),
+        };
+
+        db.insert_audit_log(&log1).unwrap();
+        db.insert_audit_log(&log2).unwrap();
+
+        let recent = db.recent_audit_logs(10, None).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].provider_id, "deepseek");
+        assert_eq!(recent[1].provider_id, "kimi");
+
+        let claude_only = db.recent_audit_logs(10, Some("claude")).unwrap();
+        assert_eq!(claude_only.len(), 1);
+        assert_eq!(claude_only[0].provider_id, "kimi");
+
+        let exported = db.export_audit_logs(Some(1500)).unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].provider_id, "deepseek");
     }
 }
