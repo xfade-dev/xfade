@@ -33,12 +33,25 @@ impl Core {
     /// `data_dir` (self data root).
     pub fn with_paths(home: &Path, data_dir: &Path, secrets: Arc<dyn SecretStore>) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700));
+        }
         let core = Self {
             db: Database::open(&data_dir.join("xfade.db"))?,
             secrets,
             home: home.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = data_dir.join("xfade.db");
+            if db_path.exists() {
+                let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
         core.migrate_legacy_key_refs();
         Ok(core)
     }
@@ -138,6 +151,27 @@ impl Core {
         Self::with_paths(home, &data, secrets)
     }
 
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn security_doctor(&self) -> Result<crate::security::SecurityDoctorReport> {
+        crate::security::doctor::SecurityDoctor::new(self).check()
+    }
+
+    pub fn security_doctor_fix(&self) -> Result<Vec<String>> {
+        crate::security::doctor::SecurityDoctor::new(self).fix()
+    }
+
+    pub fn trust_state(&self) -> Result<crate::security::TrustState> {
+        let report = self.security_doctor()?;
+        Ok(report.overall_trust)
+    }
+
     fn adapter(&self, tool: ToolKind) -> Box<dyn ToolAdapter> {
         adapter_for(tool, &self.home)
     }
@@ -233,7 +267,14 @@ impl Core {
 
     /// Whether the tool's active provider was configured in direct mode (rather than gateway proxy mode).
     pub fn is_direct(&self, tool: ToolKind) -> Result<bool> {
-        Ok(self.db.get_tool_routes(tool.as_str())?.is_none())
+        let current = self.current(tool)?;
+        if let Some(p) = current {
+            if p.is_official() {
+                return Ok(false);
+            }
+            return self.db.is_tool_direct(tool.as_str());
+        }
+        Ok(false)
     }
 
     pub fn remove(&self, tool: ToolKind, id: &str) -> Result<()> {

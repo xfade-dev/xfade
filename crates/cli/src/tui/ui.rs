@@ -166,7 +166,11 @@ fn dim((r, g, b): (u8, u8, u8), f: f32) -> (u8, u8, u8) {
 /// Header title: a crossfade wordmark — `◀ xfade ▶` with `xfade` rendered as
 /// a cyan→magenta gradient, one span per character, plus the current tool
 /// dimmed after it.
-fn title_line(tool: ToolKind, progress: f32) -> Line<'static> {
+fn title_line(
+    tool: ToolKind,
+    trust: xfade_core::security::TrustState,
+    progress: f32,
+) -> Line<'static> {
     let mut spans = vec![
         Span::raw(" "),
         Span::styled("◀ ", Style::default().fg(Color::Cyan)),
@@ -192,6 +196,27 @@ fn title_line(tool: ToolKind, progress: f32) -> Line<'static> {
         format!(" · {} ", tool.as_str()),
         Style::default().fg(Color::DarkGray),
     ));
+
+    let (trust_badge, trust_style) = match trust {
+        xfade_core::security::TrustState::Guarded => (
+            "[GUARDED]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        xfade_core::security::TrustState::Direct => (
+            "[DIRECT]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        xfade_core::security::TrustState::Exposed => (
+            "[EXPOSED]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    };
+    spans.push(Span::styled(format!(" {trust_badge} "), trust_style));
+
     Line::from(spans)
 }
 
@@ -254,7 +279,7 @@ fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title_line(app.tool, progress));
+        .title(title_line(app.tool, app.trust, progress));
     let text = Paragraph::new(vec![tool_tabs(app), fader, status]).block(block);
     f.render_widget(text, area);
 }

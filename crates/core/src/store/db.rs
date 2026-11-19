@@ -590,6 +590,20 @@ impl Database {
         }
     }
 
+    pub fn is_tool_direct(&self, tool: &str) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT routes FROM tool_routes WHERE tool = ?1")?;
+        let mut rows = stmt.query(params![tool])?;
+        match rows.next()? {
+            Some(row) => {
+                let s: String = row.get(0)?;
+                let routes: Vec<String> = serde_json::from_str(&s)?;
+                Ok(routes.is_empty())
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn upsert_client_token(&self, tool: &str, token: &str, created_at_secs: u64) -> Result<()> {
         let conn = self.conn();
         conn.execute(

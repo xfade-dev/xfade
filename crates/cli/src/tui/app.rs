@@ -58,6 +58,8 @@ pub struct App {
     pub probing: HashSet<String>,
     /// Frame counter driving the braille spinner.
     pub spinner_tick: usize,
+    /// Trust status of the environment
+    pub trust: xfade_core::security::TrustState,
     /// Switch-flash highlight deadline; cleared by [`tick`] once expired.
     pub flash_until: Option<Instant>,
     /// Open-animation deadline; the header fades in and the knob slides until
@@ -81,6 +83,9 @@ impl App {
             fader_pos: 0.5,
             probing: HashSet::new(),
             spinner_tick: 0,
+            trust: core
+                .trust_state()
+                .unwrap_or(xfade_core::security::TrustState::Guarded),
             flash_until: None,
             intro_until: None,
             user_interacted: false,
@@ -98,6 +103,9 @@ impl App {
     pub fn reload(&mut self, core: &Core) {
         let previous = self.selected_provider().map(|p| p.id.clone());
         self.providers = core.list(Some(self.tool)).unwrap_or_default();
+        self.trust = core
+            .trust_state()
+            .unwrap_or(xfade_core::security::TrustState::Guarded);
         self.selected = self
             .providers
             .iter()

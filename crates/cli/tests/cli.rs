@@ -885,3 +885,69 @@ fn handover_command_prints_brief() {
             "### [xfade Session Handover Context]",
         ));
 }
+
+#[test]
+fn doctor_security_command_checks_and_fixes() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Clean initial run: should be GUARDED
+    xfade(home.path())
+        .args(["doctor", "--security"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Trust Status: GUARDED"));
+
+    // Inject a leaked raw key in claude config
+    let claude_dir = home.path().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-ant-api03-leaked-key-12345"}}"#,
+    )
+    .unwrap();
+
+    // Now doctor should report EXPOSED
+    xfade(home.path())
+        .args(["doctor", "--security"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("EXPOSED"))
+        .stdout(predicate::str::contains("claude"));
+
+    // Status should also reflect EXPOSED
+    xfade(home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trust: EXPOSED"));
+
+    // Register kimi in xfade and run --fix
+    xfade(home.path())
+        .args([
+            "add",
+            "kimi",
+            "--tool",
+            "claude",
+            "--base-url",
+            "https://api.moonshot.cn",
+            "--key",
+            "sk-kimi-key-12345678",
+        ])
+        .assert()
+        .success();
+
+    xfade(home.path())
+        .args(["use", "kimi", "--tool", "claude"])
+        .assert()
+        .success();
+
+    xfade(home.path())
+        .args(["doctor", "--security", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Trust Status: GUARDED"));
+
+    let settings = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(!settings.contains("sk-ant-api03-leaked-key-12345"));
+    assert!(settings.contains("xfade-local-claude-"));
+}
