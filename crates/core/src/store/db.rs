@@ -2148,7 +2148,10 @@ mod tests {
     fn test_model_mappings_crud_and_preservation() {
         let db = Database::open_memory().unwrap();
         assert!(db.get_model_mappings().unwrap().is_empty());
-        assert!(db.get_mappings_for_client_model("sonnet").unwrap().is_empty());
+        assert!(db
+            .get_mappings_for_client_model("sonnet")
+            .unwrap()
+            .is_empty());
 
         // Single set
         db.set_model_mapping("sonnet", "anthropic", "claude-3-7-sonnet-20250219")
@@ -2184,14 +2187,20 @@ mod tests {
         // Remove single provider mapping
         assert!(db.remove_model_mapping("sonnet", Some("deepseek")).unwrap());
         assert_eq!(db.get_mappings_for_client_model("sonnet").unwrap().len(), 2);
-        assert!(!db.remove_model_mapping("sonnet", Some("nonexistent")).unwrap());
+        assert!(!db
+            .remove_model_mapping("sonnet", Some("nonexistent"))
+            .unwrap());
 
         // Remove whole alias
         assert!(db.remove_model_mapping("sonnet", None).unwrap());
-        assert!(db.get_mappings_for_client_model("sonnet").unwrap().is_empty());
+        assert!(db
+            .get_mappings_for_client_model("sonnet")
+            .unwrap()
+            .is_empty());
 
         // Clear all
-        db.set_model_mapping("haiku", "anthropic", "claude-3-5-haiku").unwrap();
+        db.set_model_mapping("haiku", "anthropic", "claude-3-5-haiku")
+            .unwrap();
         db.clear_model_mappings().unwrap();
         assert!(db.get_model_mappings().unwrap().is_empty());
     }

@@ -1691,7 +1691,7 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
                 println!("(no model mappings configured; use `xfade model-map set <alias> <provider>=<model>...`)");
                 return Ok(());
             }
-            println!("{:<15} {:<15} {}", "ALIAS", "PROVIDER", "UPSTREAM MODEL");
+            println!("{:<15} {:<15} UPSTREAM MODEL", "ALIAS", "PROVIDER");
             println!("{}", "─".repeat(55));
             for (alias, prov_map) in mappings {
                 for (prov, target) in prov_map {
@@ -1710,7 +1710,9 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
                 }
             } else {
                 match provider {
-                    Some(p) => println!("No mapping found for provider '{p}' under alias '{alias}'."),
+                    Some(p) => {
+                        println!("No mapping found for provider '{p}' under alias '{alias}'.")
+                    }
                     None => println!("No mappings found for alias '{alias}'."),
                 }
             }
@@ -2563,11 +2565,12 @@ mod tests {
         .unwrap();
         match cli.cmd {
             Some(Cmd::ModelMap {
-                cmd: ModelMapCmd::Set {
-                    alias,
-                    mappings,
-                    force,
-                },
+                cmd:
+                    ModelMapCmd::Set {
+                        alias,
+                        mappings,
+                        force,
+                    },
             }) => {
                 assert_eq!(alias, "sonnet");
                 assert_eq!(mappings.len(), 2);
