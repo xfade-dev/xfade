@@ -1011,3 +1011,85 @@ fn audit_command_and_export() {
             "api.moonshot.cn,kimi-k2.5,ref:kimi#sha256:abcd1234,200",
         ));
 }
+
+#[test]
+fn egress_command_whitelist_and_policy() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Default policy
+    xfade(home.path())
+        .args(["egress"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Policy Mode: registered"))
+        .stdout(predicate::str::contains("(none)"));
+
+    // Add a provider and check it appears under registered domains
+    xfade(home.path())
+        .args([
+            "add",
+            "openai",
+            "--tool",
+            "claude",
+            "--base-url",
+            "https://api.openai.com/v1",
+            "--key",
+            "sk-secret",
+        ])
+        .assert()
+        .success();
+
+    xfade(home.path())
+        .args(["egress"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api.openai.com"));
+
+    // Add custom whitelist domain
+    xfade(home.path())
+        .args(["egress", "add", "https://api.groq.com/openai/v1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Added 'api.groq.com' to egress whitelist.",
+        ));
+
+    xfade(home.path())
+        .args(["egress", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api.groq.com"));
+
+    // Remove custom domain
+    xfade(home.path())
+        .args(["egress", "remove", "api.groq.com"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed 'api.groq.com' from egress whitelist.",
+        ));
+
+    // Change policy
+    xfade(home.path())
+        .args(["egress", "policy", "unrestricted"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Egress policy set to 'unrestricted'.",
+        ));
+
+    xfade(home.path())
+        .args(["egress"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Policy Mode: unrestricted"));
+
+    // Revert policy
+    xfade(home.path())
+        .args(["egress", "policy", "registered"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Egress policy set to 'registered'.",
+        ));
+}

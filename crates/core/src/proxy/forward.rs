@@ -302,7 +302,7 @@ fn log_request(
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         duration_ms,
-        error,
+        error: error.clone(),
         session_id: session_id.map(|s| s.to_string()),
     });
     crate::sessions::record_outcome(
@@ -329,7 +329,16 @@ fn log_request(
         let key_opt = svc.core.secrets().get(&p.key_ref).ok();
         (domain, key_fingerprint(&p, key_opt.as_deref()))
     } else {
-        ("unknown".to_string(), format!("ref:{provider_id}#unknown"))
+        let domain = if let Some(err) = &error {
+            if let Some(rest) = err.strip_prefix("outbound domain '") {
+                rest.split('\'').next().unwrap_or("unknown").to_string()
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        };
+        (domain, format!("ref:{provider_id}#unknown"))
     };
 
     let _ = svc.core.db().insert_audit_log(&crate::store::db::AuditLog {
@@ -867,6 +876,35 @@ async fn failover_loop(
             Some(u) => u.clone(),
             None => continue,
         };
+
+        if let Ok(allowed) = svc.core.is_domain_allowed(&base_url) {
+            if !allowed {
+                let duration_ms = start.elapsed().as_millis() as i64;
+                let target_domain = extract_domain(&base_url);
+                let err_msg = format!("outbound domain '{target_domain}' blocked by egress policy");
+                log_request(
+                    svc,
+                    session_id,
+                    endpoint,
+                    &model,
+                    route_id,
+                    provider.tool.as_str(),
+                    403,
+                    Usage::default(),
+                    duration_ms,
+                    Some(err_msg.clone()),
+                );
+                svc.record_failure(route_id);
+                last_err = Some((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "{{\"error\":\"xfade_egress_blocked\",\"domain\":\"{target_domain}\"}}"
+                    ),
+                    None,
+                ));
+                continue;
+            }
+        }
 
         let auth_key = if provider.is_official() {
             None
@@ -1676,6 +1714,11 @@ async fn aggregate_models(
         let Some(base_url) = provider.base_url.clone() else {
             continue;
         };
+        if let Ok(allowed) = svc.core.is_domain_allowed(&base_url) {
+            if !allowed {
+                continue;
+            }
+        }
         let auth_key = if provider.is_official() {
             None
         } else {
@@ -2075,5 +2118,62 @@ data: [DONE]\n\n";
         assert!(text.contains("\"content\":\"hi\""));
         assert!(text.contains("\"finish_reason\":\"stop\""));
         assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn egress_blocked_route_returns_403_and_logs_audit() {
+        use crate::{store::secrets::MockStore, Core, Provider};
+        let temp = tempfile::tempdir().unwrap();
+        let core = Core::with_paths(
+            temp.path(),
+            temp.path(),
+            std::sync::Arc::new(MockStore::default()),
+        )
+        .unwrap();
+
+        let p = Provider::new(
+            "evil",
+            ToolKind::ClaudeCode,
+            Some("https://evil.internal.corp/v1".into()),
+        );
+
+        let svc = ProxyService::new(core);
+        let entries = vec![crate::router::decision::RouteEntry {
+            route_id: "evil".into(),
+            model_override: None,
+            tier: crate::router::decision::Tier::Cloud,
+        }];
+        let mut provider_map = std::collections::HashMap::new();
+        provider_map.insert("evil".to_string(), &p);
+        let headers = HeaderMap::new();
+
+        let resp = failover_loop(
+            &svc,
+            None,
+            "POST",
+            &entries,
+            &provider_map,
+            "chat",
+            "chat",
+            None,
+            &headers,
+            b"{}",
+            "test-model",
+            Instant::now(),
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("xfade_egress_blocked"));
+        assert!(body_str.contains("evil.internal.corp"));
+
+        // Verify audit log has the egress rejection
+        let audit = svc.core.recent_audit_logs(1, None).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].status_code, 403);
+        assert_eq!(audit[0].upstream_domain, "evil.internal.corp");
     }
 }
