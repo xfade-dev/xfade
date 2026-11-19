@@ -244,6 +244,38 @@ fn extract_prompt_text(body: &serde_json::Value, endpoint: &str) -> String {
     }
 }
 
+/// Extract the domain/host from a URL string.
+fn extract_domain(url_str: &str) -> String {
+    if let Ok(url) = reqwest::Url::parse(url_str) {
+        url.host_str().unwrap_or("unknown").to_string()
+    } else {
+        url_str
+            .split("://")
+            .nth(1)
+            .unwrap_or(url_str)
+            .split('/')
+            .next()
+            .unwrap_or("unknown")
+            .split(':')
+            .next()
+            .unwrap_or("unknown")
+            .to_string()
+    }
+}
+
+/// Compute a privacy-safe key fingerprint for audit logging (never logs raw secret).
+fn key_fingerprint(provider: &crate::models::Provider, key_opt: Option<&str>) -> String {
+    match key_opt {
+        Some(k) if !k.is_empty() => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(k.as_bytes());
+            let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            format!("ref:{}#sha256:{}", provider.id, hex)
+        }
+        _ => format!("ref:{}#none", provider.id),
+    }
+}
+
 /// Log a request to the database and fold its outcome into the session
 /// (token accumulation + handover attribution). Best-effort: errors are
 /// swallowed (the proxy must not fail a successful forward because logging
@@ -283,6 +315,38 @@ fn log_request(
         usage.completion_tokens,
         status != 0 && status < 400,
     );
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (upstream_domain, key_ref) = if let Some(p) = tool
+        .parse::<ToolKind>()
+        .ok()
+        .and_then(|t| svc.core.db().get(t, provider_id).ok().flatten())
+    {
+        let domain = extract_domain(p.base_url.as_deref().unwrap_or(""));
+        let key_opt = svc.core.secrets().get(&p.key_ref).ok();
+        (domain, key_fingerprint(&p, key_opt.as_deref()))
+    } else {
+        ("unknown".to_string(), format!("ref:{provider_id}#unknown"))
+    };
+
+    let _ = svc.core.db().insert_audit_log(&crate::store::db::AuditLog {
+        id: 0,
+        ts: now_ts,
+        client_tool: tool.to_string(),
+        client_token_id: format!("token:{tool}"),
+        provider_id: provider_id.to_string(),
+        upstream_domain,
+        upstream_model: model.clone().unwrap_or_default(),
+        key_ref,
+        status_code: status as u16,
+        duration_ms: duration_ms as u64,
+        prompt_tokens: usage.prompt_tokens as u64,
+        completion_tokens: usage.completion_tokens as u64,
+        failover_path: None,
+    });
 }
 
 // ── Forward pipeline stages ────────────────────────────────────────────────
@@ -1410,6 +1474,37 @@ impl TailLogStream {
             usage.completion_tokens,
             status_ok,
         );
+
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let upstream_domain = if let Some(p) = self
+            .tool
+            .parse::<ToolKind>()
+            .ok()
+            .and_then(|t| self.db.get(t, &self.provider_id).ok().flatten())
+        {
+            extract_domain(p.base_url.as_deref().unwrap_or(""))
+        } else {
+            "unknown".to_string()
+        };
+
+        let _ = self.db.insert_audit_log(&crate::store::db::AuditLog {
+            id: 0,
+            ts: now_ts,
+            client_tool: self.tool.clone(),
+            client_token_id: format!("token:{}", self.tool),
+            provider_id: self.provider_id.clone(),
+            upstream_domain,
+            upstream_model: self.model.clone().unwrap_or_default(),
+            key_ref: format!("ref:{}#stream", self.provider_id),
+            status_code: self.status.as_u16(),
+            duration_ms: duration_ms as u64,
+            prompt_tokens: usage.prompt_tokens as u64,
+            completion_tokens: usage.completion_tokens as u64,
+            failover_path: None,
+        });
     }
 }
 

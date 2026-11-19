@@ -85,6 +85,21 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
+    /// View and export structured security audit logs
+    Audit {
+        /// Filter audit logs by client tool (e.g. claude, codex, opencode)
+        #[arg(long)]
+        tool: Option<ToolKind>,
+        /// Number of recent records to display (default: 20)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Export all audit logs instead of viewing recent table
+        #[arg(long)]
+        export: bool,
+        /// Export format (json or csv, default: json)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
     /// Edit a provider
     Edit {
         name: String,
@@ -566,6 +581,16 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Doctor { security: _, fix } => {
             let core = build_core()?;
             cmd_doctor(&core, fix)?;
+            Ok(())
+        }
+        Cmd::Audit {
+            tool,
+            limit,
+            export,
+            format,
+        } => {
+            let core = build_core()?;
+            cmd_audit(&core, tool, limit, export, &format)?;
             Ok(())
         }
         Cmd::Rm { name, tool } => {
@@ -1332,6 +1357,94 @@ fn format_circuit_badge(state: CircuitState, cooldown: Option<u64>) -> String {
             }
         }
     }
+}
+
+fn cmd_audit(
+    core: &Core,
+    tool: Option<ToolKind>,
+    limit: usize,
+    export: bool,
+    format: &str,
+) -> Result<(), CoreError> {
+    if export {
+        let logs = core.export_audit_logs(None)?;
+        if format.eq_ignore_ascii_case("csv") {
+            println!("id,ts,client_tool,client_token_id,provider_id,upstream_domain,upstream_model,key_ref,status_code,duration_ms,prompt_tokens,completion_tokens,failover_path");
+            for l in &logs {
+                println!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},\"{}\"",
+                    l.id,
+                    l.ts,
+                    l.client_tool,
+                    l.client_token_id,
+                    l.provider_id,
+                    l.upstream_domain,
+                    l.upstream_model,
+                    l.key_ref,
+                    l.status_code,
+                    l.duration_ms,
+                    l.prompt_tokens,
+                    l.completion_tokens,
+                    l.failover_path.as_deref().unwrap_or("")
+                );
+            }
+        } else {
+            let s = serde_json::to_string_pretty(&logs).map_err(|e| CoreError::ConfigParse {
+                path: "audit_export".into(),
+                msg: e.to_string(),
+            })?;
+            println!("{s}");
+        }
+        return Ok(());
+    }
+
+    let logs = core.recent_audit_logs(limit, tool)?;
+    println!("=== xfade Security Audit Log ===");
+    if logs.is_empty() {
+        println!("No audit records found.");
+        return Ok(());
+    }
+
+    println!("Showing {} recent audit record(s):", logs.len());
+    println!(
+        "{:<19}  {:<10}  {:<12}  {:<20}  {:<18}  {:<6}  {:<6}  KEY REF",
+        "TIME (UTC)", "CLIENT", "PROVIDER", "DOMAIN", "MODEL", "STATUS", "LATENCY"
+    );
+    println!("{}", "-".repeat(110));
+
+    for l in &logs {
+        use crossterm::style::Stylize;
+        let dt = time::OffsetDateTime::from_unix_timestamp((l.ts / 1000) as i64)
+            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        let time_str = dt
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "-".into());
+        let time_short = &time_str[..19.min(time_str.len())];
+
+        let status_str = format!("{:>3}", l.status_code);
+        let status_colored = if l.status_code < 400 {
+            format!("{}", status_str.as_str().green())
+        } else {
+            format!("{}", status_str.as_str().red())
+        };
+
+        println!(
+            "{:<19}  {:<10}  {:<12}  {:<20}  {:<18}  {}   {:>4}ms  {}",
+            time_short,
+            l.client_tool,
+            l.provider_id,
+            l.upstream_domain,
+            if l.upstream_model.is_empty() {
+                "-"
+            } else {
+                &l.upstream_model
+            },
+            status_colored,
+            l.duration_ms,
+            l.key_ref,
+        );
+    }
+    Ok(())
 }
 
 fn cmd_doctor(core: &Core, fix: bool) -> Result<(), CoreError> {
