@@ -2604,7 +2604,7 @@ mod tests {
             .set_model_mapping("sonnet", "p1", "claude-3-7-sonnet")
             .unwrap();
 
-        up1.respond_with(200, &models_catalog(&["model-from-up1"]));
+        up1.respond_with(200, &models_catalog(&["model-from-up1", "sonnet"]));
 
         let url = spawn_service(ProxyService::new(core.clone())).await;
         let (status, body) = http_get(&url, "/v1/models", "Bearer x").await;
@@ -2613,10 +2613,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let data = v["data"].as_array().expect("data array");
 
-        // Verify sonnet alias is present and owned_by xfade
-        let sonnet = data.iter().find(|m| m["id"] == "sonnet");
-        assert!(sonnet.is_some(), "sonnet alias must be in /v1/models: {v}");
-        assert_eq!(sonnet.unwrap()["owned_by"], "xfade");
+        // Verify sonnet alias is present, exactly once, and owned_by xfade
+        let sonnet_matches: Vec<_> = data.iter().filter(|m| m["id"] == "sonnet").collect();
+        assert_eq!(
+            sonnet_matches.len(),
+            1,
+            "sonnet should be deduplicated in /v1/models: {v}"
+        );
+        assert_eq!(sonnet_matches[0]["owned_by"], "xfade");
 
         // Verify alias is NOT cached in model_routes
         let cached = core.db().model_route_for("sonnet").unwrap();

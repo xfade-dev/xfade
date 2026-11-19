@@ -340,8 +340,7 @@ impl Database {
                 provider_id TEXT NOT NULL,
                 upstream_model TEXT NOT NULL,
                 PRIMARY KEY (client_model, provider_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_model_mappings_client ON model_mappings(client_model);",
+            );",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -987,7 +986,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT provider_id, upstream_model FROM model_mappings WHERE client_model = ?1 ORDER BY provider_id",
         )?;
-        let mut rows = stmt.query(params![client_model])?;
+        let mut rows = stmt.query(params![client_model.trim()])?;
         let mut out = ProviderModelMap::new();
         while let Some(row) = rows.next()? {
             let provider_id: String = row.get(0)?;
@@ -2174,6 +2173,10 @@ mod tests {
         assert_eq!(map2.get("anthropic").unwrap(), "claude-3-7-sonnet-20250219");
         assert_eq!(map2.get("deepseek").unwrap(), "deepseek-chat");
         assert_eq!(map2.get("*").unwrap(), "claude-3-7-sonnet");
+
+        // Verify whitespace trimming on lookup
+        let map_trimmed = db.get_mappings_for_client_model("  sonnet  ").unwrap();
+        assert_eq!(map_trimmed.len(), 3);
 
         // Verify full dictionary
         let all = db.get_model_mappings().unwrap();

@@ -2124,15 +2124,21 @@ async fn aggregate_models(
         .await;
     }
 
-    let _ = svc.core.db().set_model_routes(&map);
-
     // In models_merge mode: query all configured client model aliases and inject them
     // into the returned catalog list (with owned_by: "xfade").
-    // NOTE: Aliases are purposely NOT added to `map` (model_routes), so that client
-    // requests using an alias are not locked to a single provider in Stage 2c.
+    // NOTE: Aliases are purposely NOT added to `map` (and stripped from `map` if an upstream
+    // happened to advertise a matching model ID), so that client requests using an alias are
+    // never locked to a single provider in Stage 2c.
     if let Ok(mappings) = svc.core.db().get_model_mappings() {
         let now_secs = crate::proxy::circuit_breaker::now_secs();
         for alias in mappings.keys() {
+            map.remove(alias);
+            if let Some(pos) = merged
+                .iter()
+                .position(|m| m.get("id").and_then(|i| i.as_str()) == Some(alias))
+            {
+                merged.remove(pos);
+            }
             merged.push(serde_json::json!({
                 "id": alias,
                 "object": "model",
@@ -2142,6 +2148,8 @@ async fn aggregate_models(
             }));
         }
     }
+
+    let _ = svc.core.db().set_model_routes(&map);
 
     let body = serde_json::json!({ "object": "list", "data": merged });
     Response::builder()

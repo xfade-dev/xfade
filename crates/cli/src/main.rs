@@ -1667,10 +1667,37 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
                     msg: "model alias cannot be empty".into(),
                 });
             }
+            if mappings.is_empty() {
+                return Err(CoreError::ConfigParse {
+                    path: "model-map".into(),
+                    msg: "expected at least one <provider>=<model> mapping".into(),
+                });
+            }
+            let mut clean_mappings = Vec::with_capacity(mappings.len());
+            let mut seen = std::collections::HashSet::new();
+            for (p, m) in mappings {
+                let p = p.trim().to_string();
+                let m = m.trim().to_string();
+                if p.is_empty() || m.is_empty() {
+                    return Err(CoreError::ConfigParse {
+                        path: "model-map".into(),
+                        msg: format!(
+                            "expected <provider>=<model> with non-empty parts, got {p:?}={m:?}"
+                        ),
+                    });
+                }
+                if !seen.insert(p.clone()) {
+                    return Err(CoreError::ConfigParse {
+                        path: "model-map".into(),
+                        msg: format!("duplicate provider '{p}' in mapping arguments"),
+                    });
+                }
+                clean_mappings.push((p, m));
+            }
             if !force {
                 let known: std::collections::HashSet<String> =
                     core.list(None)?.into_iter().map(|p| p.id).collect();
-                for (p, _) in &mappings {
+                for (p, _) in &clean_mappings {
                     if p != "*" && !known.contains(p) {
                         return Err(CoreError::ProviderNotFound(format!(
                             "'{p}' (not in any tool; run `xfade ls` to list, or use `--force`)"
@@ -1678,9 +1705,9 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
                     }
                 }
             }
-            core.db().set_model_mappings_batch(alias, &mappings)?;
+            core.db().set_model_mappings_batch(alias, &clean_mappings)?;
             println!("Updated model mapping for alias '{alias}':");
-            for (p, m) in &mappings {
+            for (p, m) in &clean_mappings {
                 println!("  {p} => {m}");
             }
             Ok(())
@@ -1691,11 +1718,24 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
                 println!("(no model mappings configured; use `xfade model-map set <alias> <provider>=<model>...`)");
                 return Ok(());
             }
-            println!("{:<15} {:<15} UPSTREAM MODEL", "ALIAS", "PROVIDER");
-            println!("{}", "─".repeat(55));
+            let mut alias_w = "ALIAS".len();
+            let mut prov_w = "PROVIDER".len();
+            for (alias, prov_map) in &mappings {
+                alias_w = alias_w.max(alias.len());
+                for prov in prov_map.keys() {
+                    prov_w = prov_w.max(prov.len());
+                }
+            }
+            alias_w += 2;
+            prov_w += 2;
+            println!(
+                "{:<alias_w$} {:<prov_w$} UPSTREAM MODEL",
+                "ALIAS", "PROVIDER"
+            );
+            println!("{}", "─".repeat(alias_w + prov_w + 20));
             for (alias, prov_map) in mappings {
                 for (prov, target) in prov_map {
-                    println!("{:<15} {:<15} {}", alias, prov, target);
+                    println!("{:<alias_w$} {:<prov_w$} {}", alias, prov, target);
                 }
             }
             Ok(())
@@ -2657,6 +2697,30 @@ mod tests {
             },
         )
         .unwrap();
+
+        // 2b. Empty provider or empty model fails validation
+        let err_empty = cmd_model_map(
+            &core,
+            ModelMapCmd::Set {
+                alias: "sonnet".into(),
+                mappings: vec![("ghost".into(), "   ".into())],
+                force: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err_empty.to_string().contains("non-empty parts"));
+
+        // 2c. Duplicate provider in single set command fails validation
+        let err_dup = cmd_model_map(
+            &core,
+            ModelMapCmd::Set {
+                alias: "sonnet".into(),
+                mappings: vec![("ghost".into(), "m1".into()), ("ghost".into(), "m2".into())],
+                force: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err_dup.to_string().contains("duplicate provider"));
 
         // 3. Setting with wildcard succeeds without force
         cmd_model_map(
