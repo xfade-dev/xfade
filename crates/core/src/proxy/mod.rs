@@ -2489,10 +2489,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up1 = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
-        let core = test_core(
-            &dir,
-            &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")],
-        );
+        let core = test_core(&dir, &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")]);
         core.db()
             .set_routes(&["p1".into(), "p2".into()], None, "chat")
             .unwrap();
@@ -2540,10 +2537,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let up1 = MockUpstream::spawn().await;
         let up2 = MockUpstream::spawn().await;
-        let core = test_core(
-            &dir,
-            &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")],
-        );
+        let core = test_core(&dir, &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")]);
         core.db()
             .set_routes(&["p1".into(), "p2".into()], None, "chat")
             .unwrap();
@@ -2584,7 +2578,11 @@ mod tests {
 
         assert_eq!(status, 200);
         // p1 must be called (NOT pinned to p2!)
-        assert_eq!(up1.call_count().await, 1, "p1 should have been called first");
+        assert_eq!(
+            up1.call_count().await,
+            1,
+            "p1 should have been called first"
+        );
         assert_eq!(up2.call_count().await, 0, "p2 should not have been called");
         assert!(
             up1.last_request()
