@@ -21,6 +21,10 @@ path = "tests/cli.rs"
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+[[test]]
+name = "protocol_golden_cascade"
+path = "tests/protocol_golden_cascade.rs"
+
 [dependencies]
 xfade-core = { path = "../core" }
 serde = { workspace = true }
@@ -39,3 +43,4 @@ crossterm = "0.29"
 assert_cmd = "2"
 predicates = "3"
 tempfile = { workspace = true }
+axum = { workspace = true }
