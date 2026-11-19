@@ -292,6 +292,36 @@ fn log_request(
     duration_ms: i64,
     error: Option<String>,
 ) {
+    log_request_full(
+        svc,
+        session_id,
+        endpoint,
+        model,
+        provider_id,
+        tool,
+        status,
+        usage,
+        duration_ms,
+        error,
+        None,
+        None,
+    );
+}
+
+fn log_request_full(
+    svc: &ProxyService,
+    session_id: Option<&str>,
+    endpoint: &str,
+    model: &Option<String>,
+    provider_id: &str,
+    tool: &str,
+    status: i64,
+    usage: Usage,
+    duration_ms: i64,
+    error: Option<String>,
+    explicit_domain: Option<&str>,
+    failover_path: Option<&str>,
+) {
     let _ = svc.core.db().insert_request_log(&RequestLog {
         ts: now_rfc3339(),
         endpoint: endpoint.to_string(),
@@ -325,19 +355,23 @@ fn log_request(
         .ok()
         .and_then(|t| svc.core.db().get(t, provider_id).ok().flatten())
     {
-        let domain = extract_domain(p.base_url.as_deref().unwrap_or(""));
+        let domain = explicit_domain
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| extract_domain(p.base_url.as_deref().unwrap_or("")));
         let key_opt = svc.core.secrets().get(&p.key_ref).ok();
         (domain, key_fingerprint(&p, key_opt.as_deref()))
     } else {
-        let domain = if let Some(err) = &error {
-            if let Some(rest) = err.strip_prefix("outbound domain '") {
-                rest.split('\'').next().unwrap_or("unknown").to_string()
+        let domain = explicit_domain.map(|d| d.to_string()).unwrap_or_else(|| {
+            if let Some(err) = &error {
+                if let Some(rest) = err.strip_prefix("outbound domain '") {
+                    rest.split('\'').next().unwrap_or("unknown").to_string()
+                } else {
+                    "unknown".to_string()
+                }
             } else {
                 "unknown".to_string()
             }
-        } else {
-            "unknown".to_string()
-        };
+        });
         (domain, format!("ref:{provider_id}#unknown"))
     };
 
@@ -354,7 +388,7 @@ fn log_request(
         duration_ms: duration_ms as u64,
         prompt_tokens: usage.prompt_tokens as u64,
         completion_tokens: usage.completion_tokens as u64,
-        failover_path: None,
+        failover_path: failover_path.map(|s| s.to_string()),
     });
 }
 
@@ -487,6 +521,7 @@ async fn handle_success(
     start: Instant,
     convert_path: bool,
     req_model: String,
+    failover_path: Option<&str>,
 ) -> Response {
     let streaming = is_stream_response(&resp);
 
@@ -504,6 +539,7 @@ async fn handle_success(
             start,
             convert_path,
             req_model,
+            failover_path,
         )
     } else {
         handle_success_non_streaming(
@@ -517,6 +553,7 @@ async fn handle_success(
             start,
             convert_path,
             req_model,
+            failover_path,
         )
         .await
     }
@@ -534,6 +571,7 @@ fn handle_success_streaming(
     start: Instant,
     convert_path: bool,
     req_model: String,
+    failover_path: Option<&str>,
 ) -> Response {
     let status = resp.status();
     let content_type = if convert_path {
@@ -552,6 +590,19 @@ fn handle_success_streaming(
     let model_owned = model.clone();
     let session_owned = session_id.map(|s| s.to_string());
     let db = svc.core.db().clone();
+
+    let (upstream_domain, key_ref) = if let Some(p) = tool
+        .parse::<ToolKind>()
+        .ok()
+        .and_then(|t| svc.core.db().get(t, route_id).ok().flatten())
+    {
+        let domain = extract_domain(p.base_url.as_deref().unwrap_or(""));
+        let key_opt = svc.core.secrets().get(&p.key_ref).ok();
+        (domain, key_fingerprint(&p, key_opt.as_deref()))
+    } else {
+        ("unknown".to_string(), format!("ref:{route_id}#unknown"))
+    };
+    let failover_path_owned = failover_path.map(|s| s.to_string());
 
     let body = if convert_path {
         // Pass upstream errors through: the converters surface them as
@@ -580,6 +631,9 @@ fn handle_success_streaming(
             session_owned,
             status,
             start,
+            key_ref,
+            upstream_domain,
+            failover_path_owned,
         )
     } else {
         make_tapped_streaming_body(
@@ -592,6 +646,9 @@ fn handle_success_streaming(
             session_owned,
             status,
             start,
+            key_ref,
+            upstream_domain,
+            failover_path_owned,
         )
     };
 
@@ -625,6 +682,7 @@ async fn handle_success_non_streaming(
     start: Instant,
     convert_path: bool,
     req_model: String,
+    failover_path: Option<&str>,
 ) -> Response {
     let status = resp.status();
     let content_type = resp
@@ -737,7 +795,7 @@ async fn handle_success_non_streaming(
     }
 
     let usage = Usage::from_json(&bytes);
-    log_request(
+    log_request_full(
         svc,
         session_id,
         endpoint,
@@ -748,6 +806,8 @@ async fn handle_success_non_streaming(
         usage,
         duration_ms,
         None,
+        None,
+        failover_path,
     );
     Response::builder()
         .status(status)
@@ -855,6 +915,7 @@ async fn failover_loop(
     failover_4xx: bool,
 ) -> Response {
     let mut last_err: Option<(StatusCode, String, Option<axum::http::HeaderValue>)> = None;
+    let mut failover_trajectory: Vec<serde_json::Value> = Vec::new();
     // Per-route body preparation is memoized by model override: adjacent
     // entries in a tier usually share the same override (static routing is
     // all-None), so failover retries must not re-run the full conversion.
@@ -882,7 +943,12 @@ async fn failover_loop(
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let target_domain = extract_domain(&base_url);
                 let err_msg = format!("outbound domain '{target_domain}' blocked by egress policy");
-                log_request(
+                failover_trajectory.push(serde_json::json!({
+                    "provider": route_id,
+                    "status": 403,
+                    "error": "xfade_egress_blocked"
+                }));
+                log_request_full(
                     svc,
                     session_id,
                     endpoint,
@@ -893,6 +959,8 @@ async fn failover_loop(
                     Usage::default(),
                     duration_ms,
                     Some(err_msg.clone()),
+                    Some(&target_domain),
+                    None,
                 );
                 svc.record_failure(route_id);
                 last_err = Some((
@@ -984,6 +1052,11 @@ async fn failover_loop(
             Ok(r) => r,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
+                failover_trajectory.push(serde_json::json!({
+                    "provider": route_id,
+                    "status": 502,
+                    "error": &e
+                }));
                 log_request(
                     svc,
                     session_id,
@@ -1034,6 +1107,11 @@ async fn failover_loop(
                     }
                     Err(e) => {
                         let duration_ms = start.elapsed().as_millis() as i64;
+                        failover_trajectory.push(serde_json::json!({
+                            "provider": route_id,
+                            "status": 502,
+                            "error": &e
+                        }));
                         log_request(
                             svc,
                             session_id,
@@ -1070,6 +1148,11 @@ async fn failover_loop(
                 let should_continue =
                     failover_4xx && qualifies_for_4xx_failover(StatusCode::BAD_REQUEST, &err_bytes);
                 if should_continue {
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": 400,
+                        "error": "model_rejection"
+                    }));
                     svc.record_failure(route_id);
                     last_err = Some((StatusCode::BAD_REQUEST, err_body.into_owned(), None));
                     continue;
@@ -1085,6 +1168,15 @@ async fn failover_loop(
 
         let status = resp.status();
         if status.is_success() || status.is_redirection() {
+            failover_trajectory.push(serde_json::json!({
+                "provider": route_id,
+                "status": status.as_u16(),
+            }));
+            let failover_path_json = if failover_trajectory.len() > 1 {
+                serde_json::to_string(&failover_trajectory).ok()
+            } else {
+                None
+            };
             return handle_success(
                 svc,
                 session_id,
@@ -1096,6 +1188,7 @@ async fn failover_loop(
                 start,
                 convert_path,
                 req_model.to_string(),
+                failover_path_json.as_deref(),
             )
             .await;
         }
@@ -1113,6 +1206,10 @@ async fn failover_loop(
         )
         .await;
         if should_continue {
+            failover_trajectory.push(serde_json::json!({
+                "provider": route_id,
+                "status": status.as_u16(),
+            }));
             // Preserve the upstream error body (e.g. 429 budget_exceeded)
             // so the client sees the real reason instead of a bare status
             // it can only retry blindly.
@@ -1385,6 +1482,9 @@ fn make_tapped_streaming_body<S>(
     session_id: Option<String>,
     status: StatusCode,
     start: Instant,
+    key_ref: String,
+    upstream_domain: String,
+    failover_path: Option<String>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -1419,6 +1519,9 @@ where
         status,
         start,
         done_logged: false,
+        key_ref,
+        upstream_domain,
+        failover_path,
     })
 }
 
@@ -1435,6 +1538,9 @@ fn make_converted_tapped_streaming_body<S>(
     session_id: Option<String>,
     status: StatusCode,
     start: Instant,
+    key_ref: String,
+    upstream_domain: String,
+    failover_path: Option<String>,
 ) -> Body
 where
     S: futures::Stream<Item = Bytes> + Send + 'static,
@@ -1462,6 +1568,9 @@ where
         status,
         start,
         done_logged: false,
+        key_ref,
+        upstream_domain,
+        failover_path,
     })
 }
 
@@ -1481,6 +1590,9 @@ struct TailLogStream {
     status: StatusCode,
     start: Instant,
     done_logged: bool,
+    key_ref: String,
+    upstream_domain: String,
+    failover_path: Option<String>,
 }
 
 impl TailLogStream {
@@ -1517,16 +1629,6 @@ impl TailLogStream {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let upstream_domain = if let Some(p) = self
-            .tool
-            .parse::<ToolKind>()
-            .ok()
-            .and_then(|t| self.db.get(t, &self.provider_id).ok().flatten())
-        {
-            extract_domain(p.base_url.as_deref().unwrap_or(""))
-        } else {
-            "unknown".to_string()
-        };
 
         let _ = self.db.insert_audit_log(&crate::store::db::AuditLog {
             id: 0,
@@ -1534,14 +1636,14 @@ impl TailLogStream {
             client_tool: self.tool.clone(),
             client_token_id: format!("token:{}", self.tool),
             provider_id: self.provider_id.clone(),
-            upstream_domain,
+            upstream_domain: self.upstream_domain.clone(),
             upstream_model: self.model.clone().unwrap_or_default(),
-            key_ref: format!("ref:{}#stream", self.provider_id),
+            key_ref: self.key_ref.clone(),
             status_code: self.status.as_u16(),
             duration_ms: duration_ms as u64,
             prompt_tokens: usage.prompt_tokens as u64,
             completion_tokens: usage.completion_tokens as u64,
-            failover_path: None,
+            failover_path: self.failover_path.clone(),
         });
     }
 }
@@ -2175,5 +2277,86 @@ data: [DONE]\n\n";
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].status_code, 403);
         assert_eq!(audit[0].upstream_domain, "evil.internal.corp");
+    }
+
+    #[tokio::test]
+    async fn failover_records_trajectory_in_audit_log() {
+        use crate::{store::secrets::MockStore, Core, Provider};
+        let temp = tempfile::tempdir().unwrap();
+        let core = Core::with_paths(
+            temp.path(),
+            temp.path(),
+            std::sync::Arc::new(MockStore::default()),
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"choices\":[],\"usage\":null}";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+        });
+
+        let p1 = Provider::new(
+            "evil",
+            ToolKind::ClaudeCode,
+            Some("https://evil.internal.corp/v1".into()),
+        );
+        let p2 = Provider::new(
+            "local",
+            ToolKind::ClaudeCode,
+            Some(format!("http://{addr}/v1")),
+        );
+        core.db().upsert(&p2).unwrap();
+
+        let svc = ProxyService::new(core);
+        let entries = vec![
+            crate::router::decision::RouteEntry {
+                route_id: "evil".into(),
+                model_override: None,
+                tier: crate::router::decision::Tier::Cloud,
+            },
+            crate::router::decision::RouteEntry {
+                route_id: "local".into(),
+                model_override: None,
+                tier: crate::router::decision::Tier::Local,
+            },
+        ];
+        let mut provider_map = std::collections::HashMap::new();
+        provider_map.insert("evil".to_string(), &p1);
+        provider_map.insert("local".to_string(), &p2);
+        let headers = HeaderMap::new();
+
+        let resp = failover_loop(
+            &svc,
+            None,
+            "POST",
+            &entries,
+            &provider_map,
+            "chat",
+            "chat",
+            None,
+            &headers,
+            b"{}",
+            "test-model",
+            Instant::now(),
+            false,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let audit = svc.core.recent_audit_logs(10, None).unwrap();
+        let success_log = audit.iter().find(|l| l.provider_id == "local").unwrap();
+        assert_eq!(success_log.status_code, 200);
+        assert!(success_log.failover_path.is_some());
+        let path_str = success_log.failover_path.as_ref().unwrap();
+        assert!(path_str.contains("evil"));
+        assert!(path_str.contains("403"));
+        assert!(path_str.contains("local"));
+        assert!(path_str.contains("200"));
     }
 }

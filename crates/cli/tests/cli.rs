@@ -1093,3 +1093,91 @@ fn egress_command_whitelist_and_policy() {
             "Egress policy set to 'registered'.",
         ));
 }
+
+#[test]
+fn e2e_visible_trust_audit_and_egress_lifecycle() {
+    let home = tempfile::tempdir().unwrap();
+
+    // 1. Initial status and doctor on empty home: Guarded
+    xfade(home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trust: GUARDED"));
+
+    xfade(home.path())
+        .args(["doctor", "--security"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GUARDED"));
+
+    // 2. Add provider with remote base URL
+    xfade(home.path())
+        .args([
+            "add",
+            "kimi",
+            "--tool",
+            "claude",
+            "--base-url",
+            "https://api.moonshot.cn/v1",
+            "--key",
+            "sk-secret1234567890abcdef",
+        ])
+        .assert()
+        .success();
+
+    // 3. Egress automatically includes api.moonshot.cn
+    xfade(home.path())
+        .args(["egress"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api.moonshot.cn"))
+        .stdout(predicate::str::contains("Policy Mode: registered"));
+
+    // 4. Insert an audit log record with key fingerprint and failover trajectory
+    let db = xfade_core::store::Db::open(&home.path().join(".xfade-data/xfade.db")).unwrap();
+    db.insert_audit_log(&xfade_core::store::db::AuditLog {
+        id: 0,
+        ts: 1700000000000,
+        client_tool: "claude".into(),
+        client_token_id: "token:claude".into(),
+        provider_id: "kimi".into(),
+        upstream_domain: "api.moonshot.cn".into(),
+        upstream_model: "kimi-k2.5".into(),
+        key_ref: "ref:kimi#sha256:7f9a1234".into(),
+        status_code: 200,
+        duration_ms: 180,
+        prompt_tokens: 42,
+        completion_tokens: 24,
+        failover_path: Some(
+            r#"[{"provider":"primary","status":502},{"provider":"kimi","status":200}]"#.into(),
+        ),
+    })
+    .unwrap();
+
+    // 5. Query audit table and export
+    xfade(home.path())
+        .args(["audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api.moonshot.cn"))
+        .stdout(predicate::str::contains("ref:kimi#sha256:7f9a1234"));
+
+    xfade(home.path())
+        .args(["audit", "--export", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"failover_path\": \"[{\\\"provider\\\":\\\"primary\\\",\\\"status\\\":502},{\\\"provider\\\":\\\"kimi\\\",\\\"status\\\":200}]\""));
+
+    // 6. Direct mode escape hatch makes trust state DIRECT
+    xfade(home.path())
+        .args(["use", "kimi", "--tool", "claude", "--direct"])
+        .assert()
+        .success();
+
+    xfade(home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trust: DIRECT"));
+}

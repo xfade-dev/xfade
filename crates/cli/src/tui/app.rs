@@ -60,6 +60,8 @@ pub struct App {
     pub spinner_tick: usize,
     /// Trust status of the environment
     pub trust: xfade_core::security::TrustState,
+    /// Timestamp of last trust state refresh (throttles expensive security scans)
+    pub last_trust_refresh: Instant,
     /// Switch-flash highlight deadline; cleared by [`tick`] once expired.
     pub flash_until: Option<Instant>,
     /// Open-animation deadline; the header fades in and the knob slides until
@@ -86,6 +88,7 @@ impl App {
             trust: core
                 .trust_state()
                 .unwrap_or(xfade_core::security::TrustState::Guarded),
+            last_trust_refresh: Instant::now(),
             flash_until: None,
             intro_until: None,
             user_interacted: false,
@@ -103,9 +106,12 @@ impl App {
     pub fn reload(&mut self, core: &Core) {
         let previous = self.selected_provider().map(|p| p.id.clone());
         self.providers = core.list(Some(self.tool)).unwrap_or_default();
-        self.trust = core
-            .trust_state()
-            .unwrap_or(xfade_core::security::TrustState::Guarded);
+        if self.last_trust_refresh.elapsed() >= std::time::Duration::from_secs(3) {
+            self.trust = core
+                .trust_state()
+                .unwrap_or(xfade_core::security::TrustState::Guarded);
+            self.last_trust_refresh = Instant::now();
+        }
         self.selected = self
             .providers
             .iter()
@@ -335,6 +341,7 @@ impl App {
                 self.message = Some(format!("Saved, but re-apply failed: {err}"));
             }
         }
+        self.last_trust_refresh = Instant::now() - std::time::Duration::from_secs(10);
         self.reload(core);
     }
 }

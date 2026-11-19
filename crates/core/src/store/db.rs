@@ -112,11 +112,29 @@ impl std::str::FromStr for EgressPolicy {
 /// Normalizes domain name by stripping protocol, path, port, and trailing slashes.
 pub fn normalize_domain(input: &str) -> String {
     let s = input.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let url_candidate = if !s.starts_with("http://") && !s.starts_with("https://") {
+        format!("http://{s}")
+    } else {
+        s.to_string()
+    };
+    if let Ok(url) = reqwest::Url::parse(&url_candidate) {
+        if let Some(host) = url.host_str() {
+            return host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
+        }
+    }
     let s = s
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
         .unwrap_or(s);
     let s = s.split('/').next().unwrap_or(s);
+    if s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            return s[1..end].trim().to_lowercase();
+        }
+    }
     let s = s.split(':').next().unwrap_or(s);
     s.trim().to_lowercase()
 }
@@ -2544,6 +2562,9 @@ mod tests {
         assert!(db.is_domain_allowed("localhost").unwrap());
         assert!(db.is_domain_allowed("127.0.0.1").unwrap());
         assert!(db.is_domain_allowed("127.0.0.1:8080").unwrap());
+        assert!(db.is_domain_allowed("http://[::1]:8080/v1").unwrap());
+        assert!(db.is_domain_allowed("[::1]").unwrap());
+        assert!(db.is_domain_allowed("::1").unwrap());
 
         // 3. Unregistered domain is blocked in Registered mode
         assert!(!db.is_domain_allowed("api.openai.com").unwrap());
