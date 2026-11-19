@@ -1018,19 +1018,40 @@ mod tests {
     async fn responses_and_messages_reach_correct_upstream_path() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
-        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
-        // target=messages so /v1/messages is passthrough (no conversion);
-        // /v1/responses is always passthrough regardless of target.
+        let core = test_core(
+            &dir,
+            &[("p_resp", &up.url(), "k1"), ("p_msg", &up.url(), "k2")],
+        );
+        let p_resp = core
+            .db()
+            .get(crate::models::ToolKind::Codex, "p_resp")
+            .unwrap()
+            .unwrap()
+            .with_protocol(crate::models::ProviderProtocol::Responses);
+        core.db().upsert(&p_resp).unwrap();
+        let p_msg = core
+            .db()
+            .get(crate::models::ToolKind::Codex, "p_msg")
+            .unwrap()
+            .unwrap()
+            .with_protocol(crate::models::ProviderProtocol::Messages);
+        core.db().upsert(&p_msg).unwrap();
+
+        // Route pointing to Responses provider -> /v1/responses reaches /v1/responses
         core.db()
-            .set_routes(&["yy".into()], None, "messages")
+            .set_routes(&["p_resp".into()], None, "responses")
             .unwrap();
-        let url = spawn_service(ProxyService::new(core)).await;
+        let url = spawn_service(ProxyService::new(core.clone())).await;
 
         up.respond_with(200, "{}");
         let (s1, _) = http_post_json(&url, "/v1/responses", "{}", "Bearer x").await;
         assert_eq!(s1, 200);
         assert_eq!(up.last_request().await.path, "/v1/responses");
 
+        // Route pointing to Messages provider -> /v1/messages reaches /v1/messages
+        core.db()
+            .set_routes(&["p_msg".into()], None, "messages")
+            .unwrap();
         up.respond_with(200, "{}");
         let (s2, _) = http_post_json(&url, "/v1/messages", "{}", "Bearer x").await;
         assert_eq!(s2, 200);

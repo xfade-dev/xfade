@@ -12,7 +12,7 @@
 use super::auth::ClientIdentity;
 use super::usage::Usage;
 use super::ProxyService;
-use crate::models::ToolKind;
+use crate::models::{Provider, ProviderProtocol, ToolKind};
 use crate::store::db::RequestLog;
 use axum::{
     body::{Body, Bytes},
@@ -407,6 +407,7 @@ struct ResolvedRoutes<'a> {
     failover_4xx: bool,
 }
 
+#[cfg(test)]
 /// Prepared request bodies for both paths (result of `prepare_bodies`).
 struct PreparedBodies {
     converted_body: Option<Vec<u8>>,
@@ -455,6 +456,7 @@ fn resolve_routes<'a>(
     })
 }
 
+#[cfg(test)]
 /// Prepare the request body for conversion or passthrough paths.
 /// Returns a `PreparedBodies` on success, or an error response.
 /// The returned `Vec<u8>` values are owned to avoid lifetime issues with temporary buffers.
@@ -508,6 +510,84 @@ fn prepare_bodies(
     })
 }
 
+/// Map client inbound endpoint string to its corresponding ProviderProtocol.
+pub fn endpoint_to_inbound_protocol(endpoint: &str) -> ProviderProtocol {
+    match endpoint {
+        "messages" | "/v1/messages" => ProviderProtocol::Messages,
+        "responses" | "/v1/responses" => ProviderProtocol::Responses,
+        _ => ProviderProtocol::Chat,
+    }
+}
+
+/// Prepare the request body and determine target endpoint for a specific provider.
+/// Resolves differences between client inbound protocol and provider outbound protocol.
+pub fn prepare_body_for_provider(
+    endpoint: &str,
+    provider: &Provider,
+    original_body: &[u8],
+    model_override: Option<&str>,
+) -> Result<(&'static str, Vec<u8>), Box<Response>> {
+    let inbound_proto = endpoint_to_inbound_protocol(endpoint);
+    let outbound_proto = provider.protocol;
+
+    let target_endpoint = match outbound_proto {
+        ProviderProtocol::Chat => "chat",
+        ProviderProtocol::Messages => "messages",
+        ProviderProtocol::Responses => "responses",
+    };
+
+    if inbound_proto == outbound_proto {
+        let transformed = transform_passthrough_body(endpoint, original_body, model_override)
+            .unwrap_or_else(|| original_body.to_vec());
+        return Ok((target_endpoint, transformed));
+    }
+
+    // Heterogeneous transcoding: Canonical Chat IR hub-and-spoke
+    let converted: crate::error::Result<Vec<u8>> = match (inbound_proto, outbound_proto) {
+        (ProviderProtocol::Messages, ProviderProtocol::Chat) => {
+            super::convert::request_anthropic_to_openai(original_body, model_override)
+                .map(|b| maybe_inject_stream_options("chat", &b).unwrap_or_else(|| b.to_vec()))
+        }
+        (ProviderProtocol::Messages, ProviderProtocol::Responses) => {
+            super::convert::request_anthropic_to_openai(original_body, None)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_responses(&chat_bytes, model_override)
+                })
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Responses, ProviderProtocol::Chat) => {
+            super::convert::request_responses_to_chat(original_body, model_override)
+                .map(|b| maybe_inject_stream_options("chat", &b).unwrap_or_else(|| b.to_vec()))
+        }
+        (ProviderProtocol::Responses, ProviderProtocol::Messages) => {
+            super::convert::request_responses_to_chat(original_body, None)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_anthropic(&chat_bytes, model_override)
+                })
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Chat, ProviderProtocol::Messages) => {
+            super::convert::request_chat_to_anthropic(original_body, model_override)
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Chat, ProviderProtocol::Responses) => {
+            super::convert::request_chat_to_responses(original_body, model_override)
+                .map(|b| b.to_vec())
+        }
+        _ => unreachable!(),
+    };
+
+    match converted {
+        Ok(body) => Ok((target_endpoint, body)),
+        Err(e) => Err(Box::new(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(format!("convert request: {e}").into())
+                .unwrap(),
+        )),
+    }
+}
+
 /// Handle a successful upstream response. Returns the response to send to the client.
 /// Callers (the failover loop) guarantee a success/redirection status.
 async fn handle_success(
@@ -519,7 +599,8 @@ async fn handle_success(
     endpoint: &str,
     model: Option<String>,
     start: Instant,
-    convert_path: bool,
+    inbound_proto: ProviderProtocol,
+    outbound_proto: ProviderProtocol,
     req_model: String,
     failover_path: Option<&str>,
 ) -> Response {
@@ -537,7 +618,8 @@ async fn handle_success(
             endpoint,
             model,
             start,
-            convert_path,
+            inbound_proto,
+            outbound_proto,
             req_model,
             failover_path,
         )
@@ -551,7 +633,8 @@ async fn handle_success(
             endpoint,
             model,
             start,
-            convert_path,
+            inbound_proto,
+            outbound_proto,
             req_model,
             failover_path,
         )
@@ -569,12 +652,14 @@ fn handle_success_streaming(
     endpoint: &str,
     model: Option<String>,
     start: Instant,
-    convert_path: bool,
+    inbound_proto: ProviderProtocol,
+    outbound_proto: ProviderProtocol,
     req_model: String,
     failover_path: Option<&str>,
 ) -> Response {
     let status = resp.status();
-    let content_type = if convert_path {
+    let is_convert = inbound_proto != outbound_proto;
+    let content_type = if is_convert {
         "text/event-stream".to_string()
     } else {
         resp.headers()
@@ -604,53 +689,82 @@ fn handle_success_streaming(
     };
     let failover_path_owned = failover_path.map(|s| s.to_string());
 
-    let body = if convert_path {
-        // Pass upstream errors through: the converters surface them as
-        // protocol-level error events (Anthropic `error` / `response.failed`)
-        // instead of masking a truncated stream as success.
-        let upstream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-        let converted: std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send>> =
-            if endpoint == "responses" {
-                Box::pin(super::convert::stream_chat_to_responses(
-                    upstream, req_model,
-                ))
-            } else {
-                Box::pin(super::convert::stream_openai_to_anthropic(
-                    upstream, req_model,
-                ))
-            };
-        make_converted_tapped_streaming_body(
-            converted,
-            db,
-            endpoint_owned,
-            model_owned,
-            provider_id_owned,
-            tool_owned,
-            session_owned,
-            status,
-            start,
-            key_ref,
-            upstream_domain,
-            failover_path_owned,
-        )
-    } else {
-        make_tapped_streaming_body(
-            resp.bytes_stream(),
-            db,
-            endpoint_owned,
-            model_owned,
-            provider_id_owned,
-            tool_owned,
-            session_owned,
-            status,
-            start,
-            key_ref,
-            upstream_domain,
-            failover_path_owned,
-        )
-    };
+    let body =
+        if is_convert {
+            // Pass upstream errors through: the converters surface them as
+            // protocol-level error events (Anthropic `error` / `response.failed`)
+            // instead of masking a truncated stream as success.
+            let upstream = resp
+                .bytes_stream()
+                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+
+            // Step 1: Outbound -> Canonical Chat IR stream
+            let chat_stream: std::pin::Pin<
+                Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>,
+            > =
+                match outbound_proto {
+                    ProviderProtocol::Chat => Box::pin(upstream),
+                    ProviderProtocol::Messages => Box::pin(
+                        super::convert::stream_anthropic_to_chat(upstream, req_model.clone()),
+                    ),
+                    ProviderProtocol::Responses => Box::pin(
+                        super::convert::stream_responses_to_chat(upstream, req_model.clone()),
+                    ),
+                };
+
+            // Step 2: Canonical Chat IR stream -> Inbound stream
+            let converted: std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send>> =
+                match inbound_proto {
+                    ProviderProtocol::Chat => Box::pin(chat_stream.map(|r| match r {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let err_json = serde_json::json!({
+                                "error": {
+                                    "message": format!("upstream stream error: {e}"),
+                                    "type": "upstream_error"
+                                }
+                            });
+                            Bytes::from(format!("data: {err_json}\n\ndata: [DONE]\n\n"))
+                        }
+                    })),
+                    ProviderProtocol::Messages => Box::pin(
+                        super::convert::stream_openai_to_anthropic(chat_stream, req_model),
+                    ),
+                    ProviderProtocol::Responses => Box::pin(
+                        super::convert::stream_chat_to_responses(chat_stream, req_model),
+                    ),
+                };
+
+            make_converted_tapped_streaming_body(
+                converted,
+                db,
+                endpoint_owned,
+                model_owned,
+                provider_id_owned,
+                tool_owned,
+                session_owned,
+                status,
+                start,
+                key_ref,
+                upstream_domain,
+                failover_path_owned,
+            )
+        } else {
+            make_tapped_streaming_body(
+                resp.bytes_stream(),
+                db,
+                endpoint_owned,
+                model_owned,
+                provider_id_owned,
+                tool_owned,
+                session_owned,
+                status,
+                start,
+                key_ref,
+                upstream_domain,
+                failover_path_owned,
+            )
+        };
 
     let mut resp_builder = Response::builder().status(status);
     if let Some(hv) = resp_builder.headers_mut() {
@@ -680,7 +794,8 @@ async fn handle_success_non_streaming(
     endpoint: &str,
     model: Option<String>,
     start: Instant,
-    convert_path: bool,
+    inbound_proto: ProviderProtocol,
+    outbound_proto: ProviderProtocol,
     req_model: String,
     failover_path: Option<&str>,
 ) -> Response {
@@ -746,15 +861,35 @@ async fn handle_success_non_streaming(
             .unwrap();
     }
 
-    if convert_path {
-        let converted = if endpoint == "responses" {
-            super::convert::response_chat_to_responses(&bytes, &req_model)
-        } else {
-            super::convert::response_openai_to_anthropic(&bytes, &req_model)
+    if inbound_proto != outbound_proto {
+        // Step 1: Outbound -> Canonical Chat IR
+        let chat_res: crate::error::Result<Bytes> = match outbound_proto {
+            ProviderProtocol::Chat => Ok(bytes),
+            ProviderProtocol::Messages => {
+                super::convert::response_anthropic_to_chat(&bytes, &req_model)
+            }
+            ProviderProtocol::Responses => {
+                super::convert::response_responses_to_chat(&bytes, &req_model)
+            }
         };
-        match converted {
-            Ok(anthropic_bytes) => {
-                let usage = Usage::from_json(&anthropic_bytes);
+
+        // Step 2: Canonical Chat IR -> Inbound
+        let final_res: crate::error::Result<Bytes> = match chat_res {
+            Ok(chat_bytes) => match inbound_proto {
+                ProviderProtocol::Chat => Ok(chat_bytes),
+                ProviderProtocol::Messages => {
+                    super::convert::response_openai_to_anthropic(&chat_bytes, &req_model)
+                }
+                ProviderProtocol::Responses => {
+                    super::convert::response_chat_to_responses(&chat_bytes, &req_model)
+                }
+            },
+            Err(e) => Err(e),
+        };
+
+        match final_res {
+            Ok(converted_bytes) => {
+                let usage = Usage::from_json(&converted_bytes);
                 log_request(
                     svc,
                     session_id,
@@ -770,7 +905,7 @@ async fn handle_success_non_streaming(
                 return Response::builder()
                     .status(status)
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(anthropic_bytes))
+                    .body(Body::from(converted_bytes))
                     .unwrap();
             }
             Err(e) => {
@@ -897,6 +1032,9 @@ fn session_failed(svc: &ProxyService, session_id: Option<&str>) {
     }
 }
 
+type BodiesCache =
+    std::collections::HashMap<(ProviderProtocol, Option<String>), (&'static str, Vec<u8>)>;
+
 /// Execute the failover loop: try each route in order, skipping open circuits.
 /// Returns the final response (success or last error).
 async fn failover_loop(
@@ -906,7 +1044,7 @@ async fn failover_loop(
     entries: &[crate::router::decision::RouteEntry],
     provider_map: &std::collections::HashMap<String, &crate::models::Provider>,
     endpoint: &str,
-    target_protocol: &str,
+    _target_protocol: &str,
     model: Option<String>,
     headers: &HeaderMap,
     original_body: &[u8],
@@ -914,13 +1052,12 @@ async fn failover_loop(
     start: Instant,
     failover_4xx: bool,
 ) -> Response {
+    let inbound_proto = endpoint_to_inbound_protocol(endpoint);
     let mut last_err: Option<(StatusCode, String, Option<axum::http::HeaderValue>)> = None;
     let mut failover_trajectory: Vec<serde_json::Value> = Vec::new();
-    // Per-route body preparation is memoized by model override: adjacent
-    // entries in a tier usually share the same override (static routing is
-    // all-None), so failover retries must not re-run the full conversion.
-    let mut bodies_cache: std::collections::HashMap<Option<String>, PreparedBodies> =
-        std::collections::HashMap::new();
+    // Per-route body preparation is memoized by (protocol, model_override): adjacent
+    // entries sharing protocol and override do not re-run full conversion.
+    let mut bodies_cache: BodiesCache = std::collections::HashMap::new();
 
     for entry in entries {
         let route_id = entry.route_id.as_str();
@@ -931,6 +1068,25 @@ async fn failover_loop(
         let provider = match provider_map.get(route_id) {
             Some(p) => *p,
             None => continue,
+        };
+
+        let effective_provider;
+        let provider = if provider.protocol == ProviderProtocol::Chat {
+            if _target_protocol == "messages" || _target_protocol == "anthropic" {
+                effective_provider = (*provider)
+                    .clone()
+                    .with_protocol(ProviderProtocol::Messages);
+                &effective_provider
+            } else if _target_protocol == "responses" || _target_protocol == "codex" {
+                effective_provider = (*provider)
+                    .clone()
+                    .with_protocol(ProviderProtocol::Responses);
+                &effective_provider
+            } else {
+                provider
+            }
+        } else {
+            provider
         };
 
         let base_url = match &provider.base_url {
@@ -980,16 +1136,15 @@ async fn failover_loop(
             svc.core.secrets().get(&provider.key_ref).ok()
         };
 
-        // Per-route body preparation: each entry may carry its own model
-        // override (Smart Fader per-tier models). The convert path is fixed
-        // by (endpoint, target_protocol) — only the override differs — so
-        // bodies are cached per override value.
-        let bodies = match bodies_cache.get(&entry.model_override) {
-            Some(b) => b,
+        // Per-route body preparation: each entry may carry its own protocol and model
+        // override (Smart Fader per-tier models). Bodies are cached per (protocol, override).
+        let cache_key = (provider.protocol, entry.model_override.clone());
+        let (upstream_endpoint, sending_body_ref) = match bodies_cache.get(&cache_key) {
+            Some((ep, b)) => (*ep, b.as_slice()),
             None => {
-                let prepared = match prepare_bodies(
+                let prepared = match prepare_body_for_provider(
                     endpoint,
-                    target_protocol,
+                    provider,
                     original_body,
                     entry.model_override.as_deref(),
                 ) {
@@ -999,35 +1154,21 @@ async fn failover_loop(
                         return *resp;
                     }
                 };
-                bodies_cache
-                    .entry(entry.model_override.clone())
-                    .or_insert(prepared)
+                let (cached_ep, cached_b) = bodies_cache.entry(cache_key).or_insert(prepared);
+                (*cached_ep, cached_b.as_slice())
             }
         };
-        let PreparedBodies {
-            converted_body: conv_body,
-            passthrough_body: passthru_body,
-            convert_path,
-        } = bodies;
-        let convert_path = *convert_path;
-
-        let out_body: &[u8] = if convert_path {
-            conv_body.as_deref().unwrap_or(original_body)
-        } else {
-            passthru_body.as_deref().unwrap_or(original_body)
-        };
-        let upstream_endpoint = if convert_path { "chat" } else { endpoint };
 
         // When target endpoint is Anthropic (/v1/messages) or target protocol is Anthropic,
         // run cache_injector::inject_cache_control on the payload before sending if it's JSON.
         let is_anthropic_target = upstream_endpoint == "messages"
             || upstream_endpoint == "/v1/messages"
-            || target_protocol == "messages"
-            || target_protocol == "anthropic";
+            || provider.protocol == ProviderProtocol::Messages;
 
         let mut injected_body_vec: Option<Vec<u8>> = None;
         if is_anthropic_target {
-            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(out_body) {
+            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(sending_body_ref)
+            {
                 let report = super::cache_injector::inject_cache_control(&mut json_val, 4);
                 if report.injected_breakpoints > 0 {
                     if let Ok(bytes) = serde_json::to_vec(&json_val) {
@@ -1036,7 +1177,7 @@ async fn failover_loop(
                 }
             }
         }
-        let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(out_body);
+        let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(sending_body_ref);
 
         let mut resp = match try_forward(
             &svc.client,
@@ -1154,14 +1295,30 @@ async fn failover_loop(
                         "error": "model_rejection"
                     }));
                     svc.record_failure(route_id);
-                    last_err = Some((StatusCode::BAD_REQUEST, err_body.into_owned(), None));
+                    let transcoded = super::convert::transcode_error_body(
+                        &err_bytes,
+                        provider.protocol,
+                        inbound_proto,
+                    );
+                    let text = String::from_utf8_lossy(&transcoded).to_string();
+                    last_err = Some((StatusCode::BAD_REQUEST, text, None));
                     continue;
                 }
                 // Release in-flight probe reservation so HalfOpen is not permanently blocked
                 svc.circuit_breaker.release_probe(route_id);
+                let out_bytes = if inbound_proto != provider.protocol {
+                    super::convert::transcode_error_body(
+                        &err_bytes,
+                        provider.protocol,
+                        inbound_proto,
+                    )
+                } else {
+                    err_bytes.to_vec()
+                };
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from(err_bytes))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(out_bytes))
                     .unwrap();
             }
         }
@@ -1186,7 +1343,8 @@ async fn failover_loop(
                 endpoint,
                 model,
                 start,
-                convert_path,
+                inbound_proto,
+                provider.protocol,
                 req_model.to_string(),
                 failover_path_json.as_deref(),
             )
@@ -1211,12 +1369,14 @@ async fn failover_loop(
                 "status": status.as_u16(),
             }));
             // Preserve the upstream error body (e.g. 429 budget_exceeded)
-            // so the client sees the real reason instead of a bare status
-            // it can only retry blindly.
-            let text = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
-                Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                Err(_) => String::new(),
+            // transcoded to client inbound protocol so the client understands the error.
+            let raw_bytes = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => Bytes::new(),
             };
+            let transcoded =
+                super::convert::transcode_error_body(&raw_bytes, provider.protocol, inbound_proto);
+            let text = String::from_utf8_lossy(&transcoded).to_string();
             last_err = Some((status, text, retry_after));
             continue;
         }
@@ -1225,6 +1385,21 @@ async fn failover_loop(
             svc.record_failure(route_id);
         } else {
             svc.circuit_breaker.release_probe(route_id);
+        }
+        if inbound_proto != provider.protocol {
+            let (parts, body) = err_resp.into_parts();
+            let raw_bytes = axum::body::to_bytes(body, 1024 * 1024)
+                .await
+                .unwrap_or_default();
+            let transcoded =
+                super::convert::transcode_error_body(&raw_bytes, provider.protocol, inbound_proto);
+            let mut builder = Response::builder().status(parts.status);
+            if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+            } else {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            }
+            return builder.body(Body::from(transcoded)).unwrap();
         }
         return err_resp;
     }
@@ -1236,6 +1411,9 @@ async fn failover_loop(
             let mut builder = Response::builder().status(status);
             if let Some(v) = retry_after {
                 builder = builder.header(axum::http::header::RETRY_AFTER, v);
+            }
+            if text.starts_with('{') {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
             }
             builder.body(text.into()).unwrap()
         }
@@ -2358,5 +2536,44 @@ data: [DONE]\n\n";
         assert!(path_str.contains("403"));
         assert!(path_str.contains("local"));
         assert!(path_str.contains("200"));
+    }
+
+    #[test]
+    fn test_prepare_body_for_heterogeneous_providers() {
+        let client_endpoint = "messages"; // Claude client
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Upstream 1: Anthropic Native -> Passthrough
+        let p_native = crate::models::Provider::new("p1", ToolKind::ClaudeCode, None)
+            .with_protocol(crate::models::ProviderProtocol::Messages);
+        let (ep1, body1) =
+            prepare_body_for_provider(client_endpoint, &p_native, body, None).unwrap();
+        assert_eq!(ep1, "messages");
+        let val1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert!(val1.get("messages").is_some());
+
+        // Upstream 2: OpenAI Chat -> Convert to Chat
+        let p_chat = crate::models::Provider::new(
+            "p2",
+            ToolKind::ClaudeCode,
+            Some("https://api.openai.com".into()),
+        )
+        .with_protocol(crate::models::ProviderProtocol::Chat);
+        let (ep2, body2) = prepare_body_for_provider(client_endpoint, &p_chat, body, None).unwrap();
+        assert_eq!(ep2, "chat");
+        let val2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert!(val2.get("messages").is_some());
+
+        // Upstream 3: OpenAI Responses -> Convert to Responses
+        let p_resp = crate::models::Provider::new(
+            "p3",
+            ToolKind::Codex,
+            Some("https://api.openai.com".into()),
+        )
+        .with_protocol(crate::models::ProviderProtocol::Responses);
+        let (ep3, body3) = prepare_body_for_provider(client_endpoint, &p_resp, body, None).unwrap();
+        assert_eq!(ep3, "responses");
+        let val3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
+        assert!(val3.get("input").is_some());
     }
 }
