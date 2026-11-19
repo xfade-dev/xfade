@@ -1181,3 +1181,33 @@ fn e2e_visible_trust_audit_and_egress_lifecycle() {
         .success()
         .stdout(predicate::str::contains("trust: DIRECT"));
 }
+
+#[test]
+fn cli_add_and_list_with_explicit_protocol() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Add provider with explicit responses protocol
+    xfade(home.path())
+        .args([
+            "add",
+            "codex-upstream",
+            "--tool",
+            "codex",
+            "--base-url",
+            "https://api.openai.com/v1",
+            "--key",
+            "sk-test",
+            "--protocol",
+            "responses",
+        ])
+        .assert()
+        .success();
+
+    // List and check protocol column
+    xfade(home.path())
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("responses"))
+        .stdout(predicate::str::contains("codex-upstream"));
+}

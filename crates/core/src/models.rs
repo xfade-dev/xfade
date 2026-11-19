@@ -211,11 +211,26 @@ mod tests {
 
     #[test]
     fn provider_protocol_serde_and_from_str() {
-        assert_eq!("chat".parse::<ProviderProtocol>().unwrap(), ProviderProtocol::Chat);
-        assert_eq!("messages".parse::<ProviderProtocol>().unwrap(), ProviderProtocol::Messages);
-        assert_eq!("anthropic".parse::<ProviderProtocol>().unwrap(), ProviderProtocol::Messages);
-        assert_eq!("responses".parse::<ProviderProtocol>().unwrap(), ProviderProtocol::Responses);
-        assert_eq!("codex".parse::<ProviderProtocol>().unwrap(), ProviderProtocol::Responses);
+        assert_eq!(
+            "chat".parse::<ProviderProtocol>().unwrap(),
+            ProviderProtocol::Chat
+        );
+        assert_eq!(
+            "messages".parse::<ProviderProtocol>().unwrap(),
+            ProviderProtocol::Messages
+        );
+        assert_eq!(
+            "anthropic".parse::<ProviderProtocol>().unwrap(),
+            ProviderProtocol::Messages
+        );
+        assert_eq!(
+            "responses".parse::<ProviderProtocol>().unwrap(),
+            ProviderProtocol::Responses
+        );
+        assert_eq!(
+            "codex".parse::<ProviderProtocol>().unwrap(),
+            ProviderProtocol::Responses
+        );
     }
 
     #[test]
@@ -223,10 +238,18 @@ mod tests {
         let p_claude = Provider::new("official", ToolKind::ClaudeCode, None);
         assert_eq!(p_claude.protocol, ProviderProtocol::Messages);
 
-        let p_anthropic = Provider::new("anthropic-custom", ToolKind::ClaudeCode, Some("https://api.anthropic.com".into()));
+        let p_anthropic = Provider::new(
+            "anthropic-custom",
+            ToolKind::ClaudeCode,
+            Some("https://api.anthropic.com".into()),
+        );
         assert_eq!(p_anthropic.protocol, ProviderProtocol::Messages);
 
-        let p_chat = Provider::new("deepseek", ToolKind::ClaudeCode, Some("https://api.deepseek.com".into()));
+        let p_chat = Provider::new(
+            "deepseek",
+            ToolKind::ClaudeCode,
+            Some("https://api.deepseek.com".into()),
+        );
         assert_eq!(p_chat.protocol, ProviderProtocol::Chat);
     }
 }

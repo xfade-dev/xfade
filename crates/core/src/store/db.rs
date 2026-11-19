@@ -1696,7 +1696,10 @@ mod tests {
         let p_tp = db.get(ToolKind::ClaudeCode, "thirdparty").unwrap().unwrap();
         assert_eq!(p_tp.protocol, ProviderProtocol::Chat);
 
-        let p_ap = db.get(ToolKind::ClaudeCode, "anthropic_proxy").unwrap().unwrap();
+        let p_ap = db
+            .get(ToolKind::ClaudeCode, "anthropic_proxy")
+            .unwrap()
+            .unwrap();
         assert_eq!(p_ap.protocol, ProviderProtocol::Messages);
     }
 

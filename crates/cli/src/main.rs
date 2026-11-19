@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use xfade_core::proxy::circuit_breaker::CircuitState;
 use xfade_core::proxy::ProxyService;
 use xfade_core::store::db::StatsGroupBy;
-use xfade_core::{presets::presets_for, Config, Core, CoreError, Provider, ToolKind};
+use xfade_core::{
+    presets::presets_for, Config, Core, CoreError, Provider, ProviderProtocol, ToolKind,
+};
 
 mod daemon;
 mod tui;
@@ -38,6 +40,9 @@ enum Cmd {
         /// Force official login (ignore the global base_url)
         #[arg(long)]
         official: bool,
+        /// Upstream protocol format (chat, messages, or responses)
+        #[arg(long)]
+        protocol: Option<ProviderProtocol>,
         /// Claude Code only: model for the `opus` slot (ANTHROPIC_DEFAULT_OPUS_MODEL)
         #[arg(long)]
         opus_model: Option<String>,
@@ -475,6 +480,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             name,
             base_url,
             key,
+            protocol,
             sets,
             official,
             opus_model,
@@ -485,6 +491,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             name,
             base_url,
             key,
+            protocol,
             sets,
             official,
             PerSlotModels {
@@ -1761,11 +1768,13 @@ fn cmd_handover(copy: bool, raw: bool) -> Result<(), CoreError> {
 /// Interactive-mode decision: skip interactivity once NAME (positional) is provided.
 /// NAME present + --base-url absent => official provider (base_url=None), no key needed;
 /// NAME absent => interactive: choose a preset or custom.
+#[allow(clippy::too_many_arguments)]
 fn cmd_add(
     tool: Option<ToolKind>,
     name: Option<String>,
     base_url: Option<String>,
     key: Option<String>,
+    protocol: Option<ProviderProtocol>,
     sets: Vec<(String, String)>,
     official: bool,
     slots: PerSlotModels,
@@ -1872,6 +1881,9 @@ fn cmd_add(
     }
 
     let mut p = Provider::new(&name, tool, base_url);
+    if let Some(proto) = protocol {
+        p.protocol = proto;
+    }
     p.extra = extra;
     let official = p.is_official();
     core.add_provider(p, key.as_deref())?;
@@ -2231,10 +2243,11 @@ fn print_table(list: &[Provider]) {
     for p in list {
         let mark = if p.is_active { "*" } else { " " };
         println!(
-            "{} {:<10} {:<16} {}",
+            "{} {:<10} {:<16} {:<10} {}",
             mark,
             p.tool.as_str(),
             p.id,
+            p.protocol.as_str(),
             p.base_url.as_deref().unwrap_or("(official)")
         );
     }
