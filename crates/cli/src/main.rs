@@ -100,6 +100,11 @@ enum Cmd {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Manage outbound egress whitelist and SSRF guard policy
+    Egress {
+        #[command(subcommand)]
+        cmd: Option<EgressCmd>,
+    },
     /// Edit a provider
     Edit {
         name: String,
@@ -334,6 +339,27 @@ enum BackupCmd {
         #[arg(long)]
         tool: ToolKind,
         file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum EgressCmd {
+    /// List current egress policy and permitted outbound domains
+    List,
+    /// Add a domain or host to the egress whitelist
+    Add {
+        /// Outbound domain to allow (e.g. api.example.com)
+        domain: String,
+    },
+    /// Remove a domain from the egress whitelist
+    Remove {
+        /// Outbound domain to remove
+        domain: String,
+    },
+    /// Set egress policy mode (registered or unrestricted)
+    Policy {
+        /// Mode: 'registered' (only registered provider endpoints and whitelist) or 'unrestricted'
+        mode: String,
     },
 }
 
@@ -591,6 +617,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         } => {
             let core = build_core()?;
             cmd_audit(&core, tool, limit, export, &format)?;
+            Ok(())
+        }
+        Cmd::Egress { cmd } => {
+            let core = build_core()?;
+            cmd_egress(&core, cmd)?;
             Ok(())
         }
         Cmd::Rm { name, tool } => {
@@ -1501,6 +1532,74 @@ fn cmd_doctor(core: &Core, fix: bool) -> Result<(), CoreError> {
         println!("Hint: Run `xfade doctor --security --fix` to automatically remediate permissions and sanitize configs.");
     }
 
+    Ok(())
+}
+
+fn cmd_egress(core: &Core, cmd: Option<EgressCmd>) -> Result<(), CoreError> {
+    match cmd {
+        None | Some(EgressCmd::List) => {
+            let policy = core.get_egress_policy()?;
+            let custom_domains = core.list_egress_domains()?;
+            let providers = core.list(None)?;
+            let mut registered_domains: Vec<String> = providers
+                .into_iter()
+                .filter_map(|p| p.base_url)
+                .map(|u| xfade_core::store::db::normalize_domain(&u))
+                .filter(|d| !d.is_empty())
+                .collect();
+            registered_domains.sort();
+            registered_domains.dedup();
+
+            println!("=== xfade Outbound Egress Policy ===");
+            println!("Policy Mode: {policy}");
+            println!();
+
+            println!("Registered Provider Domains (automatic):");
+            if registered_domains.is_empty() {
+                println!("  (none)");
+            } else {
+                for d in &registered_domains {
+                    println!("  - {d}");
+                }
+            }
+            println!();
+
+            println!("Custom Allowed Domains (whitelist):");
+            if custom_domains.is_empty() {
+                println!("  (none)");
+            } else {
+                for d in &custom_domains {
+                    println!("  - {d}");
+                }
+            }
+        }
+        Some(EgressCmd::Add { domain }) => {
+            let norm = xfade_core::store::db::normalize_domain(&domain);
+            if norm.is_empty() {
+                println!("Invalid domain: '{domain}'");
+                return Ok(());
+            }
+            core.add_egress_domain(&norm)?;
+            println!("Added '{norm}' to egress whitelist.");
+        }
+        Some(EgressCmd::Remove { domain }) => {
+            let norm = xfade_core::store::db::normalize_domain(&domain);
+            if core.remove_egress_domain(&norm)? {
+                println!("Removed '{norm}' from egress whitelist.");
+            } else {
+                println!("Domain '{norm}' was not found in egress whitelist.");
+            }
+        }
+        Some(EgressCmd::Policy { mode }) => {
+            let policy: xfade_core::store::db::EgressPolicy =
+                mode.parse().map_err(|e| CoreError::ConfigParse {
+                    path: "egress_policy".into(),
+                    msg: e,
+                })?;
+            core.set_egress_policy(policy)?;
+            println!("Egress policy set to '{policy}'.");
+        }
+    }
     Ok(())
 }
 

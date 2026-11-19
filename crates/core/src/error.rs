@@ -41,6 +41,9 @@ pub enum CoreError {
     #[error("port {0} is occupied by another non-xfade process")]
     PortConflict(u16),
 
+    #[error("outbound domain '{0}' blocked by egress policy (not in whitelist)")]
+    EgressBlocked(String),
+
     #[error("proxy error: {0}")]
     Proxy(String),
 }

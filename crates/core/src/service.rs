@@ -187,6 +187,30 @@ impl Core {
         self.db.export_audit_logs(since_ts)
     }
 
+    pub fn get_egress_policy(&self) -> Result<crate::store::db::EgressPolicy> {
+        self.db.get_egress_policy()
+    }
+
+    pub fn set_egress_policy(&self, policy: crate::store::db::EgressPolicy) -> Result<()> {
+        self.db.set_egress_policy(policy)
+    }
+
+    pub fn add_egress_domain(&self, domain: &str) -> Result<()> {
+        self.db.add_egress_domain(domain)
+    }
+
+    pub fn remove_egress_domain(&self, domain: &str) -> Result<bool> {
+        self.db.remove_egress_domain(domain)
+    }
+
+    pub fn list_egress_domains(&self) -> Result<Vec<String>> {
+        self.db.list_egress_domains()
+    }
+
+    pub fn is_domain_allowed(&self, domain: &str) -> Result<bool> {
+        self.db.is_domain_allowed(domain)
+    }
+
     fn adapter(&self, tool: ToolKind) -> Box<dyn ToolAdapter> {
         adapter_for(tool, &self.home)
     }

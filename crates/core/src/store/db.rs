@@ -81,6 +81,46 @@ pub struct HandoverRow {
     pub injected_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EgressPolicy {
+    Registered,
+    Unrestricted,
+}
+
+impl std::fmt::Display for EgressPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Registered => write!(f, "registered"),
+            Self::Unrestricted => write!(f, "unrestricted"),
+        }
+    }
+}
+
+impl std::str::FromStr for EgressPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "registered" => Ok(EgressPolicy::Registered),
+            "unrestricted" | "all" => Ok(EgressPolicy::Unrestricted),
+            other => Err(format!(
+                "unknown egress policy '{other}', expected 'registered' or 'unrestricted'"
+            )),
+        }
+    }
+}
+
+/// Normalizes domain name by stripping protocol, path, port, and trailing slashes.
+pub fn normalize_domain(input: &str) -> String {
+    let s = input.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s);
+    let s = s.split(':').next().unwrap_or(s);
+    s.trim().to_lowercase()
+}
+
 /// Stats aggregation dimension.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum StatsGroupBy {
@@ -264,7 +304,16 @@ impl Database {
                 completion_tokens INTEGER DEFAULT 0,
                 failover_path TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);",
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);
+            CREATE TABLE IF NOT EXISTS egress_whitelist (
+                domain TEXT PRIMARY KEY,
+                created_at_secs INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS egress_policy (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                policy TEXT NOT NULL DEFAULT 'registered'
+            );
+            INSERT OR IGNORE INTO egress_policy (id, policy) VALUES (1, 'registered');",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -1110,6 +1159,104 @@ impl Database {
             });
         }
         Ok(res)
+    }
+
+    // ── Egress whitelist & policy ─────────────────────────────────────────
+
+    pub fn get_egress_policy(&self) -> Result<EgressPolicy> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT policy FROM egress_policy WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let s: String = row.get(0)?;
+            Ok(s.parse().unwrap_or(EgressPolicy::Registered))
+        } else {
+            Ok(EgressPolicy::Registered)
+        }
+    }
+
+    pub fn set_egress_policy(&self, policy: EgressPolicy) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO egress_policy (id, policy) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET policy = excluded.policy",
+            params![policy.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_egress_domain(&self, domain: &str) -> Result<()> {
+        let norm = normalize_domain(domain);
+        if norm.is_empty() {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO egress_whitelist (domain, created_at_secs) VALUES (?1, ?2)",
+            params![norm, now as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_egress_domain(&self, domain: &str) -> Result<bool> {
+        let norm = normalize_domain(domain);
+        let conn = self.conn();
+        let changed = conn.execute(
+            "DELETE FROM egress_whitelist WHERE domain = ?1",
+            params![norm],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_egress_domains(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT domain FROM egress_whitelist ORDER BY domain")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    pub fn is_domain_allowed(&self, domain: &str) -> Result<bool> {
+        if self.get_egress_policy()? == EgressPolicy::Unrestricted {
+            return Ok(true);
+        }
+        let norm = normalize_domain(domain);
+        if norm.is_empty()
+            || norm == "127.0.0.1"
+            || norm == "localhost"
+            || norm == "::1"
+            || norm.starts_with("127.")
+        {
+            return Ok(true);
+        }
+
+        let conn = self.conn();
+        // 1. Check custom whitelist table
+        let mut stmt = conn.prepare("SELECT 1 FROM egress_whitelist WHERE domain = ?1")?;
+        let mut rows = stmt.query(params![norm])?;
+        if rows.next()?.is_some() {
+            return Ok(true);
+        }
+
+        // 2. Check registered provider domains
+        let mut stmt = conn.prepare("SELECT base_url FROM providers WHERE base_url IS NOT NULL")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let url_str: String = row.get(0)?;
+            let p_domain = normalize_domain(&url_str);
+            if p_domain == norm {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     // ── Sessions & handovers ──────────────────────────────────────────────
@@ -2384,5 +2531,56 @@ mod tests {
         let exported = db.export_audit_logs(Some(1500)).unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].provider_id, "deepseek");
+    }
+
+    #[test]
+    fn test_egress_whitelist_and_policy() {
+        let db = Database::open_memory().unwrap();
+
+        // 1. Default policy is Registered
+        assert_eq!(db.get_egress_policy().unwrap(), EgressPolicy::Registered);
+
+        // 2. Localhost is always allowed
+        assert!(db.is_domain_allowed("localhost").unwrap());
+        assert!(db.is_domain_allowed("127.0.0.1").unwrap());
+        assert!(db.is_domain_allowed("127.0.0.1:8080").unwrap());
+
+        // 3. Unregistered domain is blocked in Registered mode
+        assert!(!db.is_domain_allowed("api.openai.com").unwrap());
+        assert!(!db.is_domain_allowed("evil.com").unwrap());
+
+        // 4. Register provider and verify its domain is allowed
+        let prov = Provider::new(
+            "openai",
+            ToolKind::ClaudeCode,
+            Some("https://api.openai.com/v1".into()),
+        );
+        db.upsert(&prov).unwrap();
+        assert!(db.is_domain_allowed("api.openai.com").unwrap());
+        assert!(db
+            .is_domain_allowed("https://api.openai.com/v1/chat/completions")
+            .unwrap());
+        assert!(!db.is_domain_allowed("evil.com").unwrap());
+
+        // 5. Add custom egress domain
+        db.add_egress_domain("custom.ai").unwrap();
+        let list = db.list_egress_domains().unwrap();
+        assert_eq!(list, vec!["custom.ai".to_string()]);
+        assert!(db.is_domain_allowed("custom.ai").unwrap());
+        assert!(db.is_domain_allowed("https://custom.ai:443/test").unwrap());
+
+        // 6. Remove custom egress domain
+        assert!(db.remove_egress_domain("custom.ai").unwrap());
+        assert!(!db.is_domain_allowed("custom.ai").unwrap());
+
+        // 7. Unrestricted policy allows all domains
+        db.set_egress_policy(EgressPolicy::Unrestricted).unwrap();
+        assert_eq!(db.get_egress_policy().unwrap(), EgressPolicy::Unrestricted);
+        assert!(db.is_domain_allowed("evil.com").unwrap());
+        assert!(db.is_domain_allowed("any-random-domain.org").unwrap());
+
+        // Revert back
+        db.set_egress_policy(EgressPolicy::Registered).unwrap();
+        assert!(!db.is_domain_allowed("evil.com").unwrap());
     }
 }
