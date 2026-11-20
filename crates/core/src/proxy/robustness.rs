@@ -15,6 +15,8 @@ pub struct TimeoutConfig {
     pub ttft_timeout: Duration,
     /// Chunk-to-chunk idle timeout during an active response stream.
     pub idle_timeout: Duration,
+    /// Total timeout for non-streaming requests.
+    pub total_non_stream_timeout: Duration,
 }
 
 impl Default for TimeoutConfig {
@@ -23,6 +25,7 @@ impl Default for TimeoutConfig {
             connect_timeout: Duration::from_secs(10),
             ttft_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(15),
+            total_non_stream_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -35,6 +38,10 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         // Try parsing integer seconds
         if let Ok(secs) = trimmed.parse::<u64>() {
             return Some(Duration::from_secs(secs));
+        }
+        // Try parsing fractional seconds
+        if let Ok(secs_f) = trimmed.parse::<f64>() {
+            return Some(Duration::from_secs_f64(secs_f.max(0.0)));
         }
         // Try parsing HTTP-date (RFC 2822 / RFC 7231 / RFC 1123)
         if let Ok(target_time) =
@@ -117,9 +124,6 @@ impl SemanticDetector {
             if let Some(ev) = line.strip_prefix("event:") {
                 let ev_name = ev.trim();
                 current_event = Some(ev_name.to_string());
-                if ev_name == "error" || ev_name == "response.failed" {
-                    return CommitDecision::Error("upstream stream error event".to_string());
-                }
                 continue;
             }
 
@@ -132,7 +136,9 @@ impl SemanticDetector {
                 if current_event.as_deref() == Some("error")
                     || current_event.as_deref() == Some("response.failed")
                 {
-                    return CommitDecision::Error(data.to_string());
+                    let msg =
+                        Self::is_error_payload(data.as_bytes()).unwrap_or_else(|| data.to_string());
+                    return CommitDecision::Error(msg);
                 }
 
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
@@ -231,6 +237,12 @@ impl SemanticDetector {
             }
         }
 
+        if current_event.as_deref() == Some("error")
+            || current_event.as_deref() == Some("response.failed")
+        {
+            return CommitDecision::Error("upstream stream error event".to_string());
+        }
+
         if has_semantic {
             CommitDecision::Commit { has_tool_call }
         } else {
@@ -312,6 +324,10 @@ mod tests {
         h.insert("retry-after", "2".parse().unwrap());
         assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(2)));
 
+        let mut h_f = HeaderMap::new();
+        h_f.insert("retry-after", "1.5".parse().unwrap());
+        assert_eq!(parse_retry_after(&h_f), Some(Duration::from_millis(1500)));
+
         let mut h_ms = HeaderMap::new();
         h_ms.insert("retry-after-ms", "1500".parse().unwrap());
         assert_eq!(parse_retry_after(&h_ms), Some(Duration::from_millis(1500)));
@@ -377,10 +393,18 @@ mod tests {
 
         // Upstream 200 error chunk -> Error
         let err_chunk = b"data: {\"error\":{\"message\":\"quota exceeded\",\"code\":40001}}\n\n";
-        assert!(matches!(
-            SemanticDetector::inspect_chunk(err_chunk, ProviderProtocol::Chat),
-            CommitDecision::Error(_)
-        ));
+        match SemanticDetector::inspect_chunk(err_chunk, ProviderProtocol::Chat) {
+            CommitDecision::Error(msg) => assert_eq!(msg, "quota exceeded"),
+            _ => panic!("expected CommitDecision::Error"),
+        }
+
+        // Upstream SSE error event with data payload -> Error with inner message
+        let sse_err_event =
+            b"event: error\ndata: {\"error\":{\"message\":\"rate limited by provider\"}}\n\n";
+        match SemanticDetector::inspect_chunk(sse_err_event, ProviderProtocol::Messages) {
+            CommitDecision::Error(msg) => assert_eq!(msg, "rate limited by provider"),
+            _ => panic!("expected CommitDecision::Error with inner message"),
+        }
     }
 
     #[test]

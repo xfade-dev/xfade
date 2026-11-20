@@ -578,7 +578,10 @@ fn block_stop_event(block: usize) -> Bytes {
 ///
 /// Uses `futures::stream::unfold` for true streaming semantics. The upstream
 /// stream is carried in the unfold state so it persists across poll cycles.
-pub fn stream_openai_to_anthropic<S>(upstream: S, req_model: String) -> impl Stream<Item = Bytes>
+pub fn stream_openai_to_anthropic<S>(
+    upstream: S,
+    req_model: String,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
@@ -590,7 +593,7 @@ where
     struct UnfoldState {
         upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
         conv: StreamState,
-        pending: std::collections::VecDeque<Bytes>,
+        pending: std::collections::VecDeque<std::io::Result<Bytes>>,
         finished: bool,
     }
 
@@ -627,36 +630,27 @@ where
                                 continue;
                             }
                             Phase::InTextBlock { block } | Phase::InToolBlock { block, .. } => {
-                                st.pending.push_back(block_stop_event(*block));
+                                st.pending.push_back(Ok(block_stop_event(*block)));
                             }
                             _ => {}
                         }
-                        st.pending.push_back(sse_event(
+                        st.pending.push_back(Ok(sse_event(
                             "message_delta",
                             &json!({
                                 "delta": {"stop_reason": Value::Null, "stop_sequence": Value::Null},
                                 "usage": {"output_tokens": Value::Null}
                             }),
-                        ));
-                        st.pending.push_back(sse_event("message_stop", &json!({})));
+                        )));
+                        st.pending
+                            .push_back(Ok(sse_event("message_stop", &json!({}))));
                         st.conv.phase = Phase::Done;
                         st.finished = true;
                         continue;
                     }
                     Some(Err(e)) => {
-                        // Upstream failed mid-stream: surface an error event so
-                        // clients fail the turn instead of accepting a
-                        // truncated message.
-                        st.pending.push_back(sse_event(
-                            "error",
-                            &json!({
-                                "type": "error",
-                                "error": {"type": "api_error", "message": format!("upstream stream interrupted: {e}")}
-                            }),
-                        ));
-                        st.conv.phase = Phase::Done;
+                        // Forward upstream error to caller so robust stream wrapper can handle it
                         st.finished = true;
-                        continue;
+                        return Some((Err(e), st));
                     }
                     Some(Ok(chunk)) => {
                         let text = String::from_utf8_lossy(&chunk);
@@ -664,7 +658,7 @@ where
                         let (new_conv, out_frames) = process_frames(st.conv, &parsed, &req_model);
                         st.conv = new_conv;
                         for f in out_frames {
-                            st.pending.push_back(f);
+                            st.pending.push_back(Ok(f));
                         }
                         // If we produced nothing (e.g. empty chunk), loop to
                         // pull more upstream.
@@ -1183,14 +1177,17 @@ struct ResponsesStreamState {
 /// An upstream error (mid-stream transport failure) is surfaced as a
 /// `response.failed` event so Responses clients (Codex) treat the turn as
 /// failed and retry, instead of accepting a truncated message.
-pub fn stream_chat_to_responses<S>(upstream: S, req_model: String) -> impl Stream<Item = Bytes>
+pub fn stream_chat_to_responses<S>(
+    upstream: S,
+    req_model: String,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
     struct UnfoldState {
         upstream: std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>,
         st: ResponsesStreamState,
-        pending: std::collections::VecDeque<Bytes>,
+        pending: std::collections::VecDeque<std::io::Result<Bytes>>,
     }
 
     let init = UnfoldState {
@@ -1214,38 +1211,22 @@ where
                         return None;
                     }
                     for f in chat_to_responses_finish(&mut st.st) {
-                        st.pending.push_back(f);
+                        st.pending.push_back(Ok(f));
                     }
                     st.st.finished = true;
                     continue;
                 }
                 Some(Err(e)) => {
-                    if !st.st.created {
-                        st.st.created = true;
-                        st.pending.push_back(sse_event(
-                            "response.created",
-                            &json!({"type": "response.created", "response": {"id": st.st.resp_id}}),
-                        ));
-                    }
-                    st.pending.push_back(sse_event(
-                            "response.failed",
-                            &json!({
-                                "type": "response.failed",
-                                "response": {
-                                    "id": st.st.resp_id,
-                                    "error": {"code": "upstream_error", "message": format!("upstream stream interrupted: {e}")}
-                                }
-                            }),
-                        ));
+                    // Forward upstream error to caller so robust stream wrapper can handle it
                     st.st.finished = true;
-                    continue;
+                    return Some((Err(e), st));
                 }
                 Some(Ok(chunk)) => {
                     let text = String::from_utf8_lossy(&chunk);
                     let frames = parse_openai_sse_frames(&text);
                     let out = process_chat_chunk_responses(&mut st.st, &frames);
                     for f in out {
-                        st.pending.push_back(f);
+                        st.pending.push_back(Ok(f));
                     }
                     continue;
                 }
@@ -2840,24 +2821,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chat_to_responses_upstream_error_emits_failed() {
-        // A mid-stream transport failure must surface as response.failed, not
-        // a graceful response.completed (Codex retries the former).
+    async fn stream_chat_to_responses_upstream_error_propagates_err() {
+        use futures::StreamExt;
         let chunks: Vec<std::io::Result<Bytes>> = vec![
             Ok(ok_chunk(
                 br#"{"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#,
             )),
             Err(std::io::Error::other("connection reset")),
         ];
-        let out_bytes = collect_stream(stream_chat_to_responses(
+        let mut s = Box::pin(stream_chat_to_responses(
             futures::stream::iter(chunks),
             "m".into(),
-        ))
-        .await;
-        let s = String::from_utf8(out_bytes).unwrap();
-        assert!(s.contains("response.failed"), "body: {s}");
-        assert!(s.contains("connection reset"), "body: {s}");
-        assert!(!s.contains("response.completed"), "body: {s}");
+        ));
+        let mut got_err = false;
+        while let Some(item) = s.next().await {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+        }
+        assert!(
+            got_err,
+            "expected upstream error to propagate to robust stream wrapper"
+        );
     }
 
     #[tokio::test]
@@ -2879,19 +2865,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_anthropic_upstream_error_emits_error_event() {
+    async fn stream_anthropic_upstream_error_propagates_err() {
+        use futures::StreamExt;
         let chunks: Vec<std::io::Result<Bytes>> = vec![
             Ok(ok_chunk(br#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
             Err(std::io::Error::other("connection reset")),
         ];
-        let out_bytes = collect_stream(stream_openai_to_anthropic(
+        let mut s = Box::pin(stream_openai_to_anthropic(
             futures::stream::iter(chunks),
             "m".into(),
-        ))
-        .await;
-        let s = String::from_utf8(out_bytes).unwrap();
-        assert!(s.contains(r#""type":"error""#), "body: {s}");
-        assert!(!s.contains("message_stop"), "body: {s}");
+        ));
+        let mut got_err = false;
+        while let Some(item) = s.next().await {
+            if item.is_err() {
+                got_err = true;
+                break;
+            }
+        }
+        assert!(
+            got_err,
+            "expected upstream error to propagate to robust stream wrapper"
+        );
     }
 
     /// Build a `data: <bytes>\n\n` SSE frame as `Bytes` for testing.
@@ -2902,16 +2896,18 @@ mod tests {
         Bytes::from(frame)
     }
 
-    /// Collect all items from a stream of `Bytes` into a single `Vec<u8>`.
+    /// Collect all items from a stream of `Result<Bytes, io::Error>` into a single `Vec<u8>`.
     async fn collect_stream<S>(stream: S) -> Vec<u8>
     where
-        S: futures::Stream<Item = Bytes>,
+        S: futures::Stream<Item = std::io::Result<Bytes>>,
     {
         use futures::StreamExt;
         let mut out = Vec::new();
         let mut s = Box::pin(stream);
-        while let Some(chunk) = s.next().await {
-            out.extend_from_slice(&chunk);
+        while let Some(chunk_res) = s.next().await {
+            if let Ok(chunk) = chunk_res {
+                out.extend_from_slice(&chunk);
+            }
         }
         out
     }

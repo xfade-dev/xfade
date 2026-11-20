@@ -771,12 +771,14 @@ where
         // Step 2: Canonical Chat IR stream -> Inbound stream
         match inbound_proto {
             ProviderProtocol::Chat => Box::pin(chat_stream),
-            ProviderProtocol::Messages => {
-                Box::pin(super::convert::stream_openai_to_anthropic(chat_stream, req_model).map(Ok))
-            }
-            ProviderProtocol::Responses => {
-                Box::pin(super::convert::stream_chat_to_responses(chat_stream, req_model).map(Ok))
-            }
+            ProviderProtocol::Messages => Box::pin(super::convert::stream_openai_to_anthropic(
+                chat_stream,
+                req_model,
+            )),
+            ProviderProtocol::Responses => Box::pin(super::convert::stream_chat_to_responses(
+                chat_stream,
+                req_model,
+            )),
         }
     } else {
         Box::pin(filter_empty_choices(upstream))
@@ -791,7 +793,7 @@ where
         req_id,
         has_tool_call,
         provider_id_owned.clone(),
-        cb,
+        cb.clone(),
         db.clone(),
         interrupted_flag.clone(),
     );
@@ -811,6 +813,7 @@ where
         upstream_domain,
         failover_path_owned,
         interrupted_flag,
+        cb,
     );
 
     let mut resp_builder = Response::builder().status(status);
@@ -1249,21 +1252,27 @@ async fn failover_loop(
             }
         };
 
-        // Intra-upstream retry on 429/503 if Retry-After <= 2s
+        // Intra-upstream retry on 429/503 if Retry-After <= 2s (and bounded by remaining TTFT deadline)
         if resp.status() == StatusCode::TOO_MANY_REQUESTS
             || resp.status() == StatusCode::SERVICE_UNAVAILABLE
         {
             if let Some(delay) = robustness::parse_retry_after(resp.headers()) {
-                if delay <= Duration::from_secs(2) {
+                let now = tokio::time::Instant::now();
+                if delay <= Duration::from_secs(2) && now + delay < ttft_deadline {
                     tokio::time::sleep(delay).await;
-                    if let Ok(retry_resp) = try_forward(
-                        &svc.client,
-                        method,
-                        &base_url,
-                        upstream_endpoint,
-                        headers,
-                        sending_body,
-                        auth_key.as_deref(),
+                    let remaining =
+                        ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if let Ok(Ok(retry_resp)) = tokio::time::timeout(
+                        remaining,
+                        try_forward(
+                            &svc.client,
+                            method,
+                            &base_url,
+                            upstream_endpoint,
+                            headers,
+                            sending_body,
+                            auth_key.as_deref(),
+                        ),
                     )
                     .await
                     {
@@ -1390,35 +1399,68 @@ async fn failover_loop(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_lowercase();
-                // Non-streaming pre-commit gate: read body and inspect
-                let bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let duration_ms = start.elapsed().as_millis() as i64;
-                        log_request(
-                            svc,
-                            session_id,
-                            endpoint,
-                            &model,
-                            route_id,
-                            provider.tool.as_str(),
-                            0,
-                            Usage::default(),
-                            duration_ms,
-                            Some(format!("read body: {e}")),
-                        );
-                        svc.record_failure(route_id);
-                        failover_trajectory.push(serde_json::json!({
-                            "provider": route_id,
-                            "status": 502,
-                            "error": format!("read body: {e}"),
-                        }));
-                        last_err = Some((StatusCode::BAD_GATEWAY, e.to_string(), None));
-                        continue;
-                    }
-                };
+                // Non-streaming pre-commit gate: read body and inspect with total timeout
+                let bytes =
+                    match tokio::time::timeout(svc.timeouts.total_non_stream_timeout, resp.bytes())
+                        .await
+                    {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(e)) => {
+                            let duration_ms = start.elapsed().as_millis() as i64;
+                            log_request(
+                                svc,
+                                session_id,
+                                endpoint,
+                                &model,
+                                route_id,
+                                provider.tool.as_str(),
+                                0,
+                                Usage::default(),
+                                duration_ms,
+                                Some(format!("read body: {e}")),
+                            );
+                            svc.record_failure(route_id);
+                            failover_trajectory.push(serde_json::json!({
+                                "provider": route_id,
+                                "status": 502,
+                                "error": format!("read body: {e}"),
+                            }));
+                            last_err = Some((StatusCode::BAD_GATEWAY, e.to_string(), None));
+                            continue;
+                        }
+                        Err(_timeout) => {
+                            let duration_ms = start.elapsed().as_millis() as i64;
+                            log_request(
+                                svc,
+                                session_id,
+                                endpoint,
+                                &model,
+                                route_id,
+                                provider.tool.as_str(),
+                                0,
+                                Usage::default(),
+                                duration_ms,
+                                Some("read body timeout".to_string()),
+                            );
+                            svc.record_failure(route_id);
+                            failover_trajectory.push(serde_json::json!({
+                                "provider": route_id,
+                                "status": 504,
+                                "error": "read body timeout",
+                            }));
+                            last_err = Some((
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "read body timeout".to_string(),
+                                None,
+                            ));
+                            continue;
+                        }
+                    };
 
-                if !content_type.contains("json") && !body_looks_like_json(&bytes) {
+                let is_valid_json = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok();
+                if (!content_type.contains("json") && !body_looks_like_json(&bytes))
+                    || !is_valid_json
+                {
                     let msg = format!(
                         "xfade: upstream provider '{route_id}' returned a non-JSON response \
                          (content-type: '{content_type}'); its base_url is probably wrong — \
@@ -1516,8 +1558,11 @@ async fn failover_loop(
                 .await;
             } else {
                 // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout
+                const MAX_PRE_COMMIT_BUFFER_BYTES: usize = 2 * 1024 * 1024; // 2MB
                 let mut raw_stream = resp.bytes_stream();
                 let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                let mut buffered_bytes: usize = 0;
+                let mut accumulated_buf: Vec<u8> = Vec::new();
                 let mut has_tool_call = false;
                 let mut is_committed = false;
                 let mut stream_err: Option<String> = None;
@@ -1531,8 +1576,14 @@ async fn failover_loop(
                     let remaining = ttft_deadline - now;
                     match tokio::time::timeout(remaining, raw_stream.next()).await {
                         Ok(Some(Ok(chunk))) => {
+                            buffered_bytes += chunk.len();
+                            if buffered_bytes > MAX_PRE_COMMIT_BUFFER_BYTES {
+                                stream_err = Some("pre_commit_buffer_overflow".to_string());
+                                break;
+                            }
+                            accumulated_buf.extend_from_slice(&chunk);
                             let decision = robustness::SemanticDetector::inspect_chunk(
-                                &chunk,
+                                &accumulated_buf,
                                 provider.protocol,
                             );
                             match decision {
@@ -1595,7 +1646,7 @@ async fn failover_loop(
                 }
 
                 // We reached Commit Point!
-                svc.record_success(route_id);
+                // Success will be recorded when the stream completes cleanly without interruption.
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
                     "status": status.as_u16(),
@@ -1960,6 +2011,7 @@ fn make_tapped_streaming_body_with_flag<S>(
     upstream_domain: String,
     failover_path: Option<String>,
     interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
+    circuit_breaker: Arc<super::CircuitBreaker>,
 ) -> Body
 where
     S: futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
@@ -1980,6 +2032,7 @@ where
         upstream_domain,
         failover_path,
         interrupted_flag,
+        circuit_breaker,
     })
 }
 
@@ -2003,6 +2056,7 @@ struct TailLogStream {
     upstream_domain: String,
     failover_path: Option<String>,
     interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
+    circuit_breaker: Arc<super::CircuitBreaker>,
 }
 
 impl TailLogStream {
@@ -2083,6 +2137,7 @@ impl futures::Stream for TailLogStream {
                     let err = if is_interrupted {
                         Some("upstream stream interrupted".to_string())
                     } else {
+                        this.circuit_breaker.record_success(&this.provider_id);
                         None
                     };
                     this.log(err);
