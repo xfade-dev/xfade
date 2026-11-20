@@ -19,7 +19,44 @@ struct PriceEntry {
 }
 
 static CATALOG: &[PriceEntry] = &[
-    // Anthropic models
+    // Anthropic flagship models (2026 Claude 5.5 series)
+    PriceEntry {
+        prefix: "claude-sonnet-5.5",
+        price: ModelPrice {
+            input_micros_per_m: 2_000_000,       // $2.00 / 1M
+            output_micros_per_m: 10_000_000,     // $10.00 / 1M
+            cache_read_micros_per_m: 100_000,    // $0.10 / 1M
+            cache_write_micros_per_m: 2_500_000, // $2.50 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "claude-opus-5.5",
+        price: ModelPrice {
+            input_micros_per_m: 4_000_000,       // $4.00 / 1M
+            output_micros_per_m: 20_000_000,     // $20.00 / 1M
+            cache_read_micros_per_m: 200_000,    // $0.20 / 1M
+            cache_write_micros_per_m: 5_000_000, // $5.00 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "claude-haiku-5.5",
+        price: ModelPrice {
+            input_micros_per_m: 100_000,       // $0.10 / 1M
+            output_micros_per_m: 500_000,      // $0.50 / 1M
+            cache_read_micros_per_m: 10_000,   // $0.01 / 1M
+            cache_write_micros_per_m: 125_000, // $0.125 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "claude-fable-5.2",
+        price: ModelPrice {
+            input_micros_per_m: 8_000_000,        // $8.00 / 1M
+            output_micros_per_m: 40_000_000,      // $40.00 / 1M
+            cache_read_micros_per_m: 200_000,     // $0.20 / 1M
+            cache_write_micros_per_m: 10_000_000, // $10.00 / 1M
+        },
+    },
+    // Anthropic 3.x series
     PriceEntry {
         prefix: "claude-3-7-sonnet",
         price: ModelPrice {
@@ -65,7 +102,44 @@ static CATALOG: &[PriceEntry] = &[
             cache_write_micros_per_m: 18_750_000, // $18.75 / 1M
         },
     },
-    // OpenAI models
+    // OpenAI flagship models (2026 GPT-6.x series)
+    PriceEntry {
+        prefix: "gpt-6.2-astra",
+        price: ModelPrice {
+            input_micros_per_m: 8_000_000,        // $8.00 / 1M
+            output_micros_per_m: 40_000_000,      // $40.00 / 1M
+            cache_read_micros_per_m: 400_000,     // $0.40 / 1M
+            cache_write_micros_per_m: 10_000_000, // $10.00 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "gpt-6.2-sol",
+        price: ModelPrice {
+            input_micros_per_m: 2_000_000,       // $2.00 / 1M
+            output_micros_per_m: 10_000_000,     // $10.00 / 1M
+            cache_read_micros_per_m: 100_000,    // $0.10 / 1M
+            cache_write_micros_per_m: 2_500_000, // $2.50 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "gpt-6.1-terra",
+        price: ModelPrice {
+            input_micros_per_m: 1_000_000,       // $1.00 / 1M
+            output_micros_per_m: 5_000_000,      // $5.00 / 1M
+            cache_read_micros_per_m: 50_000,     // $0.05 / 1M
+            cache_write_micros_per_m: 1_250_000, // $1.25 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "gpt-6-luna",
+        price: ModelPrice {
+            input_micros_per_m: 100_000,       // $0.10 / 1M
+            output_micros_per_m: 500_000,      // $0.50 / 1M
+            cache_read_micros_per_m: 10_000,   // $0.01 / 1M
+            cache_write_micros_per_m: 125_000, // $0.125 / 1M
+        },
+    },
+    // OpenAI established models
     PriceEntry {
         prefix: "gpt-4o-mini",
         price: ModelPrice {
@@ -111,7 +185,89 @@ static CATALOG: &[PriceEntry] = &[
             cache_write_micros_per_m: 1_100_000,
         },
     },
-    // DeepSeek models
+    // Google Gemini 4 & 2.x models
+    PriceEntry {
+        prefix: "gemini-4-neon",
+        price: ModelPrice {
+            input_micros_per_m: 3_000_000,    // $3.00 / 1M
+            output_micros_per_m: 15_000_000,  // $15.00 / 1M
+            cache_read_micros_per_m: 150_000, // $0.15 / 1M
+            cache_write_micros_per_m: 83_000, // $0.083 / 1M
+        },
+    },
+    PriceEntry {
+        prefix: "gemini-4-hydrogen",
+        price: ModelPrice {
+            input_micros_per_m: 1_500_000,   // $1.50 / 1M
+            output_micros_per_m: 7_500_000,  // $7.50 / 1M
+            cache_read_micros_per_m: 75_000, // $0.075 / 1M
+            cache_write_micros_per_m: 41_500,
+        },
+    },
+    PriceEntry {
+        prefix: "gemini-4-carbon",
+        price: ModelPrice {
+            input_micros_per_m: 2_000_000,    // $2.00 / 1M
+            output_micros_per_m: 10_000_000,  // $10.00 / 1M
+            cache_read_micros_per_m: 100_000, // $0.10 / 1M
+            cache_write_micros_per_m: 55_000,
+        },
+    },
+    PriceEntry {
+        prefix: "gemini-2.0-flash",
+        price: ModelPrice {
+            input_micros_per_m: 100_000,  // $0.10 / 1M
+            output_micros_per_m: 400_000, // $0.40 / 1M
+            cache_read_micros_per_m: 25_000,
+            cache_write_micros_per_m: 100_000,
+        },
+    },
+    PriceEntry {
+        prefix: "gemini-1.5-flash",
+        price: ModelPrice {
+            input_micros_per_m: 75_000,   // $0.075 / 1M
+            output_micros_per_m: 300_000, // $0.30 / 1M
+            cache_read_micros_per_m: 18_750,
+            cache_write_micros_per_m: 75_000,
+        },
+    },
+    PriceEntry {
+        prefix: "gemini-1.5-pro",
+        price: ModelPrice {
+            input_micros_per_m: 1_250_000,  // $1.25 / 1M
+            output_micros_per_m: 5_000_000, // $5.00 / 1M
+            cache_read_micros_per_m: 312_500,
+            cache_write_micros_per_m: 1_250_000,
+        },
+    },
+    // DeepSeek V4 & V3 series
+    PriceEntry {
+        prefix: "deepseek-v4.1-flash",
+        price: ModelPrice {
+            input_micros_per_m: 36_000,      // $0.036 / 1M
+            output_micros_per_m: 500_000,    // $0.50 / 1M
+            cache_read_micros_per_m: 10_000, // $0.01 / 1M
+            cache_write_micros_per_m: 36_000,
+        },
+    },
+    PriceEntry {
+        prefix: "deepseek-v4-pro",
+        price: ModelPrice {
+            input_micros_per_m: 1_320_000,   // $1.32 / 1M
+            output_micros_per_m: 3_960_000,  // $3.96 / 1M
+            cache_read_micros_per_m: 44_000, // $0.044 / 1M
+            cache_write_micros_per_m: 1_320_000,
+        },
+    },
+    PriceEntry {
+        prefix: "deepseek-v3.2",
+        price: ModelPrice {
+            input_micros_per_m: 260_000,     // $0.26 / 1M
+            output_micros_per_m: 380_000,    // $0.38 / 1M
+            cache_read_micros_per_m: 26_000, // $0.026 / 1M
+            cache_write_micros_per_m: 260_000,
+        },
+    },
     PriceEntry {
         prefix: "deepseek-chat",
         price: ModelPrice {
@@ -148,32 +304,134 @@ static CATALOG: &[PriceEntry] = &[
             cache_write_micros_per_m: 550_000,
         },
     },
-    // Google Gemini models
+    // Alibaba Qwen series
     PriceEntry {
-        prefix: "gemini-2.0-flash",
+        prefix: "qwen4-max",
         price: ModelPrice {
-            input_micros_per_m: 100_000,  // $0.10 / 1M
-            output_micros_per_m: 400_000, // $0.40 / 1M
-            cache_read_micros_per_m: 25_000,
-            cache_write_micros_per_m: 100_000,
+            input_micros_per_m: 1_425_000,       // $1.425 / 1M
+            output_micros_per_m: 4_275_000,      // $4.275 / 1M
+            cache_read_micros_per_m: 71_000,     // $0.071 / 1M
+            cache_write_micros_per_m: 1_781_000, // $1.781 / 1M
         },
     },
     PriceEntry {
-        prefix: "gemini-1.5-flash",
+        prefix: "qwen3.8-flash",
         price: ModelPrice {
-            input_micros_per_m: 75_000,   // $0.075 / 1M
-            output_micros_per_m: 300_000, // $0.30 / 1M
-            cache_read_micros_per_m: 18_750,
-            cache_write_micros_per_m: 75_000,
+            input_micros_per_m: 150_000,  // $0.15 / 1M
+            output_micros_per_m: 470_000, // $0.47 / 1M
+            cache_read_micros_per_m: 15_000,
+            cache_write_micros_per_m: 150_000,
         },
     },
     PriceEntry {
-        prefix: "gemini-1.5-pro",
+        prefix: "qwen3.7-max",
         price: ModelPrice {
-            input_micros_per_m: 1_250_000,  // $1.25 / 1M
-            output_micros_per_m: 5_000_000, // $5.00 / 1M
-            cache_read_micros_per_m: 312_500,
-            cache_write_micros_per_m: 1_250_000,
+            input_micros_per_m: 1_475_000,  // $1.475 / 1M
+            output_micros_per_m: 4_425_000, // $4.425 / 1M
+            cache_read_micros_per_m: 74_000,
+            cache_write_micros_per_m: 1_843_000,
+        },
+    },
+    PriceEntry {
+        prefix: "qwen-2.5-coder",
+        price: ModelPrice {
+            input_micros_per_m: 660_000,    // $0.66 / 1M
+            output_micros_per_m: 1_000_000, // $1.00 / 1M
+            cache_read_micros_per_m: 66_000,
+            cache_write_micros_per_m: 660_000,
+        },
+    },
+    // Moonshot Kimi series
+    PriceEntry {
+        prefix: "kimi-k3.1-pro",
+        price: ModelPrice {
+            input_micros_per_m: 253_000,      // $0.253 / 1M
+            output_micros_per_m: 8_800_000,   // $8.80 / 1M
+            cache_read_micros_per_m: 180_000, // $0.18 / 1M
+            cache_write_micros_per_m: 253_000,
+        },
+    },
+    PriceEntry {
+        prefix: "kimi-k2.7-code",
+        price: ModelPrice {
+            input_micros_per_m: 600_000,    // $0.60 / 1M
+            output_micros_per_m: 3_000_000, // $3.00 / 1M
+            cache_read_micros_per_m: 60_000,
+            cache_write_micros_per_m: 600_000,
+        },
+    },
+    PriceEntry {
+        prefix: "kimi-k2.5",
+        price: ModelPrice {
+            input_micros_per_m: 500_000,    // $0.50 / 1M
+            output_micros_per_m: 2_500_000, // $2.50 / 1M
+            cache_read_micros_per_m: 50_000,
+            cache_write_micros_per_m: 500_000,
+        },
+    },
+    // Zhipu GLM series
+    PriceEntry {
+        prefix: "glm-5.3-flash",
+        price: ModelPrice {
+            input_micros_per_m: 40_000,  // $0.04 / 1M
+            output_micros_per_m: 80_000, // $0.08 / 1M
+            cache_read_micros_per_m: 30_000,
+            cache_write_micros_per_m: 40_000,
+        },
+    },
+    PriceEntry {
+        prefix: "glm-5.3",
+        price: ModelPrice {
+            input_micros_per_m: 70_000,     // $0.07 / 1M
+            output_micros_per_m: 1_400_000, // $1.40 / 1M
+            cache_read_micros_per_m: 35_000,
+            cache_write_micros_per_m: 70_000,
+        },
+    },
+    PriceEntry {
+        prefix: "glm-5.2",
+        price: ModelPrice {
+            input_micros_per_m: 620_000,    // $0.62 / 1M
+            output_micros_per_m: 2_420_000, // $2.42 / 1M
+            cache_read_micros_per_m: 62_000,
+            cache_write_micros_per_m: 620_000,
+        },
+    },
+    PriceEntry {
+        prefix: "glm-4-plus",
+        price: ModelPrice {
+            input_micros_per_m: 1_400_000,  // $1.40 / 1M
+            output_micros_per_m: 1_400_000, // $1.40 / 1M
+            cache_read_micros_per_m: 140_000,
+            cache_write_micros_per_m: 1_400_000,
+        },
+    },
+    // Mistral series
+    PriceEntry {
+        prefix: "pixtral-large-2502",
+        price: ModelPrice {
+            input_micros_per_m: 2_000_000,  // $2.00 / 1M
+            output_micros_per_m: 6_000_000, // $6.00 / 1M
+            cache_read_micros_per_m: 200_000,
+            cache_write_micros_per_m: 2_000_000,
+        },
+    },
+    PriceEntry {
+        prefix: "mistral-large-4-0",
+        price: ModelPrice {
+            input_micros_per_m: 700_000,    // $0.70 / 1M
+            output_micros_per_m: 2_100_000, // $2.10 / 1M
+            cache_read_micros_per_m: 70_000,
+            cache_write_micros_per_m: 700_000,
+        },
+    },
+    PriceEntry {
+        prefix: "devstral-2512",
+        price: ModelPrice {
+            input_micros_per_m: 400_000,    // $0.40 / 1M
+            output_micros_per_m: 2_000_000, // $2.00 / 1M
+            cache_read_micros_per_m: 40_000,
+            cache_write_micros_per_m: 400_000,
         },
     },
 ];
@@ -190,11 +448,28 @@ pub fn find_model_price(model_name: &str) -> Option<&'static ModelPrice> {
 
     // Normalize common model aliases
     let canonical_name: &str = match raw_name {
-        "sonnet" => "claude-3-7-sonnet",
-        "opus" => "claude-3-opus",
-        "haiku" => "claude-3-5-haiku",
+        "sonnet" => "claude-sonnet-5.5",
+        "opus" => "claude-opus-5.5",
+        "haiku" => "claude-haiku-5.5",
+        "astra" => "gpt-6.2-astra",
+        "sol" => "gpt-6.2-sol",
+        "terra" => "gpt-6.1-terra",
+        "luna" => "gpt-6-luna",
         "4o" => "gpt-4o",
         "4o-mini" => "gpt-4o-mini",
+        "neon" => "gemini-4-neon",
+        "hydrogen" => "gemini-4-hydrogen",
+        "carbon" => "gemini-4-carbon",
+        "v4-flash" | "deepseek-v4" => "deepseek-v4.1-flash",
+        "v4-pro" => "deepseek-v4-pro",
+        "qwen4" => "qwen4-max",
+        "qwen-coder" => "qwen-2.5-coder",
+        "kimi-k3" => "kimi-k3.1-pro",
+        "kimi-code" => "kimi-k2.7-code",
+        "kimi" => "kimi-k2.5",
+        "glm-5-flash" => "glm-5.3-flash",
+        "glm-5" => "glm-5.3",
+        "devstral" => "devstral-2512",
         other => other,
     };
 
@@ -308,7 +583,7 @@ mod tests {
 
         // Common model aliases
         let p_alias = find_model_price("sonnet").expect("should resolve sonnet alias");
-        assert_eq!(p_alias.input_micros_per_m, 3_000_000);
+        assert_eq!(p_alias.input_micros_per_m, 2_000_000);
         let p_4o_alias = find_model_price("4o").expect("should resolve 4o alias");
         assert_eq!(p_4o_alias.input_micros_per_m, 2_500_000);
 
@@ -343,6 +618,33 @@ mod tests {
         // Total: 60,000 + 24,000 + 75,000 = 159,000 micros ($0.159)
         let cost = calculate_cost_micros(p_sonnet, 100_000, 5_000, 80_000, 0);
         assert_eq!(cost, 159_000);
+    }
+
+    #[test]
+    fn test_2026_flagship_model_lookups_and_aliases() {
+        let p_sonnet55 = find_model_price("claude-sonnet-5.5").expect("claude-sonnet-5.5");
+        assert_eq!(p_sonnet55.input_micros_per_m, 2_000_000);
+        assert_eq!(p_sonnet55.output_micros_per_m, 10_000_000);
+
+        let p_astra = find_model_price("gpt-6.2-astra").expect("gpt-6.2-astra");
+        assert_eq!(p_astra.input_micros_per_m, 8_000_000);
+        assert_eq!(p_astra.output_micros_per_m, 40_000_000);
+
+        let p_neon = find_model_price("gemini-4-neon").expect("gemini-4-neon");
+        assert_eq!(p_neon.input_micros_per_m, 3_000_000);
+
+        let p_v4 = find_model_price("deepseek-v4.1-flash").expect("deepseek-v4.1-flash");
+        assert_eq!(p_v4.input_micros_per_m, 36_000);
+
+        // Aliases
+        assert_eq!(
+            find_model_price("sol").unwrap().input_micros_per_m,
+            2_000_000
+        );
+        assert_eq!(
+            find_model_price("luna").unwrap().input_micros_per_m,
+            100_000
+        );
     }
 
     #[test]
