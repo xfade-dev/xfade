@@ -176,6 +176,10 @@ impl MockUpstream {
         self.url.clone()
     }
 
+    pub fn clear_responses(&self) {
+        self.responses.lock().unwrap().clear();
+    }
+
     pub fn respond_with(&self, status: u16, body: &str) {
         self.responses.lock().unwrap().push(MockResponse::Plain {
             status: StatusCode::from_u16(status).unwrap(),
