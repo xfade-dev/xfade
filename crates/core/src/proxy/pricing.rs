@@ -438,6 +438,11 @@ static CATALOG: &[PriceEntry] = &[
     },
 ];
 
+/// Enumerate all static entries defined in the built-in catalog.
+pub fn list_builtin_catalog() -> Vec<(&'static str, ModelPrice)> {
+    CATALOG.iter().map(|e| (e.prefix, e.price)).collect()
+}
+
 /// Normalize common model aliases to their canonical model names.
 pub fn canonical_alias(raw_name: &str) -> &str {
     match raw_name {
