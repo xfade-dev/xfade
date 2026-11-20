@@ -25,6 +25,10 @@ path = "tests/integration_tests.rs"
 name = "protocol_golden_cascade"
 path = "tests/protocol_golden_cascade.rs"
 
+[[test]]
+name = "failover_robustness"
+path = "tests/failover_robustness.rs"
+
 [dependencies]
 xfade-core = { path = "../core" }
 serde = { workspace = true }
@@ -44,3 +48,4 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = { workspace = true }
 axum = { workspace = true }
+futures = { workspace = true }

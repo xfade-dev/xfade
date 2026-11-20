@@ -1179,19 +1179,25 @@ async fn failover_loop(
         }
         let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(sending_body_ref);
 
-        let mut resp = match try_forward(
-            &svc.client,
-            method,
-            &base_url,
-            upstream_endpoint,
-            headers,
-            sending_body,
-            auth_key.as_deref(),
+        let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
+        let time_for_headers = ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
+
+        let mut resp = match tokio::time::timeout(
+            time_for_headers,
+            try_forward(
+                &svc.client,
+                method,
+                &base_url,
+                upstream_endpoint,
+                headers,
+                sending_body,
+                auth_key.as_deref(),
+            ),
         )
         .await
         {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
@@ -1212,6 +1218,33 @@ async fn failover_loop(
                 );
                 svc.record_failure(route_id);
                 last_err = Some((StatusCode::BAD_GATEWAY, e, None));
+                continue;
+            }
+            Err(_timeout) => {
+                let duration_ms = start.elapsed().as_millis() as i64;
+                failover_trajectory.push(serde_json::json!({
+                    "provider": route_id,
+                    "status": 504,
+                    "error": "ttft_timeout"
+                }));
+                log_request(
+                    svc,
+                    session_id,
+                    endpoint,
+                    &model,
+                    route_id,
+                    provider.tool.as_str(),
+                    0,
+                    Usage::default(),
+                    duration_ms,
+                    Some("ttft_timeout".to_string()),
+                );
+                svc.record_failure(route_id);
+                last_err = Some((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "ttft_timeout".to_string(),
+                    None,
+                ));
                 continue;
             }
         };
@@ -1488,7 +1521,6 @@ async fn failover_loop(
                 let mut has_tool_call = false;
                 let mut is_committed = false;
                 let mut stream_err: Option<String> = None;
-                let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
 
                 while !is_committed {
                     let now = tokio::time::Instant::now();
