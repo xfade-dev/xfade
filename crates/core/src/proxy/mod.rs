@@ -3,6 +3,7 @@ pub mod circuit_breaker;
 pub mod convert;
 pub mod forward;
 pub mod pricing;
+pub mod pricing_sync;
 pub mod robustness;
 #[cfg(test)]
 pub mod testsupport;
@@ -14,6 +15,7 @@ pub mod status;
 
 pub use auth::ClientIdentity;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+pub use pricing_sync::{sync_pricing_catalog, SyncStats, DEFAULT_OPENROUTER_MODELS_URL};
 
 use crate::error::Result;
 use crate::service::Core;
