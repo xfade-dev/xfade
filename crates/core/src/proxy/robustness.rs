@@ -203,9 +203,13 @@ impl SemanticDetector {
                             }
                         }
                         ProviderProtocol::Responses => {
-                            let type_str = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            if type_str == "response.output_item.added" {
-                                if let Some(item) = val.get("item") {
+                            let ev_type = current_event.as_deref().unwrap_or_else(|| {
+                                val.get("type").and_then(|t| t.as_str()).unwrap_or("")
+                            });
+                            if ev_type == "response.output_item.added" {
+                                if let Some(item) =
+                                    val.get("item").or_else(|| val.get("output_item"))
+                                {
                                     let item_type =
                                         item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     if item_type == "function_call" {
@@ -215,9 +219,9 @@ impl SemanticDetector {
                                         has_semantic = true;
                                     }
                                 }
-                            } else if type_str.ends_with(".delta") {
+                            } else if ev_type.ends_with(".delta") || ev_type.contains("delta") {
                                 has_semantic = true;
-                                if type_str.contains("function_call") {
+                                if ev_type.contains("function_call") {
                                     has_tool_call = true;
                                 }
                             }

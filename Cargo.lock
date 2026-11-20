@@ -6404,6 +6404,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "dialoguer",
+ "futures",
  "predicates",
  "ratatui",
  "reqwest 0.12.28",
