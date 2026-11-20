@@ -10,22 +10,29 @@ pub struct Usage {
 
 impl Usage {
     /// Extract usage from a non-stream JSON response body. Compatible with
-    /// OpenAI (`prompt_tokens`/`completion_tokens`/`prompt_tokens_details.cached_tokens`)
-    /// and Anthropic (`input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`) shapes.
+    /// OpenAI (`prompt_tokens`/`completion_tokens`/`prompt_tokens_details.cached_tokens`),
+    /// OpenAI Responses (`input_tokens_details.cached_tokens`/`input_token_details.cached_tokens`),
+    /// Anthropic (`input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`),
+    /// DeepSeek (`prompt_cache_hit_tokens`), and Gemini (`cachedContentTokenCount`).
     pub fn from_json(bytes: &[u8]) -> Self {
         let v: Value = match serde_json::from_slice(bytes) {
             Ok(v) => v,
             Err(_) => return Self::default(),
         };
         let usage = v.get("usage").cloned().unwrap_or(Value::Null);
-        let prompt = usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(|t| t.as_i64())
-            .unwrap_or(0);
+        Self::from_usage_value(&usage)
+    }
+
+    pub fn from_usage_value(usage: &Value) -> Self {
+        if usage.is_null() {
+            return Self::default();
+        }
+        let raw_prompt = usage.get("prompt_tokens").and_then(|t| t.as_i64());
+        let anthropic_input = usage.get("input_tokens").and_then(|t| t.as_i64());
         let completion = usage
             .get("completion_tokens")
             .or_else(|| usage.get("output_tokens"))
+            .or_else(|| usage.get("candidatesTokenCount"))
             .and_then(|t| t.as_i64())
             .unwrap_or(0);
         let cached = usage
@@ -33,16 +40,36 @@ impl Usage {
             .and_then(|d| d.get("cached_tokens"))
             .or_else(|| {
                 usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+            })
+            .or_else(|| {
+                usage
                     .get("input_token_details")
                     .and_then(|d| d.get("cached_tokens"))
             })
             .or_else(|| usage.get("cache_read_input_tokens"))
+            .or_else(|| usage.get("prompt_cache_hit_tokens"))
+            .or_else(|| usage.get("cachedContentTokenCount"))
             .and_then(|t| t.as_i64())
             .unwrap_or(0);
         let cache_write = usage
             .get("cache_creation_input_tokens")
             .and_then(|t| t.as_i64())
             .unwrap_or(0);
+
+        let prompt = if let Some(p) = raw_prompt {
+            p
+        } else if let Some(inp) = anthropic_input {
+            // In Anthropic Messages API, `input_tokens` only counts new/uncached tokens.
+            // Total prompt tokens processed is input_tokens + cached + cache_write.
+            inp + cached + cache_write
+        } else {
+            usage
+                .get("promptTokenCount")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0)
+        };
 
         Self {
             prompt_tokens: prompt,
@@ -60,7 +87,8 @@ impl Usage {
     ///     prompt count;
     ///   - `completion_tokens` or `output_tokens` (in a usage block) updates
     ///     the completion count;
-    ///   - `prompt_tokens_details.cached_tokens` or `cache_read_input_tokens` updates cached count;
+    ///   - `prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
+    ///     or `cache_read_input_tokens` updates cached count;
     ///   - `cache_creation_input_tokens` updates cache write count.
     ///
     /// Note: in Anthropic's streaming protocol, `message_delta` events carry a
@@ -72,7 +100,8 @@ impl Usage {
     /// (`messages`) streams.
     pub fn from_sse_tail(tail: &[u8]) -> Self {
         let text = String::from_utf8_lossy(tail);
-        let mut prompt: Option<i64> = None;
+        let mut raw_prompt: Option<i64> = None;
+        let mut anthropic_input: Option<i64> = None;
         let mut completion: Option<i64> = None;
         let mut cached: Option<i64> = None;
         let mut cache_write: Option<i64> = None;
@@ -104,12 +133,11 @@ impl Usage {
             if usage.is_null() {
                 continue;
             }
-            if let Some(p) = usage
-                .get("prompt_tokens")
-                .or_else(|| usage.get("input_tokens"))
-                .and_then(|t| t.as_i64())
-            {
-                prompt = Some(p);
+            if let Some(p) = usage.get("prompt_tokens").and_then(|t| t.as_i64()) {
+                raw_prompt = Some(p);
+            }
+            if let Some(inp) = usage.get("input_tokens").and_then(|t| t.as_i64()) {
+                anthropic_input = Some(inp);
             }
             if let Some(c) = usage
                 .get("completion_tokens")
@@ -124,10 +152,17 @@ impl Usage {
                 .and_then(|d| d.get("cached_tokens"))
                 .or_else(|| {
                     usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                })
+                .or_else(|| {
+                    usage
                         .get("input_token_details")
                         .and_then(|d| d.get("cached_tokens"))
                 })
                 .or_else(|| usage.get("cache_read_input_tokens"))
+                .or_else(|| usage.get("prompt_cache_hit_tokens"))
+                .or_else(|| usage.get("cachedContentTokenCount"))
                 .and_then(|t| t.as_i64())
             {
                 cached = Some(ca);
@@ -140,11 +175,50 @@ impl Usage {
             }
         }
 
+        let prompt = if let Some(p) = raw_prompt {
+            p
+        } else if let Some(inp) = anthropic_input {
+            inp + cached.unwrap_or(0) + cache_write.unwrap_or(0)
+        } else {
+            0
+        };
+
         Self {
-            prompt_tokens: prompt.unwrap_or(0),
+            prompt_tokens: prompt,
             completion_tokens: completion.unwrap_or(0),
             cached_prompt_tokens: cached.unwrap_or(0),
             cache_write_tokens: cache_write.unwrap_or(0),
+        }
+    }
+
+    /// Extract usage from combined head and tail buffers of an SSE stream.
+    /// This ensures head-emitted usage (such as Anthropic's `message_start` containing
+    /// prompt and cache tokens) is not lost when stream responses exceed the tail buffer capacity.
+    pub fn from_sse_buffers(head: &[u8], tail: &[u8]) -> Self {
+        let u_head = Self::from_sse_tail(head);
+        let u_tail = Self::from_sse_tail(tail);
+
+        Self {
+            prompt_tokens: if u_tail.prompt_tokens > 0 {
+                u_tail.prompt_tokens
+            } else {
+                u_head.prompt_tokens
+            },
+            completion_tokens: if u_tail.completion_tokens > 0 {
+                u_tail.completion_tokens
+            } else {
+                u_head.completion_tokens
+            },
+            cached_prompt_tokens: if u_tail.cached_prompt_tokens > 0 {
+                u_tail.cached_prompt_tokens
+            } else {
+                u_head.cached_prompt_tokens
+            },
+            cache_write_tokens: if u_tail.cache_write_tokens > 0 {
+                u_tail.cache_write_tokens
+            } else {
+                u_head.cache_write_tokens
+            },
         }
     }
 }
@@ -196,10 +270,39 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
             }
         }"#;
         let u = Usage::from_json(json_body);
-        assert_eq!(u.prompt_tokens, 100);
+        // Total prompt tokens = uncached (100) + cache read (80) + cache write (10) = 190
+        assert_eq!(u.prompt_tokens, 190);
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.cached_prompt_tokens, 80);
         assert_eq!(u.cache_write_tokens, 10);
+    }
+
+    #[test]
+    fn from_json_responses_api_plural_tokens_details() {
+        let json_body = br#"{
+            "usage": {
+                "prompt_tokens": 250,
+                "completion_tokens": 60,
+                "input_tokens_details": {
+                    "cached_tokens": 180
+                }
+            }
+        }"#;
+        let u = Usage::from_json(json_body);
+        assert_eq!(u.prompt_tokens, 250);
+        assert_eq!(u.completion_tokens, 60);
+        assert_eq!(u.cached_prompt_tokens, 180);
+        assert_eq!(u.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn from_sse_buffers_preserves_head_prompt_tokens() {
+        let head = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":2000}}}\n\n";
+        let tail = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":120}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let u = Usage::from_sse_buffers(head, tail);
+        assert_eq!(u.prompt_tokens, 2050); // 50 uncached + 2000 cache read
+        assert_eq!(u.completion_tokens, 120);
+        assert_eq!(u.cached_prompt_tokens, 2000);
     }
 
     #[test]

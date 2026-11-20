@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(row.completion_tokens, 45);
         assert_eq!(row.status, "error");
         assert_eq!(row.model.as_deref(), Some("claude-3-7-sonnet"));
-        assert_eq!(row.cost_usd_micros, 884);
+        assert_eq!(row.cost_usd_micros, 854);
         // The handover got attributed to this session.
         let hs = db.list_handovers(&sid).unwrap();
         assert_eq!(hs.len(), 1);

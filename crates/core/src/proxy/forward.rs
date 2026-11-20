@@ -52,6 +52,7 @@ const STRIP_HEADERS: &[&str] = &[
 
 /// Tail ring buffer size kept while streaming to extract usage at the end (~8KB).
 const SSE_TAIL_CAP: usize = 8 * 1024;
+const SSE_HEAD_CAP: usize = 8 * 1024;
 
 /// Per-upstream timeout for the aggregated `/v1/models` probe. The shared
 /// client has a 120s total timeout, far too long for a model-list poll.
@@ -744,17 +745,20 @@ where
     };
     let failover_path_owned = failover_path.map(|s| s.to_string());
 
+    let head: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_HEAD_CAP)));
     let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
+    let head_for_stream = head.clone();
     let tail_for_stream = tail.clone();
 
     let raw_chained = futures::stream::iter(buffered_chunks.into_iter().map(Ok))
         .chain(raw_stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))));
 
     let upstream = raw_chained.then(move |chunk_result| {
+        let head = head_for_stream.clone();
         let tail = tail_for_stream.clone();
         async move {
             if let Ok(chunk) = &chunk_result {
-                push_tail(&tail, chunk);
+                push_head_and_tail(&head, &tail, chunk);
             }
             chunk_result
         }
@@ -810,6 +814,7 @@ where
 
     let body = make_tapped_streaming_body_with_flag(
         robust,
+        head,
         tail,
         db,
         endpoint_owned,
@@ -1550,6 +1555,7 @@ async fn failover_loop(
                 } else {
                     None
                 };
+                let effective_model = entry.model_override.clone().or_else(|| model.clone());
                 return handle_success_non_streaming(
                     svc,
                     session_id,
@@ -1558,7 +1564,7 @@ async fn failover_loop(
                     status,
                     bytes,
                     endpoint,
-                    model,
+                    effective_model,
                     start,
                     inbound_proto,
                     provider.protocol,
@@ -1673,6 +1679,7 @@ async fn failover_loop(
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("req_{:016x}", rand::random::<u64>()));
 
+                let effective_model = entry.model_override.clone().or_else(|| model.clone());
                 return handle_success_streaming_committed(
                     svc,
                     session_id,
@@ -1684,7 +1691,7 @@ async fn failover_loop(
                     raw_stream,
                     has_tool_call,
                     endpoint,
-                    model,
+                    effective_model,
                     start,
                     inbound_proto,
                     provider.protocol,
@@ -1988,26 +1995,36 @@ where
     })
 }
 
-/// Append `chunk` to the tail ring buffer (~`SSE_TAIL_CAP` bytes).
-fn push_tail(tail: &Mutex<Vec<u8>>, chunk: &[u8]) {
-    let mut t = tail.lock().unwrap();
-    t.extend_from_slice(chunk);
-    if t.len() > SSE_TAIL_CAP {
-        let excess = t.len() - SSE_TAIL_CAP;
-        t.drain(..excess);
+/// Append `chunk` to both head buffer (first ~8KB) and tail ring buffer (last ~8KB).
+fn push_head_and_tail(head: &Mutex<Vec<u8>>, tail: &Mutex<Vec<u8>>, chunk: &[u8]) {
+    {
+        let mut h = head.lock().unwrap();
+        if h.len() < SSE_HEAD_CAP {
+            let space = SSE_HEAD_CAP - h.len();
+            let take = chunk.len().min(space);
+            h.extend_from_slice(&chunk[..take]);
+        }
+    }
+    {
+        let mut t = tail.lock().unwrap();
+        t.extend_from_slice(chunk);
+        if t.len() > SSE_TAIL_CAP {
+            let excess = t.len() - SSE_TAIL_CAP;
+            t.drain(..excess);
+        }
     }
 }
 
 /// Build a streaming axum `Body` from the upstream chunk stream that:
 ///   - forwards each chunk to the client unchanged, and
-///   - maintains a tail ring buffer (~`SSE_TAIL_CAP` bytes) of the most recent
-///     bytes, and once the stream ends, extracts usage from that tail and
-///     writes a request log row.
+///   - maintains head and tail buffers of the stream, and once the stream ends,
+///     extracts usage from those buffers and writes a request log row.
 ///
 /// The logging happens as a side effect of the stream being driven to
 /// completion by axum/the client.
 fn make_tapped_streaming_body_with_flag<S>(
     stream: S,
+    head: Arc<Mutex<Vec<u8>>>,
     tail: Arc<Mutex<Vec<u8>>>,
     db: crate::store::db::Database,
     endpoint: String,
@@ -2028,6 +2045,7 @@ where
 {
     Body::from_stream(TailLogStream {
         inner: Box::pin(stream),
+        head,
         tail,
         endpoint,
         model,
@@ -2049,9 +2067,10 @@ where
 // ── Stream wrapper ─────────────────────────────────────────────────────────
 
 /// Forwards an inner SSE stream unchanged; on stream end (or the first error
-/// item) writes exactly one request-log row with usage extracted from the tail.
+/// item) writes exactly one request-log row with usage extracted from head and tail.
 struct TailLogStream {
     inner: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    head: Arc<Mutex<Vec<u8>>>,
     tail: Arc<Mutex<Vec<u8>>>,
     endpoint: String,
     model: Option<String>,
@@ -2071,8 +2090,9 @@ struct TailLogStream {
 
 impl TailLogStream {
     fn log(&self, error: Option<String>) {
+        let head_bytes = self.head.lock().unwrap().clone();
         let tail_bytes = self.tail.lock().unwrap().clone();
-        let usage = Usage::from_sse_tail(&tail_bytes);
+        let usage = Usage::from_sse_buffers(&head_bytes, &tail_bytes);
         let duration_ms = self.start.elapsed().as_millis() as i64;
         let status_ok = error.is_none();
         let cost_usd_micros = crate::proxy::pricing::estimate_cost(
