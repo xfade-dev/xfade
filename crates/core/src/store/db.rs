@@ -83,6 +83,18 @@ pub struct HandoverRow {
     pub injected_at: Option<String>,
 }
 
+/// A dynamic pricing entry loaded from OpenRouter sync or configured by the user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DynamicPriceRow {
+    pub model_pattern: String,
+    pub input_micros_per_m: i64,
+    pub output_micros_per_m: i64,
+    pub cache_read_micros_per_m: i64,
+    pub cache_write_micros_per_m: i64,
+    pub source: String, // "synced" or "custom"
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EgressPolicy {
     Registered,
@@ -345,7 +357,17 @@ impl Database {
                 provider_id TEXT NOT NULL,
                 upstream_model TEXT NOT NULL,
                 PRIMARY KEY (client_model, provider_id)
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS model_pricing (
+                model_pattern TEXT PRIMARY KEY,
+                input_micros_per_m INTEGER NOT NULL,
+                output_micros_per_m INTEGER NOT NULL,
+                cache_read_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                cache_write_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_pricing_source ON model_pricing(source);",
         )?;
         // Idempotent column migration for pre-v0.3 databases where proxy_state
         // existed without model_override / target_protocol.
@@ -1758,6 +1780,154 @@ impl Database {
         }
         Ok(map)
     }
+
+    /// Insert or update a model pricing entry.
+    pub fn upsert_model_pricing(&self, row: &DynamicPriceRow) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO model_pricing (
+                model_pattern, input_micros_per_m, output_micros_per_m,
+                cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(model_pattern) DO UPDATE SET
+                input_micros_per_m = excluded.input_micros_per_m,
+                output_micros_per_m = excluded.output_micros_per_m,
+                cache_read_micros_per_m = excluded.cache_read_micros_per_m,
+                cache_write_micros_per_m = excluded.cache_write_micros_per_m,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                row.model_pattern,
+                row.input_micros_per_m,
+                row.output_micros_per_m,
+                row.cache_read_micros_per_m,
+                row.cache_write_micros_per_m,
+                row.source,
+                row.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically insert or update multiple model pricing entries in a transaction.
+    pub fn batch_upsert_model_pricing(&self, rows: &[DynamicPriceRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO model_pricing (
+                    model_pattern, input_micros_per_m, output_micros_per_m,
+                    cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(model_pattern) DO UPDATE SET
+                    input_micros_per_m = excluded.input_micros_per_m,
+                    output_micros_per_m = excluded.output_micros_per_m,
+                    cache_read_micros_per_m = excluded.cache_read_micros_per_m,
+                    cache_write_micros_per_m = excluded.cache_write_micros_per_m,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at",
+            )?;
+            for row in rows {
+                stmt.execute(rusqlite::params![
+                    row.model_pattern,
+                    row.input_micros_per_m,
+                    row.output_micros_per_m,
+                    row.cache_read_micros_per_m,
+                    row.cache_write_micros_per_m,
+                    row.source,
+                    row.updated_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Delete a single model pricing entry by pattern.
+    pub fn delete_model_pricing(&self, pattern: &str) -> Result<bool> {
+        let conn = self.conn();
+        let rows = conn.execute(
+            "DELETE FROM model_pricing WHERE model_pattern = ?1",
+            rusqlite::params![pattern],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove all synced pricing entries, preserving custom user overrides.
+    pub fn clear_synced_model_pricing(&self) -> Result<usize> {
+        let conn = self.conn();
+        let rows = conn.execute("DELETE FROM model_pricing WHERE source = 'synced'", [])?;
+        Ok(rows)
+    }
+
+    /// List all dynamic model pricing entries ordered alphabetically.
+    pub fn list_model_pricing(&self) -> Result<Vec<DynamicPriceRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT model_pattern, input_micros_per_m, output_micros_per_m,
+                    cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
+             FROM model_pricing ORDER BY model_pattern ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DynamicPriceRow {
+                model_pattern: row.get(0)?,
+                input_micros_per_m: row.get(1)?,
+                output_micros_per_m: row.get(2)?,
+                cache_read_micros_per_m: row.get(3)?,
+                cache_write_micros_per_m: row.get(4)?,
+                source: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    /// Resolve dynamic pricing for a model name.
+    ///
+    /// Checks both the model name and an optional canonical name against `model_pattern`.
+    /// Resolution precedence:
+    /// 1. Custom overrides (`source = 'custom'`) over synced entries (`source = 'synced'`).
+    /// 2. Longest matching prefix (`LENGTH(model_pattern) DESC`).
+    pub fn find_dynamic_model_price(
+        &self,
+        model: &str,
+        canonical: Option<&str>,
+    ) -> Result<Option<DynamicPriceRow>> {
+        let conn = self.conn();
+        let canonical_str = canonical.unwrap_or("");
+        let mut stmt = conn.prepare(
+            "SELECT model_pattern, input_micros_per_m, output_micros_per_m,
+                    cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
+             FROM model_pricing
+             WHERE (?1 = model_pattern OR (?1 != '' AND LENGTH(?1) >= LENGTH(model_pattern) AND SUBSTR(?1, 1, LENGTH(model_pattern)) = model_pattern))
+                OR (?2 != '' AND (?2 = model_pattern OR (LENGTH(?2) >= LENGTH(model_pattern) AND SUBSTR(?2, 1, LENGTH(model_pattern)) = model_pattern)))
+             ORDER BY
+                 CASE source WHEN 'custom' THEN 0 ELSE 1 END ASC,
+                 LENGTH(model_pattern) DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![model, canonical_str])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(DynamicPriceRow {
+                model_pattern: row.get(0)?,
+                input_micros_per_m: row.get(1)?,
+                output_micros_per_m: row.get(2)?,
+                cache_read_micros_per_m: row.get(3)?,
+                cache_write_micros_per_m: row.get(4)?,
+                source: row.get(5)?,
+                updated_at: row.get(6)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
@@ -2962,5 +3132,105 @@ mod tests {
         // Revert back
         db.set_egress_policy(EgressPolicy::Registered).unwrap();
         assert!(!db.is_domain_allowed("evil.com").unwrap());
+    }
+
+    #[test]
+    fn test_model_pricing_crud_and_precedence() {
+        let db = Database::open_memory().unwrap();
+
+        // Initially empty
+        assert!(db.list_model_pricing().unwrap().is_empty());
+        assert!(db
+            .find_dynamic_model_price("claude-sonnet-5.5", None)
+            .unwrap()
+            .is_none());
+
+        // 1. Upsert a synced row
+        let row1 = DynamicPriceRow {
+            model_pattern: "anthropic/claude-sonnet-5.5".to_string(),
+            input_micros_per_m: 2_000_000,
+            output_micros_per_m: 10_000_000,
+            cache_read_micros_per_m: 100_000,
+            cache_write_micros_per_m: 2_500_000,
+            source: "synced".to_string(),
+            updated_at: "2026-11-20T20:00:00Z".to_string(),
+        };
+        db.upsert_model_pricing(&row1).unwrap();
+
+        // Find by full model name
+        let found = db
+            .find_dynamic_model_price("anthropic/claude-sonnet-5.5", None)
+            .unwrap()
+            .expect("should find row1");
+        assert_eq!(found.input_micros_per_m, 2_000_000);
+        assert_eq!(found.source, "synced");
+
+        // Prefix match
+        let found_prefix = db
+            .find_dynamic_model_price("anthropic/claude-sonnet-5.5-20261101", None)
+            .unwrap()
+            .expect("should match prefix");
+        assert_eq!(found_prefix.model_pattern, "anthropic/claude-sonnet-5.5");
+
+        // Canonical alias match
+        let found_canonical = db
+            .find_dynamic_model_price("sonnet", Some("anthropic/claude-sonnet-5.5"))
+            .unwrap()
+            .expect("should match canonical");
+        assert_eq!(found_canonical.model_pattern, "anthropic/claude-sonnet-5.5");
+
+        // 2. Custom override wins over synced
+        let row_custom = DynamicPriceRow {
+            model_pattern: "claude-sonnet-5.5".to_string(),
+            input_micros_per_m: 1_500_000,
+            output_micros_per_m: 8_000_000,
+            cache_read_micros_per_m: 50_000,
+            cache_write_micros_per_m: 1_000_000,
+            source: "custom".to_string(),
+            updated_at: "2026-11-20T20:05:00Z".to_string(),
+        };
+        db.upsert_model_pricing(&row_custom).unwrap();
+
+        // When queried with model="claude-sonnet-5.5", custom row must be returned
+        let found_custom = db
+            .find_dynamic_model_price("claude-sonnet-5.5", None)
+            .unwrap()
+            .expect("custom");
+        assert_eq!(found_custom.input_micros_per_m, 1_500_000);
+        assert_eq!(found_custom.source, "custom");
+
+        // 3. Batch upsert
+        let batch = vec![
+            DynamicPriceRow {
+                model_pattern: "gpt-6.2-astra".to_string(),
+                input_micros_per_m: 8_000_000,
+                output_micros_per_m: 40_000_000,
+                cache_read_micros_per_m: 400_000,
+                cache_write_micros_per_m: 10_000_000,
+                source: "synced".to_string(),
+                updated_at: "2026-11-20T20:00:00Z".to_string(),
+            },
+            DynamicPriceRow {
+                model_pattern: "deepseek-v4.1-flash".to_string(),
+                input_micros_per_m: 36_000,
+                output_micros_per_m: 500_000,
+                cache_read_micros_per_m: 10_000,
+                cache_write_micros_per_m: 36_000,
+                source: "synced".to_string(),
+                updated_at: "2026-11-20T20:00:00Z".to_string(),
+            },
+        ];
+        let inserted = db.batch_upsert_model_pricing(&batch).unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(db.list_model_pricing().unwrap().len(), 4);
+
+        // 4. Delete single custom pricing
+        assert!(db.delete_model_pricing("claude-sonnet-5.5").unwrap());
+        assert!(!db.delete_model_pricing("non-existent").unwrap());
+
+        // 5. Clear all synced
+        let cleared = db.clear_synced_model_pricing().unwrap();
+        assert_eq!(cleared, 3);
+        assert!(db.list_model_pricing().unwrap().is_empty());
     }
 }
