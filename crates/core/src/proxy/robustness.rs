@@ -1,7 +1,10 @@
 //! Robustness, timeout management, retry-after backoff, and stream interruption handling.
 
+use axum::body::Bytes;
 use axum::http::HeaderMap;
 use std::time::Duration;
+
+use crate::models::ProviderProtocol;
 
 /// Tiered timeout configuration for the proxy forwarding pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,9 +152,8 @@ impl SemanticDetector {
                                                 has_semantic = true;
                                             }
                                         }
-                                        if let Some(reasoning) = delta
-                                            .get("reasoning_content")
-                                            .and_then(|r| r.as_str())
+                                        if let Some(reasoning) =
+                                            delta.get("reasoning_content").and_then(|r| r.as_str())
                                         {
                                             if !reasoning.is_empty() {
                                                 has_semantic = true;
@@ -233,6 +235,59 @@ impl SemanticDetector {
     }
 }
 
+/// Synthesize a protocol-native stream interruption event.
+///
+/// Sent when an active stream is interrupted post-commit (e.g. upstream drop or chunk idle timeout).
+/// `retryable` is true if only text or reasoning tokens have been emitted, false if tool calls were started.
+pub fn synthesize_stream_interrupted(
+    proto: ProviderProtocol,
+    req_id: &str,
+    has_tool_call: bool,
+) -> Bytes {
+    let retryable = !has_tool_call;
+    match proto {
+        ProviderProtocol::Chat => {
+            let json = serde_json::json!({
+                "error": {
+                    "code": "xfade_stream_interrupted",
+                    "message": "upstream connection lost mid-stream",
+                    "type": "xfade_stream_interrupted",
+                    "request_id": req_id,
+                    "retryable": retryable
+                }
+            });
+            Bytes::from(format!("data: {json}\n\ndata: [DONE]\n\n"))
+        }
+        ProviderProtocol::Messages => {
+            let json = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "xfade_stream_interrupted",
+                    "message": "upstream connection lost mid-stream",
+                    "request_id": req_id,
+                    "retryable": retryable
+                }
+            });
+            Bytes::from(format!("event: error\ndata: {json}\n\n"))
+        }
+        ProviderProtocol::Responses => {
+            let json = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "id": req_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "xfade_stream_interrupted",
+                        "message": "upstream connection lost mid-stream",
+                        "retryable": retryable
+                    }
+                }
+            });
+            Bytes::from(format!("event: response.failed\ndata: {json}\n\n"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,7 +328,9 @@ mod tests {
         let chat_text = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n";
         assert!(matches!(
             SemanticDetector::inspect_chunk(chat_text, ProviderProtocol::Chat),
-            CommitDecision::Commit { has_tool_call: false }
+            CommitDecision::Commit {
+                has_tool_call: false
+            }
         ));
 
         // Chat reasoning delta -> Commit { has_tool_call: false }
@@ -281,7 +338,9 @@ mod tests {
             b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n";
         assert!(matches!(
             SemanticDetector::inspect_chunk(chat_reasoning, ProviderProtocol::Chat),
-            CommitDecision::Commit { has_tool_call: false }
+            CommitDecision::Commit {
+                has_tool_call: false
+            }
         ));
 
         // Chat tool_calls delta -> Commit { has_tool_call: true }
@@ -289,21 +348,27 @@ mod tests {
             b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\"}]}}]}\n\n";
         assert!(matches!(
             SemanticDetector::inspect_chunk(chat_tool, ProviderProtocol::Chat),
-            CommitDecision::Commit { has_tool_call: true }
+            CommitDecision::Commit {
+                has_tool_call: true
+            }
         ));
 
         // Messages thinking delta -> Commit { has_tool_call: false }
         let msg_thinking = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think\"}}\n\n";
         assert!(matches!(
             SemanticDetector::inspect_chunk(msg_thinking, ProviderProtocol::Messages),
-            CommitDecision::Commit { has_tool_call: false }
+            CommitDecision::Commit {
+                has_tool_call: false
+            }
         ));
 
         // Messages tool_use -> Commit { has_tool_call: true }
         let msg_tool = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\"}}\n\n";
         assert!(matches!(
             SemanticDetector::inspect_chunk(msg_tool, ProviderProtocol::Messages),
-            CommitDecision::Commit { has_tool_call: true }
+            CommitDecision::Commit {
+                has_tool_call: true
+            }
         ));
 
         // Upstream 200 error chunk -> Error
@@ -321,5 +386,36 @@ mod tests {
 
         let ok_json = br#"{"choices":[{"message":{"content":"Hi"}}]}"#;
         assert!(SemanticDetector::is_error_payload(ok_json).is_none());
+    }
+
+    #[test]
+    fn test_synthesize_stream_interrupted_wire_formats() {
+        use crate::models::ProviderProtocol;
+
+        // 1. Chat text-only (retryable: true)
+        let b_chat = synthesize_stream_interrupted(ProviderProtocol::Chat, "req-123", false);
+        let s_chat = String::from_utf8_lossy(&b_chat);
+        assert!(s_chat.contains(r#""code":"xfade_stream_interrupted""#));
+        assert!(s_chat.contains(r#""request_id":"req-123""#));
+        assert!(s_chat.contains(r#""retryable":true"#));
+        assert!(s_chat.ends_with("data: [DONE]\n\n"));
+
+        // 2. Chat with tool_call (retryable: false)
+        let b_chat_tool = synthesize_stream_interrupted(ProviderProtocol::Chat, "req-123", true);
+        let s_chat_tool = String::from_utf8_lossy(&b_chat_tool);
+        assert!(s_chat_tool.contains(r#""retryable":false"#));
+
+        // 3. Messages text-only (event: error)
+        let b_msg = synthesize_stream_interrupted(ProviderProtocol::Messages, "req-456", false);
+        let s_msg = String::from_utf8_lossy(&b_msg);
+        assert!(s_msg.starts_with("event: error\n"));
+        assert!(s_msg.contains(r#""type":"xfade_stream_interrupted""#));
+        assert!(s_msg.contains(r#""retryable":true"#));
+
+        // 4. Responses with tool_call (event: response.failed)
+        let b_resp = synthesize_stream_interrupted(ProviderProtocol::Responses, "req-789", true);
+        let s_resp = String::from_utf8_lossy(&b_resp);
+        assert!(s_resp.contains("response.failed"));
+        assert!(s_resp.contains(r#""retryable":false"#));
     }
 }
