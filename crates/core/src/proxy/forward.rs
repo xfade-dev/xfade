@@ -324,7 +324,8 @@ fn log_request_full(
     explicit_domain: Option<&str>,
     failover_path: Option<&str>,
 ) {
-    let cost_usd_micros = crate::proxy::pricing::estimate_cost(
+    let cost_usd_micros = crate::proxy::pricing::estimate_cost_with_db(
+        Some(svc.core.db()),
         model.as_deref(),
         usage.prompt_tokens,
         usage.completion_tokens,
@@ -2095,7 +2096,8 @@ impl TailLogStream {
         let usage = Usage::from_sse_buffers(&head_bytes, &tail_bytes);
         let duration_ms = self.start.elapsed().as_millis() as i64;
         let status_ok = error.is_none();
-        let cost_usd_micros = crate::proxy::pricing::estimate_cost(
+        let cost_usd_micros = crate::proxy::pricing::estimate_cost_with_db(
+            Some(&self.db),
             self.model.as_deref(),
             usage.prompt_tokens,
             usage.completion_tokens,
