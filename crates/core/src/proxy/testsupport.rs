@@ -19,6 +19,12 @@ pub struct RecordedRequest {
 enum MockResponse {
     /// Non-streaming: status + body bytes.
     Plain { status: StatusCode, body: String },
+    /// Non-streaming with custom headers.
+    PlainWithHeaders {
+        status: StatusCode,
+        headers: Vec<(String, String)>,
+        body: String,
+    },
     /// Streaming: status + content-type text/event-stream + lines (each terminated with `\n\n`).
     Sse {
         status: StatusCode,
@@ -83,6 +89,17 @@ impl MockUpstream {
                         .status(status)
                         .body(Body::from(body))
                         .unwrap(),
+                    MockResponse::PlainWithHeaders {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let mut b = Response::builder().status(status);
+                        for (k, v) in headers {
+                            b = b.header(k, v);
+                        }
+                        b.body(Body::from(body)).unwrap()
+                    }
                     MockResponse::Sse { status, lines } => {
                         // Build a single body chunk where each line is terminated by `\n\n`,
                         // then close the stream so the client doesn't hang.
@@ -164,6 +181,20 @@ impl MockUpstream {
             status: StatusCode::from_u16(status).unwrap(),
             body: body.to_string(),
         });
+    }
+
+    pub fn respond_with_headers(&self, status: u16, headers: &[(&str, &str)], body: &str) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push(MockResponse::PlainWithHeaders {
+                status: StatusCode::from_u16(status).unwrap(),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body: body.to_string(),
+            });
     }
 
     pub fn respond_sequence(&self, seq: Vec<(u16, &str)>) {
