@@ -223,10 +223,17 @@ impl ProxyService {
     }
 
     pub fn record_failure(&self, provider_id: &str) {
-        self.circuit_breaker.record_failure(provider_id);
-        let fails = self.circuit_breaker.failure_count(provider_id);
-        let cooldown_remaining = self
-            .circuit_breaker
+        Self::record_failure_static(&self.circuit_breaker, self.core.db(), provider_id);
+    }
+
+    pub fn record_failure_static(
+        circuit_breaker: &CircuitBreaker,
+        db: &crate::store::db::Database,
+        provider_id: &str,
+    ) {
+        circuit_breaker.record_failure(provider_id);
+        let fails = circuit_breaker.failure_count(provider_id);
+        let cooldown_remaining = circuit_breaker
             .remaining_cooldown_secs(provider_id)
             .unwrap_or(0);
         let cooldown_until_secs = if cooldown_remaining > 0 {
@@ -238,7 +245,7 @@ impl ProxyService {
             fails,
             cooldown_until_secs,
         };
-        let _ = self.core.db().save_circuit(provider_id, &c);
+        let _ = db.save_circuit(provider_id, &c);
     }
 
     /// Start the proxy; shut down gracefully when the `shutdown` future completes. host/port come from self fields.
@@ -2635,6 +2642,155 @@ mod tests {
         assert!(
             cached.is_none(),
             "aliases must not be saved to model_routes cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_pre_commit_200_error_body_fails_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let up1 = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")]);
+        core.db()
+            .set_routes(&["p1".into(), "p2".into()], None, "chat")
+            .unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        // p1 returns 200 OK with error body
+        up1.respond_with(
+            200,
+            r#"{"error":{"message":"upstream overloaded","type":"server_error"}}"#,
+        );
+        // p2 returns 200 OK with valid response
+        up2.respond_with(
+            200,
+            r#"{"choices":[{"message":{"content":"healthy from p2"}}]}"#,
+        );
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("healthy from p2"),
+            "expected failover to p2, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_retry_after_under_2s_retries_same_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let url = spawn_service(ProxyService::new(core)).await;
+        // First attempt returns 429 with Retry-After: 0
+        up.respond_with_headers(429, &[("retry-after", "0")], r#"{"error":"rate_limited"}"#);
+        // Second attempt on the same provider returns 200 OK
+        up.respond_with(
+            200,
+            r#"{"choices":[{"message":{"content":"success after retry"}}]}"#,
+        );
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("success after retry"),
+            "expected retry on same route to succeed, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_streaming_post_commit_interruption_synthesizes_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let svc = ProxyService::new(core);
+        let cb = svc.circuit_breaker.clone();
+        let url = spawn_service(svc).await;
+
+        up.respond_sse_error(vec![r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#]);
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("Hello"),
+            "client must receive committed tokens"
+        );
+        assert!(
+            body.contains("xfade_stream_interrupted"),
+            "expected synthesized xfade_stream_interrupted frame, got: {body}"
+        );
+        assert_eq!(
+            cb.failure_count("p1"),
+            1,
+            "failure must be recorded on circuit breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_streaming_pre_commit_error_frame_fails_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let up1 = MockUpstream::spawn().await;
+        let up2 = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up1.url(), "k1"), ("p2", &up2.url(), "k2")]);
+        core.db()
+            .set_routes(&["p1".into(), "p2".into()], None, "chat")
+            .unwrap();
+
+        let svc = ProxyService::new(core);
+        let cb = svc.circuit_breaker.clone();
+        let url = spawn_service(svc).await;
+
+        // p1 returns 200 OK SSE, but first line is an error payload
+        up1.respond_sse(vec![
+            r#"data: {"error":{"message":"overloaded","type":"server_error"}}"#,
+        ]);
+        // p2 returns 200 OK SSE with valid text
+        up2.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"hello from p2"}}]}"#,
+            r#"data: [DONE]"#,
+        ]);
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("hello from p2"),
+            "expected failover to p2, got: {body}"
+        );
+        assert_eq!(
+            cb.failure_count("p1"),
+            1,
+            "pre-commit failure must trip circuit on p1"
         );
     }
 }

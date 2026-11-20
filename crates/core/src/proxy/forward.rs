@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::auth::ClientIdentity;
+use super::robustness;
 use super::usage::Usage;
 use super::ProxyService;
 use crate::models::{Provider, ProviderProtocol, ToolKind};
@@ -22,7 +23,7 @@ use axum::{
 };
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -592,67 +593,103 @@ pub fn prepare_body_for_provider(
     }
 }
 
-/// Handle a successful upstream response. Returns the response to send to the client.
-/// Callers (the failover loop) guarantee a success/redirection status.
-async fn handle_success(
-    svc: &ProxyService,
-    session_id: Option<&str>,
-    route_id: &str,
-    tool: &str,
-    resp: reqwest::Response,
-    endpoint: &str,
-    model: Option<String>,
-    start: Instant,
+fn make_robust_stream<S>(
+    stream: S,
+    idle_timeout: Duration,
     inbound_proto: ProviderProtocol,
-    outbound_proto: ProviderProtocol,
-    req_model: String,
-    failover_path: Option<&str>,
-) -> Response {
-    let streaming = is_stream_response(&resp);
-
-    svc.record_success(route_id);
-
-    if streaming {
-        handle_success_streaming(
-            svc,
-            session_id,
-            route_id,
-            tool,
-            resp,
-            endpoint,
-            model,
-            start,
-            inbound_proto,
-            outbound_proto,
-            req_model,
-            failover_path,
-        )
-    } else {
-        handle_success_non_streaming(
-            svc,
-            session_id,
-            route_id,
-            tool,
-            resp,
-            endpoint,
-            model,
-            start,
-            inbound_proto,
-            outbound_proto,
-            req_model,
-            failover_path,
-        )
-        .await
+    req_id: String,
+    has_tool_call: bool,
+    provider_id: String,
+    circuit_breaker: Arc<super::CircuitBreaker>,
+    db: crate::store::db::Database,
+    interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    struct State {
+        stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+        idle_timeout: Duration,
+        inbound_proto: ProviderProtocol,
+        req_id: String,
+        has_tool_call: bool,
+        provider_id: String,
+        circuit_breaker: Arc<super::CircuitBreaker>,
+        db: crate::store::db::Database,
+        interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
+        emitted_interrupted: bool,
     }
+
+    let init = State {
+        stream: Box::pin(stream),
+        idle_timeout,
+        inbound_proto,
+        req_id,
+        has_tool_call,
+        provider_id,
+        circuit_breaker,
+        db,
+        interrupted_flag,
+        emitted_interrupted: false,
+    };
+
+    futures::stream::unfold(init, |mut st| async move {
+        if st.emitted_interrupted {
+            return None;
+        }
+
+        match tokio::time::timeout(st.idle_timeout, st.stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                let text = String::from_utf8_lossy(&chunk);
+                if !st.has_tool_call
+                    && (text.contains("tool_calls")
+                        || text.contains("tool_use")
+                        || text.contains("function_call"))
+                {
+                    st.has_tool_call = true;
+                }
+                Some((Ok(chunk), st))
+            }
+            Ok(Some(Err(_err))) => {
+                st.emitted_interrupted = true;
+                st.interrupted_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                ProxyService::record_failure_static(&st.circuit_breaker, &st.db, &st.provider_id);
+                let interrupted = robustness::synthesize_stream_interrupted(
+                    st.inbound_proto,
+                    &st.req_id,
+                    st.has_tool_call,
+                );
+                Some((Ok(interrupted), st))
+            }
+            Ok(None) => None,
+            Err(_timeout_elapsed) => {
+                st.emitted_interrupted = true;
+                st.interrupted_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                ProxyService::record_failure_static(&st.circuit_breaker, &st.db, &st.provider_id);
+                let interrupted = robustness::synthesize_stream_interrupted(
+                    st.inbound_proto,
+                    &st.req_id,
+                    st.has_tool_call,
+                );
+                Some((Ok(interrupted), st))
+            }
+        }
+    })
 }
 
-/// Handle successful streaming response.
-fn handle_success_streaming(
+/// Handle committed streaming response with buffering flusher and post-commit idle/interruption wrapper.
+fn handle_success_streaming_committed<S>(
     svc: &ProxyService,
     session_id: Option<&str>,
     route_id: &str,
     tool: &str,
-    resp: reqwest::Response,
+    status: StatusCode,
+    resp_headers: &reqwest::header::HeaderMap,
+    buffered_chunks: Vec<Bytes>,
+    raw_stream: S,
+    has_tool_call: bool,
     endpoint: &str,
     model: Option<String>,
     start: Instant,
@@ -660,13 +697,16 @@ fn handle_success_streaming(
     outbound_proto: ProviderProtocol,
     req_model: String,
     failover_path: Option<&str>,
-) -> Response {
-    let status = resp.status();
+    req_id: String,
+) -> Response
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
     let is_convert = inbound_proto != outbound_proto;
     let content_type = if is_convert {
         "text/event-stream".to_string()
     } else {
-        resp.headers()
+        resp_headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/event-stream")
@@ -679,6 +719,7 @@ fn handle_success_streaming(
     let model_owned = model.clone();
     let session_owned = session_id.map(|s| s.to_string());
     let db = svc.core.db().clone();
+    let cb = svc.circuit_breaker.clone();
 
     let (upstream_domain, key_ref) = if let Some(p) = tool
         .parse::<ToolKind>()
@@ -693,82 +734,84 @@ fn handle_success_streaming(
     };
     let failover_path_owned = failover_path.map(|s| s.to_string());
 
-    let body =
-        if is_convert {
-            // Pass upstream errors through: the converters surface them as
-            // protocol-level error events (Anthropic `error` / `response.failed`)
-            // instead of masking a truncated stream as success.
-            let upstream = resp
-                .bytes_stream()
-                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
+    let tail_for_stream = tail.clone();
 
-            // Step 1: Outbound -> Canonical Chat IR stream
-            let chat_stream: std::pin::Pin<
-                Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>,
-            > =
-                match outbound_proto {
-                    ProviderProtocol::Chat => Box::pin(upstream),
-                    ProviderProtocol::Messages => Box::pin(
-                        super::convert::stream_anthropic_to_chat(upstream, req_model.clone()),
-                    ),
-                    ProviderProtocol::Responses => Box::pin(
-                        super::convert::stream_responses_to_chat(upstream, req_model.clone()),
-                    ),
-                };
+    let raw_chained = futures::stream::iter(buffered_chunks.into_iter().map(Ok))
+        .chain(raw_stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))));
 
-            // Step 2: Canonical Chat IR stream -> Inbound stream
-            let converted: std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send>> =
-                match inbound_proto {
-                    ProviderProtocol::Chat => Box::pin(chat_stream.map(|r| match r {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let err_json = serde_json::json!({
-                                "error": {
-                                    "message": format!("upstream stream error: {e}"),
-                                    "type": "upstream_error"
-                                }
-                            });
-                            Bytes::from(format!("data: {err_json}\n\ndata: [DONE]\n\n"))
-                        }
-                    })),
-                    ProviderProtocol::Messages => Box::pin(
-                        super::convert::stream_openai_to_anthropic(chat_stream, req_model),
-                    ),
-                    ProviderProtocol::Responses => Box::pin(
-                        super::convert::stream_chat_to_responses(chat_stream, req_model),
-                    ),
-                };
+    let upstream = raw_chained.then(move |chunk_result| {
+        let tail = tail_for_stream.clone();
+        async move {
+            if let Ok(chunk) = &chunk_result {
+                push_tail(&tail, chunk);
+            }
+            chunk_result
+        }
+    });
 
-            make_converted_tapped_streaming_body(
-                converted,
-                db,
-                endpoint_owned,
-                model_owned,
-                provider_id_owned,
-                tool_owned,
-                session_owned,
-                status,
-                start,
-                key_ref,
-                upstream_domain,
-                failover_path_owned,
-            )
-        } else {
-            make_tapped_streaming_body(
-                resp.bytes_stream(),
-                db,
-                endpoint_owned,
-                model_owned,
-                provider_id_owned,
-                tool_owned,
-                session_owned,
-                status,
-                start,
-                key_ref,
-                upstream_domain,
-                failover_path_owned,
-            )
+    let proto_stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>,
+    > = if is_convert {
+        // Step 1: Outbound -> Canonical Chat IR stream
+        let chat_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>,
+        > = match outbound_proto {
+            ProviderProtocol::Chat => Box::pin(upstream),
+            ProviderProtocol::Messages => Box::pin(super::convert::stream_anthropic_to_chat(
+                upstream,
+                req_model.clone(),
+            )),
+            ProviderProtocol::Responses => Box::pin(super::convert::stream_responses_to_chat(
+                upstream,
+                req_model.clone(),
+            )),
         };
+
+        // Step 2: Canonical Chat IR stream -> Inbound stream
+        match inbound_proto {
+            ProviderProtocol::Chat => Box::pin(chat_stream),
+            ProviderProtocol::Messages => {
+                Box::pin(super::convert::stream_openai_to_anthropic(chat_stream, req_model).map(Ok))
+            }
+            ProviderProtocol::Responses => {
+                Box::pin(super::convert::stream_chat_to_responses(chat_stream, req_model).map(Ok))
+            }
+        }
+    } else {
+        Box::pin(filter_empty_choices(upstream))
+    };
+
+    let interrupted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let robust = make_robust_stream(
+        proto_stream,
+        svc.timeouts.idle_timeout,
+        inbound_proto,
+        req_id,
+        has_tool_call,
+        provider_id_owned.clone(),
+        cb,
+        db.clone(),
+        interrupted_flag.clone(),
+    );
+
+    let body = make_tapped_streaming_body_with_flag(
+        robust,
+        tail,
+        db,
+        endpoint_owned,
+        model_owned,
+        provider_id_owned,
+        tool_owned,
+        session_owned,
+        status,
+        start,
+        key_ref,
+        upstream_domain,
+        failover_path_owned,
+        interrupted_flag,
+    );
 
     let mut resp_builder = Response::builder().status(status);
     if let Some(hv) = resp_builder.headers_mut() {
@@ -776,6 +819,12 @@ fn handle_success_streaming(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_str(&content_type).unwrap(),
         );
+        if let Some(path_json) = failover_path {
+            hv.insert(
+                axum::http::header::HeaderName::from_static("x-xfade-failover-path"),
+                axum::http::HeaderValue::from_str(path_json).unwrap(),
+            );
+        }
     }
     resp_builder.body(body).unwrap()
 }
@@ -788,13 +837,14 @@ fn body_looks_like_json(bytes: &[u8]) -> bool {
         .is_some_and(|b| *b == b'{' || *b == b'[')
 }
 
-/// Handle successful non-streaming response.
+/// Handle successful non-streaming response from verified pre-commit bytes.
 async fn handle_success_non_streaming(
     svc: &ProxyService,
     session_id: Option<&str>,
     route_id: &str,
     tool: &str,
-    resp: reqwest::Response,
+    status: StatusCode,
+    bytes: Bytes,
     endpoint: &str,
     model: Option<String>,
     start: Instant,
@@ -803,67 +853,7 @@ async fn handle_success_non_streaming(
     req_model: String,
     failover_path: Option<&str>,
 ) -> Response {
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            let duration_ms = start.elapsed().as_millis() as i64;
-            log_request(
-                svc,
-                session_id,
-                endpoint,
-                &model,
-                route_id,
-                tool,
-                0,
-                Usage::default(),
-                duration_ms,
-                Some(format!("read body: {e}")),
-            );
-            svc.record_failure(route_id);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(e.to_string().into())
-                .unwrap();
-        }
-    };
-
     let duration_ms = start.elapsed().as_millis() as i64;
-
-    // A 2xx response that is neither SSE nor JSON means the upstream URL is
-    // wrong (typically a gateway web page answering 200 HTML because the
-    // provider base_url misses the /v1 path). Fail loudly instead of relaying
-    // the page to the client, which surfaces as cryptic errors like Pi's
-    // "Stream ended without finish_reason".
-    if !content_type.contains("json") && !body_looks_like_json(&bytes) {
-        let msg = format!(
-            "xfade: upstream provider '{route_id}' returned a non-JSON response \
-             (content-type: '{content_type}'); its base_url is probably wrong — \
-             OpenAI/Anthropic-compatible upstreams usually need a /v1 path suffix"
-        );
-        log_request(
-            svc,
-            session_id,
-            endpoint,
-            &model,
-            route_id,
-            tool,
-            StatusCode::BAD_GATEWAY.as_u16() as i64,
-            Usage::default(),
-            duration_ms,
-            Some(msg.clone()),
-        );
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(msg.into())
-            .unwrap();
-    }
 
     if inbound_proto != outbound_proto {
         // Step 1: Outbound -> Canonical Chat IR
@@ -948,10 +938,16 @@ async fn handle_success_non_streaming(
         None,
         failover_path,
     );
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .body(Body::from(bytes))
-        .unwrap()
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(path_json) = failover_path {
+        builder = builder.header(
+            axum::http::header::HeaderName::from_static("x-xfade-failover-path"),
+            axum::http::HeaderValue::from_str(path_json).unwrap(),
+        );
+    }
+    builder.body(Body::from(bytes)).unwrap()
 }
 
 /// Whether a 4xx response is a *transient* upstream problem worth failing
@@ -1220,6 +1216,30 @@ async fn failover_loop(
             }
         };
 
+        // Intra-upstream retry on 429/503 if Retry-After <= 2s
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS
+            || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+        {
+            if let Some(delay) = robustness::parse_retry_after(resp.headers()) {
+                if delay <= Duration::from_secs(2) {
+                    tokio::time::sleep(delay).await;
+                    if let Ok(retry_resp) = try_forward(
+                        &svc.client,
+                        method,
+                        &base_url,
+                        upstream_endpoint,
+                        headers,
+                        sending_body,
+                        auth_key.as_deref(),
+                    )
+                    .await
+                    {
+                        resp = retry_resp;
+                    }
+                }
+            }
+        }
+
         // If response is 400 Bad Request, attempt self-healing parameter rectification
         if resp.status() == StatusCode::BAD_REQUEST {
             let err_bytes = resp.bytes().await.unwrap_or_default();
@@ -1329,30 +1349,257 @@ async fn failover_loop(
 
         let status = resp.status();
         if status.is_success() || status.is_redirection() {
-            failover_trajectory.push(serde_json::json!({
-                "provider": route_id,
-                "status": status.as_u16(),
-            }));
-            let failover_path_json = if failover_trajectory.len() > 1 {
-                serde_json::to_string(&failover_trajectory).ok()
+            let is_stream = is_stream_response(&resp);
+            let resp_headers = resp.headers().clone();
+            if !is_stream {
+                let content_type = resp_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_lowercase();
+                // Non-streaming pre-commit gate: read body and inspect
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let duration_ms = start.elapsed().as_millis() as i64;
+                        log_request(
+                            svc,
+                            session_id,
+                            endpoint,
+                            &model,
+                            route_id,
+                            provider.tool.as_str(),
+                            0,
+                            Usage::default(),
+                            duration_ms,
+                            Some(format!("read body: {e}")),
+                        );
+                        svc.record_failure(route_id);
+                        failover_trajectory.push(serde_json::json!({
+                            "provider": route_id,
+                            "status": 502,
+                            "error": format!("read body: {e}"),
+                        }));
+                        last_err = Some((StatusCode::BAD_GATEWAY, e.to_string(), None));
+                        continue;
+                    }
+                };
+
+                if !content_type.contains("json") && !body_looks_like_json(&bytes) {
+                    let msg = format!(
+                        "xfade: upstream provider '{route_id}' returned a non-JSON response \
+                         (content-type: '{content_type}'); its base_url is probably wrong — \
+                         OpenAI/Anthropic-compatible upstreams usually need a /v1 path suffix"
+                    );
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        StatusCode::BAD_GATEWAY.as_u16() as i64,
+                        Usage::default(),
+                        duration_ms,
+                        Some(msg.clone()),
+                    );
+                    svc.record_failure(route_id);
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": 502,
+                        "error": "non_json_response",
+                    }));
+                    last_err = Some((StatusCode::BAD_GATEWAY, msg, None));
+                    continue;
+                }
+
+                if let Some(err_msg) = robustness::SemanticDetector::is_error_payload(&bytes) {
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        StatusCode::BAD_GATEWAY.as_u16() as i64,
+                        Usage::default(),
+                        duration_ms,
+                        Some(format!("upstream 200 error payload: {err_msg}")),
+                    );
+                    svc.record_failure(route_id);
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": 200,
+                        "error": format!("error_payload: {err_msg}"),
+                    }));
+                    let is_rate_limit = err_msg.to_lowercase().contains("rate")
+                        || err_msg.to_lowercase().contains("quota")
+                        || err_msg.to_lowercase().contains("insufficient");
+                    let mapped_status = if is_rate_limit {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    last_err = Some((
+                        mapped_status,
+                        format!(
+                            "{{\"error\":{{\"code\":\"upstream_error\",\"message\":{}}}}}",
+                            serde_json::to_string(&err_msg)
+                                .unwrap_or_else(|_| "\"upstream error\"".to_string())
+                        ),
+                        None,
+                    ));
+                    continue;
+                }
+
+                // Verified non-streaming response: commit!
+                svc.record_success(route_id);
+                failover_trajectory.push(serde_json::json!({
+                    "provider": route_id,
+                    "status": status.as_u16(),
+                }));
+                let failover_path_json = if failover_trajectory.len() > 1 {
+                    serde_json::to_string(&failover_trajectory).ok()
+                } else {
+                    None
+                };
+                return handle_success_non_streaming(
+                    svc,
+                    session_id,
+                    route_id,
+                    provider.tool.as_str(),
+                    status,
+                    bytes,
+                    endpoint,
+                    model,
+                    start,
+                    inbound_proto,
+                    provider.protocol,
+                    req_model.to_string(),
+                    failover_path_json.as_deref(),
+                )
+                .await;
             } else {
-                None
-            };
-            return handle_success(
-                svc,
-                session_id,
-                route_id,
-                provider.tool.as_str(),
-                resp,
-                endpoint,
-                model,
-                start,
-                inbound_proto,
-                provider.protocol,
-                req_model.to_string(),
-                failover_path_json.as_deref(),
-            )
-            .await;
+                // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout
+                let mut raw_stream = resp.bytes_stream();
+                let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                let mut has_tool_call = false;
+                let mut is_committed = false;
+                let mut stream_err: Option<String> = None;
+                let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
+
+                while !is_committed {
+                    let now = tokio::time::Instant::now();
+                    if now >= ttft_deadline {
+                        stream_err = Some("ttft_timeout".to_string());
+                        break;
+                    }
+                    let remaining = ttft_deadline - now;
+                    match tokio::time::timeout(remaining, raw_stream.next()).await {
+                        Ok(Some(Ok(chunk))) => {
+                            let decision = robustness::SemanticDetector::inspect_chunk(
+                                &chunk,
+                                provider.protocol,
+                            );
+                            match decision {
+                                robustness::CommitDecision::Error(e) => {
+                                    stream_err = Some(format!("upstream_stream_error: {e}"));
+                                    break;
+                                }
+                                robustness::CommitDecision::Commit { has_tool_call: tc } => {
+                                    has_tool_call = tc;
+                                    is_committed = true;
+                                    buffered_chunks.push(chunk);
+                                }
+                                robustness::CommitDecision::Buffering => {
+                                    buffered_chunks.push(chunk);
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            stream_err = Some(format!("upstream_read_error: {e}"));
+                            break;
+                        }
+                        Ok(None) => {
+                            stream_err = Some("stream_ended_before_commit".to_string());
+                            break;
+                        }
+                        Err(_timeout) => {
+                            stream_err = Some("ttft_timeout".to_string());
+                            break;
+                        }
+                    }
+                }
+
+                if !is_committed {
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    let err_str = stream_err.unwrap_or_else(|| "pre_commit_failure".to_string());
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        StatusCode::BAD_GATEWAY.as_u16() as i64,
+                        Usage::default(),
+                        duration_ms,
+                        Some(err_str.clone()),
+                    );
+                    svc.record_failure(route_id);
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": 502,
+                        "error": &err_str,
+                    }));
+                    last_err = Some((
+                        StatusCode::BAD_GATEWAY,
+                        format!("{{\"error\":\"{err_str}\"}}"),
+                        None,
+                    ));
+                    continue;
+                }
+
+                // We reached Commit Point!
+                svc.record_success(route_id);
+                failover_trajectory.push(serde_json::json!({
+                    "provider": route_id,
+                    "status": status.as_u16(),
+                }));
+                let failover_path_json = if failover_trajectory.len() > 1 {
+                    serde_json::to_string(&failover_trajectory).ok()
+                } else {
+                    None
+                };
+
+                let req_id = headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("req_{:016x}", rand::random::<u64>()));
+
+                return handle_success_streaming_committed(
+                    svc,
+                    session_id,
+                    route_id,
+                    provider.tool.as_str(),
+                    status,
+                    &resp_headers,
+                    buffered_chunks,
+                    raw_stream,
+                    has_tool_call,
+                    endpoint,
+                    model,
+                    start,
+                    inbound_proto,
+                    provider.protocol,
+                    req_model.to_string(),
+                    failover_path_json.as_deref(),
+                    req_id,
+                );
+            }
         }
         let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
         let (err_resp, should_continue) = handle_upstream_error(
@@ -1666,8 +1913,9 @@ fn push_tail(tail: &Mutex<Vec<u8>>, chunk: &[u8]) {
 ///
 /// The logging happens as a side effect of the stream being driven to
 /// completion by axum/the client.
-fn make_tapped_streaming_body<S>(
-    upstream: S,
+fn make_tapped_streaming_body_with_flag<S>(
+    stream: S,
+    tail: Arc<Mutex<Vec<u8>>>,
     db: crate::store::db::Database,
     endpoint: String,
     model: Option<String>,
@@ -1679,30 +1927,13 @@ fn make_tapped_streaming_body<S>(
     key_ref: String,
     upstream_domain: String,
     failover_path: Option<String>,
+    interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Body
 where
-    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
-    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
-    let tail_for_stream = tail.clone();
-
-    let mapped = upstream.then(move |chunk_result| {
-        let tail = tail_for_stream.clone();
-        async move {
-            if let Ok(chunk) = &chunk_result {
-                push_tail(&tail, chunk);
-            }
-            chunk_result.map_err(|e| std::io::Error::other(e.to_string()))
-        }
-    });
-
-    // Strip new-api's trailing empty-`choices` frame from what we send to the
-    // client. The tail buffer above already captured the raw bytes, so usage
-    // extraction still sees the empty frame's usage fields.
-    let filtered = filter_empty_choices(mapped);
-
     Body::from_stream(TailLogStream {
-        inner: Box::pin(filtered),
+        inner: Box::pin(stream),
         tail,
         endpoint,
         model,
@@ -1716,55 +1947,7 @@ where
         key_ref,
         upstream_domain,
         failover_path,
-    })
-}
-
-/// Same as `make_tapped_streaming_body`, but for the conversion path: the input
-/// is a stream of already-converted SSE frames (`Usage::from_sse_tail` handles
-/// both Anthropic and Responses events), so no empty-`choices` filtering.
-fn make_converted_tapped_streaming_body<S>(
-    converted: S,
-    db: crate::store::db::Database,
-    endpoint: String,
-    model: Option<String>,
-    provider_id: String,
-    tool: String,
-    session_id: Option<String>,
-    status: StatusCode,
-    start: Instant,
-    key_ref: String,
-    upstream_domain: String,
-    failover_path: Option<String>,
-) -> Body
-where
-    S: futures::Stream<Item = Bytes> + Send + 'static,
-{
-    let tail: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(SSE_TAIL_CAP)));
-    let tail_for_stream = tail.clone();
-
-    let mapped = converted.then(move |chunk| {
-        let tail = tail_for_stream.clone();
-        async move {
-            push_tail(&tail, &chunk);
-            Ok::<Bytes, std::io::Error>(chunk)
-        }
-    });
-
-    Body::from_stream(TailLogStream {
-        inner: Box::pin(mapped),
-        tail,
-        endpoint,
-        model,
-        provider_id,
-        tool,
-        session_id,
-        db,
-        status,
-        start,
-        done_logged: false,
-        key_ref,
-        upstream_domain,
-        failover_path,
+        interrupted_flag,
     })
 }
 
@@ -1787,6 +1970,7 @@ struct TailLogStream {
     key_ref: String,
     upstream_domain: String,
     failover_path: Option<String>,
+    interrupted_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TailLogStream {
@@ -1861,7 +2045,15 @@ impl futures::Stream for TailLogStream {
             std::task::Poll::Ready(None) => {
                 if !this.done_logged {
                     this.done_logged = true;
-                    this.log(None);
+                    let is_interrupted = this
+                        .interrupted_flag
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    let err = if is_interrupted {
+                        Some("upstream stream interrupted".to_string())
+                    } else {
+                        None
+                    };
+                    this.log(err);
                 }
                 std::task::Poll::Ready(None)
             }
