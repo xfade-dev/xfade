@@ -305,6 +305,7 @@ async fn test_scenario_2_pre_commit_ttft_timeout_fails_over() {
         connect_timeout: Duration::from_secs(5),
         ttft_timeout: Duration::from_millis(150),
         idle_timeout: Duration::from_secs(5),
+        total_non_stream_timeout: Duration::from_secs(5),
     };
     let (url, cb) = spawn_proxy_with_svc(ProxyService::new(core).with_timeouts(timeouts)).await;
 
@@ -582,5 +583,93 @@ async fn test_scenario_5_intra_upstream_retry_with_retry_after() {
         cb.failure_count("p1"),
         0,
         "successful retry must not record circuit breaker failure"
+    );
+}
+
+// ── Scenario 6: Heterogeneous Protocol Post-Commit Interruption ─────────────
+
+#[tokio::test]
+async fn test_scenario_6_heterogeneous_protocol_post_commit_interruption_synthesizes_error() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Upstream 1: Chat protocol emits text delta then drops TCP connection mid-stream
+    let up1 = MockServer::spawn(MockAction::SseErrorMidStream(
+        StatusCode::OK,
+        vec![
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"Heterogeneous tokens..."}}]}"#.to_string(),
+        ],
+    ))
+    .await;
+
+    // Upstream 2: Fallback route - must NEVER be called once committed!
+    let up2 = MockServer::spawn(MockAction::Sse(
+        StatusCode::OK,
+        vec![
+            r#"data: {"choices":[{"delta":{"content":"Should NEVER replay"}}]}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ],
+    ))
+    .await;
+
+    let core = setup_test_core(
+        &dir,
+        &[
+            ("p1", &up1.url, ProviderProtocol::Chat),
+            ("p2", &up2.url, ProviderProtocol::Chat),
+        ],
+    );
+
+    let (url, cb) = spawn_proxy_with_svc(ProxyService::new(core)).await;
+
+    // Inbound client uses Anthropic Messages protocol
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/messages"))
+        .header("authorization", "Bearer test-key")
+        .header("x-xfade-tool", "claude_code")
+        .header("x-request-id", "req-test-scenario-6")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+
+    // 1. Converted text delta was received by Anthropic client
+    assert!(
+        body.contains("Heterogeneous tokens..."),
+        "client must receive converted text, got: {body}"
+    );
+    // 2. Synthesized protocol-native Anthropic error event
+    assert!(
+        body.contains("event: error"),
+        "Anthropic client must receive event: error on mid-stream interruption: {body}"
+    );
+    assert!(
+        body.contains(r#""type":"xfade_stream_interrupted""#),
+        "interruption payload must have type xfade_stream_interrupted: {body}"
+    );
+    assert!(
+        body.contains(r#""retryable":true"#),
+        "text-only interruption must be retryable: true: {body}"
+    );
+    // 3. Fallback was NEVER called
+    assert_eq!(
+        up2.requests.lock().unwrap().len(),
+        0,
+        "post-commit interruption must NEVER replay to candidate 2"
+    );
+    // 4. Candidate 1 circuit breaker marked failed
+    assert_eq!(
+        cb.failure_count("p1"),
+        1,
+        "interrupted upstream must record circuit breaker failure"
     );
 }
