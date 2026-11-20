@@ -20,7 +20,7 @@ fn parse_rate_to_micros(val: Option<&serde_json::Value>) -> i64 {
         serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
     };
-    if rate_f64 <= 0.0 {
+    if !rate_f64.is_finite() || rate_f64 <= 0.0 {
         return 0;
     }
     // Rate is in USD per token.
@@ -124,6 +124,15 @@ pub async fn sync_pricing_catalog(db: &Database, url: Option<&str>) -> Result<Sy
         return Err(CoreError::Proxy(format!(
             "pricing sync request to {target_url} returned HTTP {status}"
         )));
+    }
+
+    if let Some(content_length) = res.content_length() {
+        const MAX_BODY_BYTES: u64 = 25 * 1024 * 1024; // 25 MB
+        if content_length > MAX_BODY_BYTES {
+            return Err(CoreError::Proxy(format!(
+                "pricing response from {target_url} exceeds 25MB limit ({content_length} bytes)"
+            )));
+        }
     }
 
     let bytes = res.bytes().await.map_err(|e| {

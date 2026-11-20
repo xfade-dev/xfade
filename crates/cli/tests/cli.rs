@@ -1342,6 +1342,31 @@ fn test_cli_pricing_commands() {
         .stdout(predicate::str::contains(
             "Cleared 0 synced model pricing entries",
         ));
+
+    // 6. Validation: reject empty model name
+    xfade(home.path())
+        .args(["pricing", "set", "  ", "--input", "1.0", "--output", "2.0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("model pattern cannot be empty"));
+
+    // 7. Validation: reject negative rates
+    xfade(home.path())
+        .args([
+            "pricing", "set", "bad-rate", "--input", "-1.0", "--output", "2.0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "pricing rates must be non-negative",
+        ));
+
+    // 8. Validation: reset without --synced fails with guidance
+    xfade(home.path())
+        .args(["pricing", "reset"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing required flag: --synced"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -359,13 +359,14 @@ impl Database {
                 PRIMARY KEY (client_model, provider_id)
             );
             CREATE TABLE IF NOT EXISTS model_pricing (
-                model_pattern TEXT PRIMARY KEY,
+                model_pattern TEXT NOT NULL,
                 input_micros_per_m INTEGER NOT NULL,
                 output_micros_per_m INTEGER NOT NULL,
                 cache_read_micros_per_m INTEGER NOT NULL DEFAULT 0,
                 cache_write_micros_per_m INTEGER NOT NULL DEFAULT 0,
                 source TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (model_pattern, source)
             );
             CREATE INDEX IF NOT EXISTS idx_model_pricing_source ON model_pricing(source);",
         )?;
@@ -512,6 +513,37 @@ impl Database {
             );",
             [],
         )?;
+        // Idempotent migration for model_pricing: ensure compound primary key (model_pattern, source)
+        let has_compound_pk: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(model_pricing)")?;
+            let mut rows = stmt.query([])?;
+            let mut pk_count = 0;
+            while let Some(row) = rows.next()? {
+                let pk: i64 = row.get(5)?;
+                if pk > 0 {
+                    pk_count += 1;
+                }
+            }
+            pk_count >= 2
+        };
+        if !has_compound_pk {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS model_pricing_v2 (
+                    model_pattern TEXT NOT NULL,
+                    input_micros_per_m INTEGER NOT NULL,
+                    output_micros_per_m INTEGER NOT NULL,
+                    cache_read_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                    cache_write_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (model_pattern, source)
+                );
+                INSERT OR IGNORE INTO model_pricing_v2 SELECT * FROM model_pricing;
+                DROP TABLE model_pricing;
+                ALTER TABLE model_pricing_v2 RENAME TO model_pricing;
+                CREATE INDEX IF NOT EXISTS idx_model_pricing_source ON model_pricing(source);",
+            )?;
+        }
         Ok(())
     }
 
@@ -1789,12 +1821,11 @@ impl Database {
                 model_pattern, input_micros_per_m, output_micros_per_m,
                 cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT(model_pattern) DO UPDATE SET
+            ON CONFLICT(model_pattern, source) DO UPDATE SET
                 input_micros_per_m = excluded.input_micros_per_m,
                 output_micros_per_m = excluded.output_micros_per_m,
                 cache_read_micros_per_m = excluded.cache_read_micros_per_m,
                 cache_write_micros_per_m = excluded.cache_write_micros_per_m,
-                source = excluded.source,
                 updated_at = excluded.updated_at",
             rusqlite::params![
                 row.model_pattern,
@@ -1822,12 +1853,11 @@ impl Database {
                     model_pattern, input_micros_per_m, output_micros_per_m,
                     cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(model_pattern) DO UPDATE SET
+                ON CONFLICT(model_pattern, source) DO UPDATE SET
                     input_micros_per_m = excluded.input_micros_per_m,
                     output_micros_per_m = excluded.output_micros_per_m,
                     cache_read_micros_per_m = excluded.cache_read_micros_per_m,
                     cache_write_micros_per_m = excluded.cache_write_micros_per_m,
-                    source = excluded.source,
                     updated_at = excluded.updated_at",
             )?;
             for row in rows {
@@ -1846,11 +1876,11 @@ impl Database {
         Ok(rows.len())
     }
 
-    /// Delete a single model pricing entry by pattern.
+    /// Delete a single custom model pricing entry by pattern.
     pub fn delete_model_pricing(&self, pattern: &str) -> Result<bool> {
         let conn = self.conn();
         let rows = conn.execute(
-            "DELETE FROM model_pricing WHERE model_pattern = ?1",
+            "DELETE FROM model_pricing WHERE model_pattern = ?1 AND source = 'custom'",
             rusqlite::params![pattern],
         )?;
         Ok(rows > 0)
@@ -1869,7 +1899,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT model_pattern, input_micros_per_m, output_micros_per_m,
                     cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
-             FROM model_pricing ORDER BY model_pattern ASC",
+             FROM model_pricing
+             ORDER BY model_pattern ASC, CASE source WHEN 'synced' THEN 0 ELSE 1 END ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(DynamicPriceRow {
@@ -1893,27 +1924,67 @@ impl Database {
     ///
     /// Checks both the model name and an optional canonical name against `model_pattern`.
     /// Resolution precedence:
-    /// 1. Custom overrides (`source = 'custom'`) over synced entries (`source = 'synced'`).
-    /// 2. Longest matching prefix (`LENGTH(model_pattern) DESC`).
+    /// 1. Fast exact match index seek (`model_pattern IN (?1, ?2)`).
+    /// 2. Delimiter-checked prefix match (`LENGTH(model_pattern) DESC`).
+    /// 3. Custom overrides (`source = 'custom'`) over synced entries (`source = 'synced'`).
     pub fn find_dynamic_model_price(
         &self,
         model: &str,
         canonical: Option<&str>,
     ) -> Result<Option<DynamicPriceRow>> {
+        let model_trimmed = model.trim().to_lowercase();
+        if model_trimmed.is_empty() {
+            return Ok(None);
+        }
+        let canonical_str = canonical.unwrap_or("").trim().to_lowercase();
         let conn = self.conn();
-        let canonical_str = canonical.unwrap_or("");
-        let mut stmt = conn.prepare(
+
+        // Stage 1: Fast exact-match lookup using PRIMARY KEY index
+        let mut stmt_exact = conn.prepare(
             "SELECT model_pattern, input_micros_per_m, output_micros_per_m,
                     cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
              FROM model_pricing
-             WHERE (?1 = model_pattern OR (?1 != '' AND LENGTH(?1) >= LENGTH(model_pattern) AND SUBSTR(?1, 1, LENGTH(model_pattern)) = model_pattern))
-                OR (?2 != '' AND (?2 = model_pattern OR (LENGTH(?2) >= LENGTH(model_pattern) AND SUBSTR(?2, 1, LENGTH(model_pattern)) = model_pattern)))
+             WHERE model_pattern = ?1 OR (?2 != '' AND model_pattern = ?2)
+             ORDER BY
+                 CASE source WHEN 'custom' THEN 0 ELSE 1 END ASC
+             LIMIT 1",
+        )?;
+        let mut exact_rows = stmt_exact.query(rusqlite::params![model_trimmed, canonical_str])?;
+        if let Some(row) = exact_rows.next()? {
+            return Ok(Some(DynamicPriceRow {
+                model_pattern: row.get(0)?,
+                input_micros_per_m: row.get(1)?,
+                output_micros_per_m: row.get(2)?,
+                cache_read_micros_per_m: row.get(3)?,
+                cache_write_micros_per_m: row.get(4)?,
+                source: row.get(5)?,
+                updated_at: row.get(6)?,
+            }));
+        }
+        drop(exact_rows);
+        drop(stmt_exact);
+
+        // Stage 2: Prefix lookup with delimiter check to avoid collisions (e.g. 'gpt-4' vs 'gpt-4o')
+        let mut stmt_prefix = conn.prepare(
+            "SELECT model_pattern, input_micros_per_m, output_micros_per_m,
+                    cache_read_micros_per_m, cache_write_micros_per_m, source, updated_at
+             FROM model_pricing
+             WHERE model_pattern != ''
+               AND (
+                   (LENGTH(?1) > LENGTH(model_pattern)
+                    AND SUBSTR(?1, 1, LENGTH(model_pattern)) = model_pattern
+                    AND SUBSTR(?1, LENGTH(model_pattern) + 1, 1) IN ('-', ':', '.', '/'))
+                OR (?2 != ''
+                    AND LENGTH(?2) > LENGTH(model_pattern)
+                    AND SUBSTR(?2, 1, LENGTH(model_pattern)) = model_pattern
+                    AND SUBSTR(?2, LENGTH(model_pattern) + 1, 1) IN ('-', ':', '.', '/'))
+               )
              ORDER BY
                  CASE source WHEN 'custom' THEN 0 ELSE 1 END ASC,
                  LENGTH(model_pattern) DESC
              LIMIT 1",
         )?;
-        let mut rows = stmt.query(rusqlite::params![model, canonical_str])?;
+        let mut rows = stmt_prefix.query(rusqlite::params![model_trimmed, canonical_str])?;
         if let Some(row) = rows.next()? {
             Ok(Some(DynamicPriceRow {
                 model_pattern: row.get(0)?,
@@ -3232,5 +3303,80 @@ mod tests {
         let cleared = db.clear_synced_model_pricing().unwrap();
         assert_eq!(cleared, 3);
         assert!(db.list_model_pricing().unwrap().is_empty());
+
+        // 6. Delimiter collision check: pattern 'gpt-4' must NOT match 'gpt-4o'
+        let row_gpt4 = DynamicPriceRow {
+            model_pattern: "gpt-4".to_string(),
+            input_micros_per_m: 30_000_000,
+            output_micros_per_m: 60_000_000,
+            cache_read_micros_per_m: 0,
+            cache_write_micros_per_m: 0,
+            source: "synced".to_string(),
+            updated_at: "2026-11-20T20:00:00Z".to_string(),
+        };
+        db.upsert_model_pricing(&row_gpt4).unwrap();
+
+        // Exact match
+        assert!(db
+            .find_dynamic_model_price("gpt-4", None)
+            .unwrap()
+            .is_some());
+        // Hyphenated suffix match
+        assert!(db
+            .find_dynamic_model_price("gpt-4-turbo", None)
+            .unwrap()
+            .is_some());
+        // Non-delimiter suffix must NOT match!
+        assert!(db
+            .find_dynamic_model_price("gpt-4o", None)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .find_dynamic_model_price("gpt-4o-mini", None)
+            .unwrap()
+            .is_none());
+
+        // Empty pattern lookup
+        assert!(db.find_dynamic_model_price("", None).unwrap().is_none());
+        assert!(db.find_dynamic_model_price("   ", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_model_pricing_table_migration_from_single_pk() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Simulate pre-existing database with single-column PK
+        conn.execute_batch(
+            "CREATE TABLE model_pricing (
+                model_pattern TEXT PRIMARY KEY,
+                input_micros_per_m INTEGER NOT NULL,
+                output_micros_per_m INTEGER NOT NULL,
+                cache_read_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                cache_write_micros_per_m INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO model_pricing VALUES ('old-model', 100, 200, 10, 20, 'synced', '2026-01-01');",
+        ).unwrap();
+
+        let db = Database {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        };
+        db.migrate().unwrap();
+
+        // Check compound primary key is now active
+        let row_custom = DynamicPriceRow {
+            model_pattern: "old-model".to_string(),
+            input_micros_per_m: 50,
+            output_micros_per_m: 100,
+            cache_read_micros_per_m: 5,
+            cache_write_micros_per_m: 10,
+            source: "custom".to_string(),
+            updated_at: "2026-11-20".to_string(),
+        };
+        db.upsert_model_pricing(&row_custom).unwrap();
+
+        // Both rows should coexist in table
+        let list = db.list_model_pricing().unwrap();
+        assert_eq!(list.len(), 2);
     }
 }
