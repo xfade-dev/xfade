@@ -1,15 +1,17 @@
 use serde_json::Value;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_write_tokens: i64,
 }
 
 impl Usage {
     /// Extract usage from a non-stream JSON response body. Compatible with
-    /// OpenAI (`prompt_tokens`/`completion_tokens`) and Anthropic
-    /// (`input_tokens`/`output_tokens`) shapes.
+    /// OpenAI (`prompt_tokens`/`completion_tokens`/`prompt_tokens_details.cached_tokens`)
+    /// and Anthropic (`input_tokens`/`output_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`) shapes.
     pub fn from_json(bytes: &[u8]) -> Self {
         let v: Value = match serde_json::from_slice(bytes) {
             Ok(v) => v,
@@ -26,9 +28,27 @@ impl Usage {
             .or_else(|| usage.get("output_tokens"))
             .and_then(|t| t.as_i64())
             .unwrap_or(0);
+        let cached = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .or_else(|| {
+                usage
+                    .get("input_token_details")
+                    .and_then(|d| d.get("cached_tokens"))
+            })
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0);
+        let cache_write = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0);
+
         Self {
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cached_prompt_tokens: cached,
+            cache_write_tokens: cache_write,
         }
     }
 
@@ -39,7 +59,9 @@ impl Usage {
     ///   - `prompt_tokens` or `input_tokens` (in a usage block) updates the
     ///     prompt count;
     ///   - `completion_tokens` or `output_tokens` (in a usage block) updates
-    ///     the completion count.
+    ///     the completion count;
+    ///   - `prompt_tokens_details.cached_tokens` or `cache_read_input_tokens` updates cached count;
+    ///   - `cache_creation_input_tokens` updates cache write count.
     ///
     /// Note: in Anthropic's streaming protocol, `message_delta` events carry a
     /// cumulative `output_tokens` (the running total for the response), so we
@@ -52,6 +74,8 @@ impl Usage {
         let text = String::from_utf8_lossy(tail);
         let mut prompt: Option<i64> = None;
         let mut completion: Option<i64> = None;
+        let mut cached: Option<i64> = None;
+        let mut cache_write: Option<i64> = None;
 
         for line in text.lines() {
             let trimmed = line.trim_start();
@@ -95,11 +119,32 @@ impl Usage {
                 // message_delta's output_tokens is cumulative → take last.
                 completion = Some(c);
             }
+            if let Some(ca) = usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .or_else(|| {
+                    usage
+                        .get("input_token_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                })
+                .or_else(|| usage.get("cache_read_input_tokens"))
+                .and_then(|t| t.as_i64())
+            {
+                cached = Some(ca);
+            }
+            if let Some(w) = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|t| t.as_i64())
+            {
+                cache_write = Some(w);
+            }
         }
 
         Self {
             prompt_tokens: prompt.unwrap_or(0),
             completion_tokens: completion.unwrap_or(0),
+            cached_prompt_tokens: cached.unwrap_or(0),
+            cache_write_tokens: cache_write.unwrap_or(0),
         }
     }
 }
@@ -136,5 +181,52 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         let u = Usage::from_sse_tail(tail);
         assert_eq!(u.prompt_tokens, 0);
         assert_eq!(u.completion_tokens, 0);
+        assert_eq!(u.cached_prompt_tokens, 0);
+        assert_eq!(u.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn from_json_anthropic_cache_tokens() {
+        let json_body = br#"{
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 10
+            }
+        }"#;
+        let u = Usage::from_json(json_body);
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.cached_prompt_tokens, 80);
+        assert_eq!(u.cache_write_tokens, 10);
+    }
+
+    #[test]
+    fn from_json_openai_cached_tokens() {
+        let json_body = br#"{
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 80,
+                "prompt_tokens_details": {
+                    "cached_tokens": 150
+                }
+            }
+        }"#;
+        let u = Usage::from_json(json_body);
+        assert_eq!(u.prompt_tokens, 200);
+        assert_eq!(u.completion_tokens, 80);
+        assert_eq!(u.cached_prompt_tokens, 150);
+        assert_eq!(u.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn from_sse_tail_openai_cached_tokens() {
+        let tail = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":90}}}\n\ndata: [DONE]\n\n";
+        let u = Usage::from_sse_tail(tail);
+        assert_eq!(u.prompt_tokens, 120);
+        assert_eq!(u.completion_tokens, 30);
+        assert_eq!(u.cached_prompt_tokens, 90);
+        assert_eq!(u.cache_write_tokens, 0);
     }
 }
