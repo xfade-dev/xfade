@@ -2,6 +2,7 @@ pub mod cache_injector;
 pub mod circuit_breaker;
 pub mod convert;
 pub mod forward;
+pub mod robustness;
 #[cfg(test)]
 pub mod testsupport;
 pub mod thinking_rectifier;
@@ -53,6 +54,7 @@ pub struct ProxyService {
     pub token_manager: Arc<TokenManager>,
     pub client: reqwest::Client,
     pub circuit_breaker: Arc<CircuitBreaker>,
+    pub timeouts: robustness::TimeoutConfig,
     pub auth_token: Option<String>,
     pub host: String,
     pub port: u16,
@@ -102,9 +104,9 @@ impl ProxyService {
                 }
             }
         }
+        let timeouts = robustness::TimeoutConfig::default();
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(timeouts.connect_timeout)
             .pool_max_idle_per_host(4)
             .build()
             .expect("reqwest Client::builder should not fail");
@@ -114,6 +116,7 @@ impl ProxyService {
             token_manager,
             client,
             circuit_breaker,
+            timeouts,
             auth_token: None,
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -191,6 +194,11 @@ impl ProxyService {
 
     pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
         self.circuit_breaker = cb;
+        self
+    }
+
+    pub fn with_timeouts(mut self, timeouts: robustness::TimeoutConfig) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
