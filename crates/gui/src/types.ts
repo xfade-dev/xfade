@@ -51,6 +51,7 @@ export interface StatsRow {
   requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  cost_usd_micros?: number;
   errors: number;
   avg_duration_ms: number;
 }
@@ -66,6 +67,7 @@ export interface RequestLog {
   completion_tokens: number;
   duration_ms: number;
   error: string | null;
+  cost_usd_micros?: number;
 }
 
 export interface AddProviderInput {

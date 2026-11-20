@@ -741,6 +741,7 @@ mod tests {
             requests: 100,
             prompt_tokens: 0,
             completion_tokens: 0,
+            cost_usd_micros: 0,
             errors: 2,
             avg_duration_ms: 150,
         }];

@@ -323,6 +323,13 @@ fn log_request_full(
     explicit_domain: Option<&str>,
     failover_path: Option<&str>,
 ) {
+    let cost_usd_micros = crate::proxy::pricing::estimate_cost(
+        model.as_deref(),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cached_prompt_tokens,
+        usage.cache_write_tokens,
+    );
     let _ = svc.core.db().insert_request_log(&RequestLog {
         ts: now_rfc3339(),
         endpoint: endpoint.to_string(),
@@ -335,6 +342,7 @@ fn log_request_full(
         duration_ms,
         error: error.clone(),
         session_id: session_id.map(|s| s.to_string()),
+        cost_usd_micros,
     });
     crate::sessions::record_outcome(
         svc.core.db(),
@@ -344,6 +352,8 @@ fn log_request_full(
         model.as_deref(),
         usage.prompt_tokens,
         usage.completion_tokens,
+        usage.cached_prompt_tokens,
+        usage.cache_write_tokens,
         status != 0 && status < 400,
     );
 
@@ -1031,7 +1041,7 @@ async fn handle_upstream_error(
 /// exhausted) into the session so it doesn't stay "running" forever.
 fn session_failed(svc: &ProxyService, session_id: Option<&str>) {
     if let Some(sid) = session_id {
-        crate::sessions::record_outcome(svc.core.db(), Some(sid), "", "", None, 0, 0, false);
+        crate::sessions::record_outcome(svc.core.db(), Some(sid), "", "", None, 0, 0, 0, 0, false);
     }
 }
 
@@ -2065,6 +2075,13 @@ impl TailLogStream {
         let usage = Usage::from_sse_tail(&tail_bytes);
         let duration_ms = self.start.elapsed().as_millis() as i64;
         let status_ok = error.is_none();
+        let cost_usd_micros = crate::proxy::pricing::estimate_cost(
+            self.model.as_deref(),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_prompt_tokens,
+            usage.cache_write_tokens,
+        );
         let _ = self.db.insert_request_log(&RequestLog {
             ts: now_rfc3339(),
             endpoint: self.endpoint.clone(),
@@ -2077,6 +2094,7 @@ impl TailLogStream {
             duration_ms,
             error,
             session_id: self.session_id.clone(),
+            cost_usd_micros,
         });
         crate::sessions::record_outcome(
             &self.db,
@@ -2086,6 +2104,8 @@ impl TailLogStream {
             self.model.as_deref(),
             usage.prompt_tokens,
             usage.completion_tokens,
+            usage.cached_prompt_tokens,
+            usage.cache_write_tokens,
             status_ok,
         );
 
