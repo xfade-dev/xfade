@@ -867,6 +867,79 @@ fn stats_by_session_accepted() {
 }
 
 #[test]
+fn stats_and_sessions_display_cost_estimation() {
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join(".xfade-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = xfade_core::store::db::Database::open(&data_dir.join("xfade.db")).unwrap();
+
+    // Insert a request log with cost_usd_micros: 39_600 = $0.0396
+    db.insert_request_log(&xfade_core::store::db::RequestLog {
+        ts: "2026-11-20T12:00:00Z".into(),
+        endpoint: "chat".into(),
+        model: Some("claude-3-7-sonnet".into()),
+        provider_id: "prov1".into(),
+        tool: "claude".into(),
+        status: 200,
+        prompt_tokens: 10_000,
+        completion_tokens: 1_000,
+        duration_ms: 120,
+        error: None,
+        session_id: Some("s-test-cost-1".into()),
+        cost_usd_micros: 39_600,
+    })
+    .unwrap();
+
+    // Insert session and update progress with cost_usd_micros
+    db.insert_session(
+        "s-test-cost-1",
+        "fp1",
+        "2026-11-20T12:00:00Z",
+        Some("first cost prompt"),
+    )
+    .unwrap();
+    db.update_session_progress(
+        "s-test-cost-1",
+        "claude",
+        "prov1",
+        Some("claude-3-7-sonnet"),
+        10_000,
+        1_000,
+        39_600,
+        "ok",
+        "2026-11-20T12:01:00Z",
+    )
+    .unwrap();
+
+    // 1. Verify `xfade stats` header, row, and footnote
+    xfade(home.path())
+        .args(["stats", "--since", "30d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cost (est)"))
+        .stdout(predicate::str::contains("$0.0396"))
+        .stdout(predicate::str::contains(
+            "* cost estimates based on official token pricing (estimated)",
+        ));
+
+    // 2. Verify `xfade sessions` list includes cost (est) and $0.0396
+    xfade(home.path())
+        .args(["sessions"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cost (est)"))
+        .stdout(predicate::str::contains("$0.0396"))
+        .stdout(predicate::str::contains("s-test-cost-1"));
+
+    // 3. Verify `xfade sessions show s-test-cost-1` displays cost: $0.0396 (estimated)
+    xfade(home.path())
+        .args(["sessions", "show", "s-test-cost-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cost:     $0.0396 (estimated)"));
+}
+
+#[test]
 fn handover_command_prints_brief() {
     let home = tempfile::tempdir().unwrap();
     xfade(home.path())
