@@ -1644,6 +1644,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_records_cost_in_request_logs_and_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+
+        // Turn 1: 10_000 prompt tokens (2_000 cached), 1_000 completion tokens
+        // For claude-3-7-sonnet:
+        // uncached prompt: 8,000 * $3.00/M = $0.0240 = 24,000 micros
+        // cached prompt:   2,000 * $0.30/M = $0.0006 =    600 micros
+        // completion:      1,000 * $15.00/M = $0.0150 = 15,000 micros
+        // Total Turn 1 = 39,600 micros ($0.0396)
+        up.respond_sequence(vec![(
+            200,
+            r#"{"id":"r1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10000,"completion_tokens":1000,"prompt_tokens_details":{"cached_tokens":2000}}}"#,
+        )]);
+
+        let (status, headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"claude-3-7-sonnet","messages":[{"role":"user","content":"hello"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sid = headers
+            .iter()
+            .find(|(k, _)| k == "x-xfade-session-id")
+            .expect("session id header")
+            .1
+            .clone();
+
+        let logs = db.recent_request_logs(1).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].cost_usd_micros, 39_600);
+
+        let sessions = db.list_sessions(1).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, sid);
+        assert_eq!(sessions[0].cost_usd_micros, 39_600);
+
+        // Streaming Turn 2: same session, gpt-4o, SSE stream with usage tail
+        // 1,000 prompt tokens (no cache), 500 completion tokens
+        // For gpt-4o:
+        // prompt:     1,000 * $2.50/M = $0.0025 = 2,500 micros
+        // completion:   500 * $10.00/M = $0.0050 = 5,000 micros
+        // Turn 2 = 7,500 micros ($0.0075)
+        // Accumulated Session cost = 39,600 + 7,500 = 47,100 micros ($0.0471)
+        up.clear_responses();
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"streaming text"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":500}}"#,
+            r#"data: [DONE]"#,
+        ]);
+
+        let (status, _headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"ok"},{"role":"user","content":"streaming please"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Give stream logger moment to flush
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let logs = db.recent_request_logs(2).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].cost_usd_micros, 7_500);
+
+        let sessions = db.list_sessions(1).unwrap();
+        assert_eq!(sessions[0].cost_usd_micros, 47_100);
+    }
+
+    #[tokio::test]
     async fn handover_auto_injection_off_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
