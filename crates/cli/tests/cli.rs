@@ -1284,3 +1284,109 @@ fn cli_add_and_list_with_explicit_protocol() {
         .stdout(predicate::str::contains("responses"))
         .stdout(predicate::str::contains("codex-upstream"));
 }
+
+#[test]
+fn test_cli_pricing_commands() {
+    let home = tempfile::tempdir().unwrap();
+
+    // 1. List shows built-in models
+    xfade(home.path())
+        .args(["pricing", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude-sonnet-5.5"))
+        .stdout(predicate::str::contains("gpt-6.2-astra"))
+        .stdout(predicate::str::contains("builtin"));
+
+    // 2. Set custom pricing override
+    xfade(home.path())
+        .args([
+            "pricing",
+            "set",
+            "my-custom-model",
+            "--input",
+            "1.50",
+            "--output",
+            "6.00",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Set custom pricing for my-custom-model",
+        ));
+
+    // 3. List with filter
+    xfade(home.path())
+        .args(["pricing", "list", "--filter", "my-custom"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("my-custom-model"))
+        .stdout(predicate::str::contains("custom"))
+        .stdout(predicate::str::contains("$1.5000"))
+        .stdout(predicate::str::contains("$6.0000"));
+
+    // 4. Remove custom override
+    xfade(home.path())
+        .args(["pricing", "rm", "my-custom-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed custom pricing override for my-custom-model",
+        ));
+
+    // 5. Reset synced pricing
+    xfade(home.path())
+        .args(["pricing", "reset", "--synced"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Cleared 0 synced model pricing entries",
+        ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cli_pricing_sync_custom_url() {
+    use axum::{routing::get, Json, Router};
+
+    let payload = serde_json::json!({
+        "data": [
+            {
+                "id": "mock/special-model-2026",
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015"
+                }
+            }
+        ]
+    });
+
+    let app = Router::new().route("/models", get(move || async move { Json(payload) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let sync_url = format!("http://{addr}/models");
+
+    // Sync from mock URL
+    xfade(home.path())
+        .args(["pricing", "sync", "--url", &sync_url])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "synced: 2 models loaded into local catalog",
+        ));
+
+    // Verify list displays synced model
+    xfade(home.path())
+        .args(["pricing", "list", "--filter", "special-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mock/special-model-2026"))
+        .stdout(predicate::str::contains("special-model-2026"))
+        .stdout(predicate::str::contains("synced"))
+        .stdout(predicate::str::contains("$3.0000"))
+        .stdout(predicate::str::contains("$15.0000"));
+}

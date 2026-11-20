@@ -213,6 +213,11 @@ enum Cmd {
         #[arg(long)]
         tool: Option<ToolKind>,
     },
+    /// Manage model pricing catalogs, custom overrides, and live synchronization
+    Pricing {
+        #[command(subcommand)]
+        cmd: Option<PricingCmd>,
+    },
     /// Launch Claude Code with a provider injected via env (instant `run`)
     Claude(RunOpts),
     /// Launch Codex — config overrides via `-c` + key via env (instant `run`)
@@ -396,6 +401,50 @@ enum ModelMapCmd {
     },
     /// Clear all model mappings across all aliases
     Clear,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PricingCmd {
+    /// List active model pricing across custom, synced, and built-in layers
+    List {
+        /// Optional keyword or model filter
+        #[arg(long, short)]
+        filter: Option<String>,
+    },
+    /// Synchronize model pricing catalog from OpenRouter or custom URL
+    Sync {
+        /// Custom JSON endpoint URL (defaults to OpenRouter public models API)
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Set a custom model pricing override (rates in USD per 1M tokens)
+    Set {
+        /// Target model pattern or name
+        model: String,
+        /// Input prompt token price in USD per 1M tokens (e.g. 2.00)
+        #[arg(long)]
+        input: f64,
+        /// Output completion token price in USD per 1M tokens (e.g. 10.00)
+        #[arg(long)]
+        output: f64,
+        /// Cached input read token price in USD per 1M tokens (defaults to 10% of input)
+        #[arg(long)]
+        cache_read: Option<f64>,
+        /// Cache creation/write token price in USD per 1M tokens (defaults to 125% of input)
+        #[arg(long)]
+        cache_write: Option<f64>,
+    },
+    /// Remove a custom model pricing override
+    Rm {
+        /// Model pattern to remove
+        model: String,
+    },
+    /// Reset pricing table (e.g. clear synced cache)
+    Reset {
+        /// Clear synced pricing entries
+        #[arg(long)]
+        synced: bool,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -1146,6 +1195,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 Ok(())
             }
         },
+        Cmd::Pricing { cmd } => cmd_pricing(&build_core()?, cmd),
         Cmd::Project => {
             let core = build_core()?;
             let cwd = std::env::current_dir()?;
@@ -1767,6 +1817,165 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
         ModelMapCmd::Clear => {
             core.db().clear_model_mappings()?;
             println!("Cleared all model mappings.");
+            Ok(())
+        }
+    }
+}
+
+fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
+    let now_rfc3339 = || {
+        use time::format_description::well_known::Rfc3339;
+        time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    };
+
+    match cmd.unwrap_or(PricingCmd::List { filter: None }) {
+        PricingCmd::List { filter } => {
+            let filter_lower = filter.as_deref().map(|f| f.trim().to_lowercase());
+            // 1. Collect built-ins
+            let mut models_map: std::collections::BTreeMap<
+                String,
+                (i64, i64, i64, i64, &'static str, String),
+            > = std::collections::BTreeMap::new();
+            for (prefix, price) in xfade_core::proxy::pricing::list_builtin_catalog() {
+                models_map.insert(
+                    prefix.to_string(),
+                    (
+                        price.input_micros_per_m,
+                        price.output_micros_per_m,
+                        price.cache_read_micros_per_m,
+                        price.cache_write_micros_per_m,
+                        "builtin",
+                        "-".to_string(),
+                    ),
+                );
+            }
+
+            // 2. Overlay synced and custom from DB
+            let db_rows = core.db().list_model_pricing()?;
+            for row in db_rows {
+                let source_str = match row.source.as_str() {
+                    "custom" => "custom",
+                    _ => "synced",
+                };
+                models_map.insert(
+                    row.model_pattern,
+                    (
+                        row.input_micros_per_m,
+                        row.output_micros_per_m,
+                        row.cache_read_micros_per_m,
+                        row.cache_write_micros_per_m,
+                        source_str,
+                        row.updated_at,
+                    ),
+                );
+            }
+
+            let mut count = 0;
+            println!(
+                "{:<32} {:>12} {:>12} {:>14} {:>14} {:<8} {:<24}",
+                "MODEL",
+                "INPUT ($/1M)",
+                "OUTPUT ($/1M)",
+                "CACHE READ",
+                "CACHE WRITE",
+                "SOURCE",
+                "UPDATED AT"
+            );
+            println!("{}", "-".repeat(105));
+
+            for (pattern, (inp, out, cr, cw, src, upd)) in models_map {
+                if let Some(ref f) = filter_lower {
+                    if !pattern.to_lowercase().contains(f) {
+                        continue;
+                    }
+                }
+                count += 1;
+                let inp_str = format!("${:.4}", inp as f64 / 1_000_000.0);
+                let out_str = format!("${:.4}", out as f64 / 1_000_000.0);
+                let cr_str = format!("${:.4}", cr as f64 / 1_000_000.0);
+                let cw_str = format!("${:.4}", cw as f64 / 1_000_000.0);
+                println!(
+                    "{:<32} {:>12} {:>12} {:>14} {:>14} {:<8} {}",
+                    pattern, inp_str, out_str, cr_str, cw_str, src, upd
+                );
+            }
+            println!("\nTotal: {} models listed.", count);
+            Ok(())
+        }
+        PricingCmd::Sync { url } => {
+            let target_url = url
+                .as_deref()
+                .unwrap_or(xfade_core::proxy::DEFAULT_OPENROUTER_MODELS_URL);
+            println!("Syncing pricing from {target_url}...");
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| CoreError::Proxy(format!("failed to start tokio runtime: {e}")))?;
+            let stats = rt.block_on(xfade_core::proxy::sync_pricing_catalog(
+                core.db(),
+                url.as_deref(),
+            ))?;
+            println!(
+                "synced: {} models loaded into local catalog.",
+                stats.models_synced
+            );
+            Ok(())
+        }
+        PricingCmd::Set {
+            model,
+            input,
+            output,
+            cache_read,
+            cache_write,
+        } => {
+            if input < 0.0 || output < 0.0 {
+                return Err(CoreError::Proxy(
+                    "pricing rates must be non-negative".to_string(),
+                ));
+            }
+            let input_micros = (input * 1_000_000.0).round() as i64;
+            let output_micros = (output * 1_000_000.0).round() as i64;
+            let cache_read_micros = cache_read
+                .map(|r| (r * 1_000_000.0).round() as i64)
+                .unwrap_or((input_micros as f64 * 0.1).round() as i64);
+            let cache_write_micros = cache_write
+                .map(|w| (w * 1_000_000.0).round() as i64)
+                .unwrap_or((input_micros as f64 * 1.25).round() as i64);
+
+            let row = xfade_core::store::db::DynamicPriceRow {
+                model_pattern: model.trim().to_lowercase(),
+                input_micros_per_m: input_micros,
+                output_micros_per_m: output_micros,
+                cache_read_micros_per_m: cache_read_micros,
+                cache_write_micros_per_m: cache_write_micros,
+                source: "custom".to_string(),
+                updated_at: now_rfc3339(),
+            };
+            core.db().upsert_model_pricing(&row)?;
+            println!(
+                "Set custom pricing for {}: ${:.4} in / ${:.4} out per 1M tokens.",
+                model, input, output
+            );
+            Ok(())
+        }
+        PricingCmd::Rm { model } => {
+            let deleted = core
+                .db()
+                .delete_model_pricing(&model.trim().to_lowercase())?;
+            if deleted {
+                println!("Removed custom pricing override for {model}.");
+            } else {
+                println!("No custom pricing override found for {model}.");
+            }
+            Ok(())
+        }
+        PricingCmd::Reset { synced } => {
+            if synced {
+                let cleared = core.db().clear_synced_model_pricing()?;
+                println!("Cleared {cleared} synced model pricing entries.");
+            } else {
+                println!("Please specify what to reset, e.g. `xfade pricing reset --synced`.");
+            }
             Ok(())
         }
     }
