@@ -530,7 +530,7 @@ pub fn calculate_cost_micros(
     let cost_cache_write = cache_write * (price.cache_write_micros_per_m as i128);
 
     let total = cost_input + cost_cache_read + cost_output + cost_cache_write;
-    ((total + 500_000) / 1_000_000) as i64
+    ((total + 500_000) / 1_000_000).clamp(0, i64::MAX as i128) as i64
 }
 
 /// Estimate cost using the three-tier resolution hierarchy:

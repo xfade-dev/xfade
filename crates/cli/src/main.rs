@@ -422,16 +422,16 @@ pub enum PricingCmd {
         /// Target model pattern or name
         model: String,
         /// Input prompt token price in USD per 1M tokens (e.g. 2.00)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         input: f64,
         /// Output completion token price in USD per 1M tokens (e.g. 10.00)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         output: f64,
         /// Cached input read token price in USD per 1M tokens (defaults to 10% of input)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         cache_read: Option<f64>,
         /// Cache creation/write token price in USD per 1M tokens (defaults to 125% of input)
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         cache_write: Option<f64>,
     },
     /// Remove a custom model pricing override
@@ -1852,13 +1852,16 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
                 );
             }
 
-            // 2. Overlay synced and custom from DB
+            // 2. Overlay synced and custom from DB (custom rows must never be overwritten by synced rows)
             let db_rows = core.db().list_model_pricing()?;
             for row in db_rows {
-                let source_str = match row.source.as_str() {
-                    "custom" => "custom",
-                    _ => "synced",
-                };
+                let is_custom = row.source == "custom";
+                let source_str = if is_custom { "custom" } else { "synced" };
+                if let Some((_, _, _, _, existing_source, _)) = models_map.get(&row.model_pattern) {
+                    if *existing_source == "custom" && !is_custom {
+                        continue;
+                    }
+                }
                 models_map.insert(
                     row.model_pattern,
                     (
@@ -1928,10 +1931,30 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
             cache_read,
             cache_write,
         } => {
-            if input < 0.0 || output < 0.0 {
+            let model_trimmed = model.trim().to_lowercase();
+            if model_trimmed.is_empty() {
                 return Err(CoreError::Proxy(
-                    "pricing rates must be non-negative".to_string(),
+                    "model pattern cannot be empty".to_string(),
                 ));
+            }
+            if !input.is_finite() || input < 0.0 || !output.is_finite() || output < 0.0 {
+                return Err(CoreError::Proxy(
+                    "pricing rates must be non-negative finite numbers".to_string(),
+                ));
+            }
+            if let Some(cr) = cache_read {
+                if !cr.is_finite() || cr < 0.0 {
+                    return Err(CoreError::Proxy(
+                        "cache_read rate must be a non-negative finite number".to_string(),
+                    ));
+                }
+            }
+            if let Some(cw) = cache_write {
+                if !cw.is_finite() || cw < 0.0 {
+                    return Err(CoreError::Proxy(
+                        "cache_write rate must be a non-negative finite number".to_string(),
+                    ));
+                }
             }
             let input_micros = (input * 1_000_000.0).round() as i64;
             let output_micros = (output * 1_000_000.0).round() as i64;
@@ -1943,7 +1966,7 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
                 .unwrap_or((input_micros as f64 * 1.25).round() as i64);
 
             let row = xfade_core::store::db::DynamicPriceRow {
-                model_pattern: model.trim().to_lowercase(),
+                model_pattern: model_trimmed.clone(),
                 input_micros_per_m: input_micros,
                 output_micros_per_m: output_micros,
                 cache_read_micros_per_m: cache_read_micros,
@@ -1952,6 +1975,17 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
                 updated_at: now_rfc3339(),
             };
             core.db().upsert_model_pricing(&row)?;
+
+            // If pattern is namespaced (e.g. "anthropic/claude-sonnet-5.5"), also alias bare name
+            if let Some((_, bare)) = model_trimmed.rsplit_once('/') {
+                let bare = bare.trim();
+                if !bare.is_empty() && bare != model_trimmed {
+                    let mut bare_row = row.clone();
+                    bare_row.model_pattern = bare.to_string();
+                    let _ = core.db().upsert_model_pricing(&bare_row);
+                }
+            }
+
             println!(
                 "Set custom pricing for {}: ${:.4} in / ${:.4} out per 1M tokens.",
                 model, input, output
@@ -1959,9 +1993,19 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
             Ok(())
         }
         PricingCmd::Rm { model } => {
-            let deleted = core
-                .db()
-                .delete_model_pricing(&model.trim().to_lowercase())?;
+            let model_trimmed = model.trim().to_lowercase();
+            if model_trimmed.is_empty() {
+                return Err(CoreError::Proxy(
+                    "model pattern cannot be empty".to_string(),
+                ));
+            }
+            let mut deleted = core.db().delete_model_pricing(&model_trimmed)?;
+            if let Some((_, bare)) = model_trimmed.rsplit_once('/') {
+                let bare = bare.trim();
+                if !bare.is_empty() && bare != model_trimmed {
+                    deleted |= core.db().delete_model_pricing(bare)?;
+                }
+            }
             if deleted {
                 println!("Removed custom pricing override for {model}.");
             } else {
@@ -1973,10 +2017,13 @@ fn cmd_pricing(core: &Core, cmd: Option<PricingCmd>) -> Result<(), CoreError> {
             if synced {
                 let cleared = core.db().clear_synced_model_pricing()?;
                 println!("Cleared {cleared} synced model pricing entries.");
+                Ok(())
             } else {
-                println!("Please specify what to reset, e.g. `xfade pricing reset --synced`.");
+                Err(CoreError::Proxy(
+                    "missing required flag: --synced (e.g. `xfade pricing reset --synced`)"
+                        .to_string(),
+                ))
             }
-            Ok(())
         }
     }
 }

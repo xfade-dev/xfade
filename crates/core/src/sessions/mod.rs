@@ -173,7 +173,8 @@ pub fn record_outcome(
 ) {
     let Some(sid) = session_id else { return };
     let status = if status_ok { "ok" } else { "error" };
-    let cost_micros = crate::proxy::pricing::estimate_cost(
+    let cost_micros = crate::proxy::pricing::estimate_cost_with_db(
+        Some(db),
         model,
         prompt_tokens,
         completion_tokens,
