@@ -424,6 +424,22 @@ impl Database {
                 [],
             )?;
         }
+        let session_cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+            let mut rows = stmt.query([])?;
+            let mut cols = std::collections::HashSet::new();
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                cols.insert(name);
+            }
+            cols
+        };
+        if !session_cols.contains("cost_usd_micros") {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN cost_usd_micros INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         let existing_handover_cols: std::collections::HashSet<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(handovers)")?;
             let mut rows = stmt.query([])?;

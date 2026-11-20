@@ -181,17 +181,27 @@ static CATALOG: &[PriceEntry] = &[
 /// Find the model price entry using prefix and alias normalization.
 pub fn find_model_price(model_name: &str) -> Option<&'static ModelPrice> {
     let trimmed = model_name.trim().to_lowercase();
-    // Strip provider prefix if present (e.g. "anthropic/claude-3-7-sonnet" -> "claude-3-7-sonnet")
-    let raw_name = if let Some((_, rest)) = trimmed.split_once('/') {
+    // Strip multi-tier provider prefixes if present (e.g. "openrouter/anthropic/claude-3-7-sonnet" -> "claude-3-7-sonnet")
+    let raw_name = if let Some((_, rest)) = trimmed.rsplit_once('/') {
         rest
     } else {
         &trimmed
     };
 
+    // Normalize common model aliases
+    let canonical_name: &str = match raw_name {
+        "sonnet" => "claude-3-7-sonnet",
+        "opus" => "claude-3-opus",
+        "haiku" => "claude-3-5-haiku",
+        "4o" => "gpt-4o",
+        "4o-mini" => "gpt-4o-mini",
+        other => other,
+    };
+
     // Find longest matching prefix
     let mut best_match: Option<(&'static str, &'static ModelPrice)> = None;
     for entry in CATALOG {
-        if raw_name.starts_with(entry.prefix) {
+        if canonical_name.starts_with(entry.prefix) {
             match best_match {
                 Some((prev_prefix, _)) => {
                     if entry.prefix.len() > prev_prefix.len() {
@@ -216,10 +226,17 @@ pub fn calculate_cost_micros(
     cached_prompt_tokens: i64,
     cache_write_tokens: i64,
 ) -> i64 {
-    let uncached_prompt = (prompt_tokens - cached_prompt_tokens).max(0) as i128;
-    let cached_prompt = cached_prompt_tokens.max(0) as i128;
-    let completion = completion_tokens.max(0) as i128;
-    let cache_write = cache_write_tokens.max(0) as i128;
+    let prompt_tokens = prompt_tokens.max(0);
+    let completion_tokens = completion_tokens.max(0);
+    let cached_prompt_tokens = cached_prompt_tokens.max(0);
+    let cache_write_tokens = cache_write_tokens.max(0);
+
+    // Uncached prompt tokens: total prompt minus cached read tokens minus cache write tokens.
+    let uncached_prompt =
+        (prompt_tokens - cached_prompt_tokens - cache_write_tokens).max(0) as i128;
+    let cached_prompt = cached_prompt_tokens as i128;
+    let completion = completion_tokens as i128;
+    let cache_write = cache_write_tokens as i128;
 
     let cost_input = uncached_prompt * (price.input_micros_per_m as i128);
     let cost_cache_read = cached_prompt * (price.cache_read_micros_per_m as i128);
@@ -257,6 +274,9 @@ pub fn format_cost(micros: i64) -> String {
     if micros <= 0 {
         return "$0.0000".to_string();
     }
+    if micros < 50 {
+        return "< $0.0001".to_string();
+    }
     let dollars = micros as f64 / 1_000_000.0;
     format!("${:.4}", dollars)
 }
@@ -280,6 +300,17 @@ mod tests {
         let p_scoped =
             find_model_price("anthropic/claude-3-5-sonnet").expect("should match stripped prefix");
         assert_eq!(p_scoped.input_micros_per_m, 3_000_000);
+
+        // Multi-tier provider-scoped prefix
+        let p_multitier = find_model_price("openrouter/anthropic/claude-3-7-sonnet")
+            .expect("should strip multi-tier prefix");
+        assert_eq!(p_multitier.input_micros_per_m, 3_000_000);
+
+        // Common model aliases
+        let p_alias = find_model_price("sonnet").expect("should resolve sonnet alias");
+        assert_eq!(p_alias.input_micros_per_m, 3_000_000);
+        let p_4o_alias = find_model_price("4o").expect("should resolve 4o alias");
+        assert_eq!(p_4o_alias.input_micros_per_m, 2_500_000);
 
         // GPT-4o
         let p_4o = find_model_price("gpt-4o-2024-08-06").expect("should match gpt-4o");
@@ -317,6 +348,7 @@ mod tests {
     #[test]
     fn test_format_cost() {
         assert_eq!(format_cost(0), "$0.0000");
+        assert_eq!(format_cost(25), "< $0.0001");
         assert_eq!(format_cost(8_400), "$0.0084");
         assert_eq!(format_cost(1_245_000), "$1.2450");
         assert_eq!(format_cost(18_000_000), "$18.0000");

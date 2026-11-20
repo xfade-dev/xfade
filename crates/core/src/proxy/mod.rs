@@ -1722,6 +1722,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_streaming_large_response_preserves_head_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        core.db().set_routes(&["yy".into()], None, "chat").unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+
+        // Simulate Anthropic streaming:
+        // 1. message_start with 50 input_tokens, 20,000 cache_read_input_tokens
+        // 2. Many output text chunks totaling > 15 KB to force eviction from an 8 KB tail buffer
+        // 3. message_delta with cumulative output_tokens = 500
+        let mut sse_lines = Vec::new();
+        sse_lines.push("event: message_start".to_string());
+        sse_lines.push(r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50,"cache_read_input_tokens":20000}}}"#.to_string());
+
+        // 100 chunks of 150 bytes = 15,000 bytes > 8KB SSE_TAIL_CAP
+        for _ in 0..100 {
+            sse_lines.push(format!(
+                r#"data: {{"choices":[{{"delta":{{"content":"{}"}}}}]}}"#,
+                "a".repeat(150)
+            ));
+        }
+        sse_lines.push("event: message_delta".to_string());
+        sse_lines
+            .push(r#"data: {"type":"message_delta","usage":{"output_tokens":500}}"#.to_string());
+        sse_lines.push("data: [DONE]".to_string());
+
+        let lines_ref: Vec<&str> = sse_lines.iter().map(|s| s.as_str()).collect();
+        up.respond_sse(lines_ref);
+
+        let (status, _headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"claude-3-7-sonnet","stream":true,"messages":[{"role":"user","content":"write long text"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let logs = db.recent_request_logs(1).unwrap();
+        assert_eq!(logs.len(), 1);
+        // Prompt tokens should not be lost despite tail buffer overflow!
+        // Total prompt: 50 uncached + 20,000 cached = 20,050
+        assert_eq!(logs[0].prompt_tokens, 20_050);
+        assert_eq!(logs[0].completion_tokens, 500);
+        // Cost:
+        // uncached: 50 * $3.00/M = 150 micros
+        // cached read: 20,000 * $0.30/M = 6,000 micros
+        // completion: 500 * $15.00/M = 7,500 micros
+        // Total = 150 + 6,000 + 7,500 = 13,650 micros
+        assert_eq!(logs[0].cost_usd_micros, 13_650);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_calculates_cost_with_model_override_and_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("yy", &up.url(), "k1")]);
+        let db = core.db().clone();
+        // Route model override sets model to "claude-3-7-sonnet"
+        core.db()
+            .set_routes_with_models(
+                &["yy".into()],
+                Some("claude-3-7-sonnet"),
+                "chat",
+                &Default::default(),
+            )
+            .unwrap();
+        let url = spawn_service(ProxyService::new(core)).await;
+
+        up.respond_sequence(vec![(
+            200,
+            r#"{"id":"r1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":200}}"#,
+        )]);
+
+        // Client request specifies generic alias "sonnet"
+        let (status, _headers, _body) = http_post_json_with_headers(
+            &url,
+            "/v1/chat/completions",
+            r#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let logs = db.recent_request_logs(1).unwrap();
+        assert_eq!(logs.len(), 1);
+        // Cost should be calculated on claude-3-7-sonnet: 1000 * 3 + 200 * 15 = 3000 + 3000 = 6000 micros
+        assert_eq!(logs[0].cost_usd_micros, 6000);
+    }
+
+    #[tokio::test]
     async fn handover_auto_injection_off_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let up = MockUpstream::spawn().await;
