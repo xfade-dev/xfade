@@ -24,6 +24,8 @@ pub struct RequestLog {
     /// Session this request belongs to (see `crate::sessions`); NULL for
     /// pre-V2 rows and non-conversation endpoints (model listings).
     pub session_id: Option<String>,
+    /// Estimated cost in USD micro-dollars ($1.00 = 1,000,000 micros).
+    pub cost_usd_micros: i64,
 }
 
 /// A session row — the aggregated, eviction-isolated counterpart of
@@ -155,6 +157,7 @@ pub struct StatsRow {
     pub requests: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cost_usd_micros: i64,
     pub errors: i64,
     pub avg_duration_ms: i64,
 }
@@ -262,7 +265,9 @@ impl Database {
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL, error TEXT,
-                tool TEXT NOT NULL DEFAULT ''
+                tool TEXT NOT NULL DEFAULT '',
+                session_id TEXT,
+                cost_usd_micros INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_request_logs_ts ON request_logs(ts);
             CREATE TABLE IF NOT EXISTS circuit_state (
@@ -412,6 +417,12 @@ impl Database {
         }
         if !log_cols.contains("session_id") {
             conn.execute("ALTER TABLE request_logs ADD COLUMN session_id TEXT", [])?;
+        }
+        if !log_cols.contains("cost_usd_micros") {
+            conn.execute(
+                "ALTER TABLE request_logs ADD COLUMN cost_usd_micros INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         let existing_handover_cols: std::collections::HashSet<String> = {
             let mut stmt = conn.prepare("PRAGMA table_info(handovers)")?;
@@ -1114,8 +1125,8 @@ impl Database {
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id, cost_usd_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 log.ts,
                 log.endpoint,
@@ -1128,6 +1139,7 @@ impl Database {
                 log.duration_ms,
                 log.error,
                 log.session_id,
+                log.cost_usd_micros,
             ],
         )?;
         // Eviction: retain the most recent MAX_REQUEST_LOG_ROWS rows, deleting the oldest once exceeded.
@@ -1165,6 +1177,7 @@ impl Database {
             "SELECT {group_expr}, COUNT(*),
                     COALESCE(SUM(prompt_tokens), 0),
                     COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(cost_usd_micros), 0),
                     SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
                     CAST(AVG(duration_ms) AS INTEGER)
              FROM request_logs WHERE ts >= ?1{tool_filter}
@@ -1183,8 +1196,9 @@ impl Database {
                 requests: row.get(1)?,
                 prompt_tokens: row.get(2)?,
                 completion_tokens: row.get(3)?,
-                errors: row.get(4)?,
-                avg_duration_ms: row.get(5)?,
+                cost_usd_micros: row.get(4)?,
+                errors: row.get(5)?,
+                avg_duration_ms: row.get(6)?,
             });
         }
         Ok(out)
@@ -1194,7 +1208,7 @@ impl Database {
     pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id
+            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id, cost_usd_micros
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![limit as i64])?;
@@ -1212,6 +1226,7 @@ impl Database {
                 duration_ms: row.get(8)?,
                 error: row.get(9)?,
                 session_id: row.get(10)?,
+                cost_usd_micros: row.get(11)?,
             });
         }
         Ok(out)
@@ -1485,6 +1500,7 @@ impl Database {
         model: Option<&str>,
         prompt_tokens: i64,
         completion_tokens: i64,
+        cost_usd_micros: i64,
         status: &str,
         ended_at: &str,
     ) -> Result<()> {
@@ -1495,8 +1511,9 @@ impl Database {
                 model = COALESCE(?4, model),
                 prompt_tokens = prompt_tokens + ?5,
                 completion_tokens = completion_tokens + ?6,
-                status = ?7,
-                ended_at = ?8
+                cost_usd_micros = cost_usd_micros + ?7,
+                status = ?8,
+                ended_at = ?9
              WHERE id = ?1",
             params![
                 session_id,
@@ -1505,6 +1522,7 @@ impl Database {
                 model,
                 prompt_tokens,
                 completion_tokens,
+                cost_usd_micros,
                 status,
                 ended_at
             ],
@@ -2360,6 +2378,7 @@ mod tests {
             duration_ms: 5,
             error: None,
             session_id: None,
+            cost_usd_micros: 0,
         })
         .unwrap();
         let rows = db
@@ -2388,6 +2407,7 @@ mod tests {
             duration_ms: 800,
             error: None,
             session_id: None,
+            cost_usd_micros: 0,
         })
         .unwrap();
         db.insert_request_log(&RequestLog {
@@ -2402,6 +2422,7 @@ mod tests {
             duration_ms: 120,
             error: Some("rate limited".into()),
             session_id: None,
+            cost_usd_micros: 0,
         })
         .unwrap();
         // F5: status=0 (upstream connection failure) should count as errors
@@ -2417,6 +2438,7 @@ mod tests {
             duration_ms: 50,
             error: Some("connection refused".into()),
             session_id: None,
+            cost_usd_micros: 0,
         })
         .unwrap();
         let rows = db
@@ -2430,6 +2452,55 @@ mod tests {
             .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Model, None)
             .unwrap();
         assert_eq!(by_model.len(), 2);
+    }
+
+    #[test]
+    fn test_request_log_with_cost_usd_micros_and_stats_aggregation() {
+        let db = Database::open_memory().unwrap();
+        db.insert_request_log(&RequestLog {
+            ts: "2026-07-26T10:00:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("claude-3-7-sonnet".into()),
+            provider_id: "prov1".into(),
+            tool: "claude".into(),
+            status: 200,
+            prompt_tokens: 10_000,
+            completion_tokens: 2_000,
+            duration_ms: 500,
+            error: None,
+            session_id: Some("s1".into()),
+            cost_usd_micros: 60_000, // 60,000 micros = $0.06
+        })
+        .unwrap();
+
+        db.insert_request_log(&RequestLog {
+            ts: "2026-07-26T10:05:00Z".into(),
+            endpoint: "chat".into(),
+            model: Some("claude-3-7-sonnet".into()),
+            provider_id: "prov1".into(),
+            tool: "claude".into(),
+            status: 200,
+            prompt_tokens: 5_000,
+            completion_tokens: 1_000,
+            duration_ms: 300,
+            error: None,
+            session_id: Some("s1".into()),
+            cost_usd_micros: 30_000, // 30,000 micros = $0.03
+        })
+        .unwrap();
+
+        // 1. Verify recent request logs have cost_usd_micros
+        let recent = db.recent_request_logs(2).unwrap();
+        assert_eq!(recent[0].cost_usd_micros, 30_000);
+        assert_eq!(recent[1].cost_usd_micros, 60_000);
+
+        // 2. Verify stats_since aggregates cost_usd_micros
+        let rows = db
+            .stats_since("2026-07-25T00:00:00Z", StatsGroupBy::Provider, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].cost_usd_micros, 90_000);
     }
 
     #[test]
@@ -2448,6 +2519,7 @@ mod tests {
                 duration_ms: 100,
                 error: None,
                 session_id: None,
+                cost_usd_micros: 0,
             })
             .unwrap();
         };
@@ -2504,10 +2576,12 @@ mod tests {
             duration_ms: 10,
             error: None,
             session_id: None,
+            cost_usd_micros: 15,
         };
         let v: serde_json::Value = serde_json::to_value(&log).unwrap();
         assert_eq!(v["endpoint"], "chat");
         assert_eq!(v["status"], 200);
+        assert_eq!(v["cost_usd_micros"], 15);
     }
 
     #[test]
@@ -2569,6 +2643,7 @@ mod tests {
             Some("kimi-k2.5"),
             100,
             50,
+            500,
             "ok",
             "2026-10-09T10:01:00Z",
         )
@@ -2580,6 +2655,7 @@ mod tests {
             None,
             10,
             5,
+            50,
             "error",
             "2026-10-09T10:02:00Z",
         )
@@ -2590,11 +2666,12 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("kimi-k2.5")); // COALESCE keeps it
         assert_eq!(s.prompt_tokens, 110);
         assert_eq!(s.completion_tokens, 55);
+        assert_eq!(s.cost_usd_micros, 550);
         assert_eq!(s.status, "error");
         assert_eq!(s.first_prompt.as_deref(), Some("hello world"));
 
         // Empty tool/provider must not clobber filled fields.
-        db.update_session_progress("s1", "", "", None, 0, 0, "ok", "2026-10-09T10:03:00Z")
+        db.update_session_progress("s1", "", "", None, 0, 0, 0, "ok", "2026-10-09T10:03:00Z")
             .unwrap();
         let s = db.get_session("s1").unwrap().unwrap();
         assert_eq!(s.tool, "claude");
@@ -2723,6 +2800,7 @@ mod tests {
             duration_ms: 7,
             error: None,
             session_id: Some("s1".into()),
+            cost_usd_micros: 0,
         })
         .unwrap();
         let logs = db.recent_request_logs(5).unwrap();
@@ -2750,6 +2828,7 @@ mod tests {
                 duration_ms: 10,
                 error: None,
                 session_id,
+                cost_usd_micros: 0,
             })
             .unwrap();
         }

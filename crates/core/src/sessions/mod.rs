@@ -167,10 +167,19 @@ pub fn record_outcome(
     model: Option<&str>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_write_tokens: i64,
     status_ok: bool,
 ) {
     let Some(sid) = session_id else { return };
     let status = if status_ok { "ok" } else { "error" };
+    let cost_micros = crate::proxy::pricing::estimate_cost(
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cached_prompt_tokens,
+        cache_write_tokens,
+    );
     let _ = db.update_session_progress(
         sid,
         tool,
@@ -178,6 +187,7 @@ pub fn record_outcome(
         model,
         prompt_tokens,
         completion_tokens,
+        cost_micros,
         status,
         &now_rfc3339(),
     );
@@ -313,17 +323,20 @@ mod tests {
             Some(&sid),
             "claude",
             "glm",
-            Some("glm-5-2"),
+            Some("claude-3-7-sonnet"),
             100,
             40,
+            20,
+            10,
             true,
         );
-        record_outcome(&db, Some(&sid), "claude", "glm", None, 10, 5, false);
+        record_outcome(&db, Some(&sid), "claude", "glm", None, 10, 5, 0, 0, false);
         let row = db.get_session(&sid).unwrap().unwrap();
         assert_eq!(row.prompt_tokens, 110);
         assert_eq!(row.completion_tokens, 45);
         assert_eq!(row.status, "error");
-        assert_eq!(row.model.as_deref(), Some("glm-5-2"));
+        assert_eq!(row.model.as_deref(), Some("claude-3-7-sonnet"));
+        assert_eq!(row.cost_usd_micros, 884);
         // The handover got attributed to this session.
         let hs = db.list_handovers(&sid).unwrap();
         assert_eq!(hs.len(), 1);
@@ -333,7 +346,7 @@ mod tests {
     #[test]
     fn record_outcome_none_session_is_noop() {
         let db = Database::open_memory().unwrap();
-        record_outcome(&db, None, "claude", "kimi", None, 1, 1, true);
+        record_outcome(&db, None, "claude", "kimi", None, 1, 1, 0, 0, true);
         assert!(db.list_sessions(10).unwrap().is_empty());
     }
 }
