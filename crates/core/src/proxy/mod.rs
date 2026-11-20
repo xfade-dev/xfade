@@ -2,6 +2,7 @@ pub mod cache_injector;
 pub mod circuit_breaker;
 pub mod convert;
 pub mod forward;
+pub mod pricing;
 pub mod robustness;
 #[cfg(test)]
 pub mod testsupport;
