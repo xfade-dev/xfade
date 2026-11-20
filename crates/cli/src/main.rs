@@ -1057,16 +1057,18 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 return Ok(());
             }
             println!(
-                "{:<24} {:>10} {:>10} {:>8} {:>8}",
-                "group", "requests", "tokens", "errors", "avg_ms"
+                "{:<24} {:>10} {:>10} {:>12} {:>8} {:>8}",
+                "group", "requests", "tokens", "cost (est)", "errors", "avg_ms"
             );
             for r in &rows {
                 let tokens = r.prompt_tokens + r.completion_tokens;
+                let cost_str = xfade_core::proxy::pricing::format_cost(r.cost_usd_micros);
                 println!(
-                    "{:<24} {:>10} {:>10} {:>8} {:>8}",
-                    r.group, r.requests, tokens, r.errors, r.avg_duration_ms
+                    "{:<24} {:>10} {:>10} {:>12} {:>8} {:>8}",
+                    r.group, r.requests, tokens, cost_str, r.errors, r.avg_duration_ms
                 );
             }
+            println!("* cost estimates based on official token pricing (estimated)");
             Ok(())
         }
         Cmd::Sessions { cmd } => match cmd {
@@ -1080,18 +1082,20 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     return Ok(());
                 }
                 println!(
-                    "{:<26} {:<8} {:<10} {:<16} {:>8} {:<8} started",
-                    "session", "tool", "provider", "model", "tokens", "status"
+                    "{:<26} {:<8} {:<10} {:<16} {:>8} {:>12} {:<8} started",
+                    "session", "tool", "provider", "model", "tokens", "cost (est)", "status"
                 );
                 for r in &rows {
                     let tokens = r.prompt_tokens + r.completion_tokens;
+                    let cost_str = xfade_core::proxy::pricing::format_cost(r.cost_usd_micros);
                     println!(
-                        "{:<26} {:<8} {:<10} {:<16} {:>8} {:<8} {}",
+                        "{:<26} {:<8} {:<10} {:<16} {:>8} {:>12} {:<8} {}",
                         r.id,
                         r.tool,
                         r.provider_id.as_deref().unwrap_or("-"),
                         r.model.as_deref().unwrap_or("-"),
                         tokens,
+                        cost_str,
                         r.status,
                         r.started_at
                     );
@@ -1120,6 +1124,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     "tokens:   {} prompt + {} completion",
                     s.prompt_tokens, s.completion_tokens
                 );
+                let cost_str = xfade_core::proxy::pricing::format_cost(s.cost_usd_micros);
+                println!("cost:     {cost_str} (estimated)");
                 if let Some(p) = &s.first_prompt {
                     println!("opener:   {p}");
                 }
