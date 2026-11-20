@@ -1,5 +1,7 @@
 //! Token pricing catalog and cost estimation for supported models.
 
+use crate::store::db::Database;
+
 /// Per-million token rates in micro-dollars ($1.00 USD = 1,000,000 micros).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelPrice {
@@ -436,18 +438,9 @@ static CATALOG: &[PriceEntry] = &[
     },
 ];
 
-/// Find the model price entry using prefix and alias normalization.
-pub fn find_model_price(model_name: &str) -> Option<&'static ModelPrice> {
-    let trimmed = model_name.trim().to_lowercase();
-    // Strip multi-tier provider prefixes if present (e.g. "openrouter/anthropic/claude-3-7-sonnet" -> "claude-3-7-sonnet")
-    let raw_name = if let Some((_, rest)) = trimmed.rsplit_once('/') {
-        rest
-    } else {
-        &trimmed
-    };
-
-    // Normalize common model aliases
-    let canonical_name: &str = match raw_name {
+/// Normalize common model aliases to their canonical model names.
+pub fn canonical_alias(raw_name: &str) -> &str {
+    match raw_name {
         "sonnet" => "claude-sonnet-5.5",
         "opus" => "claude-opus-5.5",
         "haiku" => "claude-haiku-5.5",
@@ -471,7 +464,20 @@ pub fn find_model_price(model_name: &str) -> Option<&'static ModelPrice> {
         "glm-5" => "glm-5.3",
         "devstral" => "devstral-2512",
         other => other,
+    }
+}
+
+/// Find the model price entry using prefix and alias normalization.
+pub fn find_model_price(model_name: &str) -> Option<&'static ModelPrice> {
+    let trimmed = model_name.trim().to_lowercase();
+    // Strip multi-tier provider prefixes if present (e.g. "openrouter/anthropic/claude-3-7-sonnet" -> "claude-3-7-sonnet")
+    let raw_name = if let Some((_, rest)) = trimmed.rsplit_once('/') {
+        rest
+    } else {
+        &trimmed
     };
+
+    let canonical_name = canonical_alias(raw_name);
 
     // Find longest matching prefix
     let mut best_match: Option<(&'static str, &'static ModelPrice)> = None;
@@ -522,8 +528,12 @@ pub fn calculate_cost_micros(
     ((total + 500_000) / 1_000_000) as i64
 }
 
-/// Convenience helper to estimate cost for a named model, defaulting to 0 if unknown.
-pub fn estimate_cost(
+/// Estimate cost using the three-tier resolution hierarchy:
+/// 1. User custom override in database (`source = 'custom'`)
+/// 2. Live synced model pricing in database (`source = 'synced'`)
+/// 3. Built-in fallback catalog (`CATALOG`)
+pub fn estimate_cost_with_db(
+    db: Option<&Database>,
     model: Option<&str>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -531,6 +541,30 @@ pub fn estimate_cost(
     cache_write_tokens: i64,
 ) -> i64 {
     let Some(m) = model else { return 0 };
+    let trimmed = m.trim().to_lowercase();
+    let raw = trimmed.rsplit_once('/').map(|(_, r)| r).unwrap_or(&trimmed);
+    let canonical = canonical_alias(raw);
+
+    // 1 & 2: Dynamic DB lookup (custom then synced)
+    if let Some(db_conn) = db {
+        if let Ok(Some(dynamic)) = db_conn.find_dynamic_model_price(&trimmed, Some(canonical)) {
+            let price = ModelPrice {
+                input_micros_per_m: dynamic.input_micros_per_m,
+                output_micros_per_m: dynamic.output_micros_per_m,
+                cache_read_micros_per_m: dynamic.cache_read_micros_per_m,
+                cache_write_micros_per_m: dynamic.cache_write_micros_per_m,
+            };
+            return calculate_cost_micros(
+                &price,
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+                cache_write_tokens,
+            );
+        }
+    }
+
+    // 3: Built-in fallback catalog
     if let Some(price) = find_model_price(m) {
         calculate_cost_micros(
             price,
@@ -542,6 +576,24 @@ pub fn estimate_cost(
     } else {
         0
     }
+}
+
+/// Convenience helper to estimate cost for a named model, defaulting to 0 if unknown.
+pub fn estimate_cost(
+    model: Option<&str>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_prompt_tokens: i64,
+    cache_write_tokens: i64,
+) -> i64 {
+    estimate_cost_with_db(
+        None,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cached_prompt_tokens,
+        cache_write_tokens,
+    )
 }
 
 /// Format micro-dollars into a human-readable USD string (e.g. "$0.0084", "$1.2450").
@@ -654,5 +706,103 @@ mod tests {
         assert_eq!(format_cost(8_400), "$0.0084");
         assert_eq!(format_cost(1_245_000), "$1.2450");
         assert_eq!(format_cost(18_000_000), "$18.0000");
+    }
+
+    #[test]
+    fn test_estimate_cost_with_db_precedence() {
+        use crate::store::db::{Database, DynamicPriceRow};
+
+        let db = Database::open_memory().unwrap();
+
+        // 1. Built-in catalog: claude-sonnet-5.5 ($2.00 / 1M in, $10.00 / 1M out)
+        // 1M prompt + 1M completion = $12.00 = 12_000_000 micros
+        let cost_builtin = estimate_cost_with_db(
+            Some(&db),
+            Some("claude-sonnet-5.5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_builtin, 12_000_000);
+
+        // 2. Synced pricing overrides built-in: $1.80 in, $9.00 out -> $10.80 = 10_800_000 micros
+        let row_synced = DynamicPriceRow {
+            model_pattern: "claude-sonnet-5.5".to_string(),
+            input_micros_per_m: 1_800_000,
+            output_micros_per_m: 9_000_000,
+            cache_read_micros_per_m: 90_000,
+            cache_write_micros_per_m: 2_250_000,
+            source: "synced".to_string(),
+            updated_at: "2026-11-20T20:00:00Z".to_string(),
+        };
+        db.upsert_model_pricing(&row_synced).unwrap();
+
+        let cost_synced = estimate_cost_with_db(
+            Some(&db),
+            Some("claude-sonnet-5.5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_synced, 10_800_000);
+
+        // 3. Custom pricing overrides synced: $1.00 in, $5.00 out -> $6.00 = 6_000_000 micros
+        let row_custom = DynamicPriceRow {
+            model_pattern: "claude-sonnet-5.5".to_string(),
+            input_micros_per_m: 1_000_000,
+            output_micros_per_m: 5_000_000,
+            cache_read_micros_per_m: 50_000,
+            cache_write_micros_per_m: 1_250_000,
+            source: "custom".to_string(),
+            updated_at: "2026-11-20T20:05:00Z".to_string(),
+        };
+        db.upsert_model_pricing(&row_custom).unwrap();
+
+        let cost_custom = estimate_cost_with_db(
+            Some(&db),
+            Some("claude-sonnet-5.5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_custom, 6_000_000);
+
+        // 4. Unknown model returns 0
+        let cost_unknown = estimate_cost_with_db(
+            Some(&db),
+            Some("my-unregistered-model"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_unknown, 0);
+
+        // 5. Delete custom -> falls back to synced
+        db.delete_model_pricing("claude-sonnet-5.5").unwrap();
+        let cost_fallback_synced = estimate_cost_with_db(
+            Some(&db),
+            Some("claude-sonnet-5.5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_fallback_synced, 10_800_000);
+
+        // 6. Clear synced -> falls back to built-in
+        db.clear_synced_model_pricing().unwrap();
+        let cost_fallback_builtin = estimate_cost_with_db(
+            Some(&db),
+            Some("claude-sonnet-5.5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        assert_eq!(cost_fallback_builtin, 12_000_000);
     }
 }
