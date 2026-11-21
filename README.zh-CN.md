@@ -25,28 +25,52 @@
 
 ---
 
-## 安装与验签
+## 安装与升级指南
 
-### CLI
+### 1. Homebrew 安装与升级（macOS / Linux）
 
 ```bash
-# Homebrew（macOS / Linux）
+# 首次安装
 brew install xfade-dev/xfade/xfade
 
-# 一键安装脚本（macOS / Linux）
+# 升级至最新版本
+brew update && brew upgrade xfade-dev/xfade/xfade
+```
+
+### 2. 一键安装 / 升级脚本 (`xfade.sh`)
+
+```bash
+# 默认安装至 ~/.local/bin
 curl -fsSL https://xfade.sh | sh
 
-# 源码编译
+# 或指定覆盖安装至系统目录：
+curl -fsSL https://xfade.sh | XFADE_INSTALL_DIR=/usr/local/bin sh
+```
+
+### 3. CLI 内置自更新
+
+```bash
+xfade self-update
+# 若安装在系统受限目录（如 /usr/local/bin），请使用：
+# sudo xfade self-update
+```
+
+### 4. 源码编译构建
+
+```bash
 cargo build --release -p xfade   # 产物 target/release/xfade
 ```
 
-### 发布产物验签
+### 发布产物与签名校验
 
 每个 Release 均包含 Sigstore 无长期私钥签名与 GitHub 构建来源证明（Build Provenance）。可在运行前独立校验：
 
 ```bash
-scripts/verify-release.sh v0.11.1
+scripts/verify-release.sh v0.12.0
 ```
+
+> [!TIP]
+> **版本冲突排查**：若重新安装或升级后执行 `xfade --version` 仍显示老版本，请使用 `which -a xfade` 排查系统中是否存在多个冲突路径（如 `/usr/local/bin` 或 `/opt/homebrew/bin` 优先于 `~/.local/bin`），并在终端执行 `rehash`（Zsh）或 `hash -r`（Bash）刷新 Shell 命令缓存。
 
 ---
 

@@ -25,28 +25,51 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Installation
+## Installation & Upgrade
 
-### CLI
+### 1. Homebrew (macOS / Linux)
 
 ```bash
-# Homebrew (macOS / Linux)
+# Install
 brew install xfade-dev/xfade/xfade
 
-# One-line installer (macOS / Linux)
+# Upgrade to latest release
+brew update && brew upgrade xfade-dev/xfade/xfade
+```
+
+### 2. One-Line Installer (`xfade.sh`)
+
+```bash
+# Install or upgrade (default: ~/.local/bin)
 curl -fsSL https://xfade.sh | sh
 
-# Or build from source
+# Or install directly to system path:
+curl -fsSL https://xfade.sh | XFADE_INSTALL_DIR=/usr/local/bin sh
+```
+
+### 3. Built-In Self-Update
+
+```bash
+xfade self-update
+# (Use `sudo xfade self-update` if installed in /usr/local/bin)
+```
+
+### 4. Build from Source
+
+```bash
 cargo build --release -p xfade   # output in target/release/xfade
 ```
 
-### Release Verification
+### Cryptographic Verification
 
 Every release includes a keyless Sigstore signature and GitHub build provenance. Verify before running:
 
 ```bash
-scripts/verify-release.sh v0.11.1
+scripts/verify-release.sh v0.12.0
 ```
+
+> [!TIP]
+> **Troubleshooting Upgrades**: If `xfade --version` still shows an older version after reinstalling, run `which -a xfade` to check if an older binary in `/usr/local/bin` or `/opt/homebrew/bin` is shadowing `~/.local/bin`. Run `rehash` (Zsh) or `hash -r` (Bash) to refresh your shell's binary path cache.
 
 ---
 
