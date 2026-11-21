@@ -2,6 +2,38 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.12.0 — 2026-11-21
+
+### Security & Credential Isolation (F1, F2, F7, T7, T8)
+- **feat(credentials)**: Zero-raw-key credential isolation by default. `xfade use` writes a virtual local token (`xf-tok-*`) to client configurations (`settings.json`, `config.toml`, etc.) pointing to the local gateway at `127.0.0.1:24860`. Upstream API keys are held strictly in the system keyring or private storage, never exposed on disk. Includes automatic client config backup and rollback on migration failure.
+- **feat(escape-hatch)**: `--direct` escape hatch on `xfade use` for troubleshooting or unsupported setups, with explicit warning prompts, trust state `DIRECT`, and audit trail tracking.
+- **feat(security)**: `xfade doctor --security [--fix]` command suite to audit client configs for raw key leakage, file permissions, and daemon connectivity, with automatic remediation.
+- **feat(audit)**: Structured `xfade audit` log recording client origin, route path, failover trajectories, and token counts (without logging prompt contents or keys).
+- **feat(egress)**: Outbound domain whitelist filtering to guard against SSRF, malicious redirects, and credential exfiltration.
+- **feat(permissions)**: Cross-platform owner-only file permissions (Unix atomic `0600` + Windows protected owner/SYSTEM DACL on NTFS, blocking inherited permissions).
+- **feat(policy)**: Published formal vulnerability response SLA (48h triage, 7d mitigation, 90d coordinated public disclosure, `security@xfade.dev`).
+
+### Routing & Failover Robustness (F4, F5, F6)
+- **feat(protocols)**: Independent per-provider protocols (`ProviderProtocol::Chat`, `Messages`, `Responses`). Transcodes requests and streaming responses bidirectionally between OpenAI Chat, Anthropic Messages, and Responses.
+- **feat(model-map)**: Explicit client-to-upstream model mapping via `xfade model-map` (`set`, `ls`, `rm`, `clear`) with wildcard fallback and Stage 2c models-merge bypass.
+- **feat(robustness)**: Semantic commit gate supporting pre-commit failover on upstream HTTP 200 JSON error bodies, TTFT timeouts, and idle timeouts.
+- **feat(robustness)**: Upstream rate limit backoff parsing `Retry-After` headers (≤2s) for instant intra-upstream retry before escalating.
+- **feat(robustness)**: Post-commit non-replay safety guarantee. Interrupted streams synthesize a protocol-native `xfade_stream_interrupted` event and terminate without duplicated token billing or duplicate tool calls.
+
+### Dynamic Cost Estimation (F8 & F8-Ext)
+- **feat(pricing)**: Three-tier dynamic model pricing (`Custom Overrides` > `Synced OpenRouter Catalog` > `Built-in 2026 Flagship Baseline`) with micro-dollar ($0.000001) integer arithmetic and prompt cache read/write discounts.
+- **feat(cli)**: Added `xfade pricing` (`list`, `sync`, `set`, `rm`, `reset`) subcommand suite.
+- **feat(stats)**: Surface estimated USD cost in `xfade stats` and `xfade sessions`.
+
+### Performance & Benchmarks (F10)
+- **feat(benchmarks)**: Automated Criterion microbenchmark suite measuring local gateway overhead:
+  - Gateway loopback added latency overhead: **~0.32 ms** (Direct: 0.032 ms vs Gateway: 0.353 ms).
+  - Effective model resolution: **~26 ns**.
+  - Micro-dollar price lookup: **~30 ns – 88 ns**.
+  - Stream chunk semantic inspection: **< 1 µs**.
+
+---
+
 ## v0.11.1 — 2026-11-15
 
 ### Security

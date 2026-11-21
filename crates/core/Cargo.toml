@@ -28,5 +28,15 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "routing_and_pricing"
+harness = false
+
+[[bench]]
+name = "proxy_overhead"
+harness = false
+

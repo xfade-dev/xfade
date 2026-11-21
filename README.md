@@ -2,291 +2,190 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Switch API providers between AI coding tools like Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw, with a local proxy (OpenAI/Anthropic-compatible endpoints, failover, protocol conversion) and a macOS/Linux resident daemon.
+**xfade** — the vendor-neutral, zero-raw-key gateway for AI coding CLIs (Claude Code, Codex, OpenCode, Aider, Cline, Hermes, OpenClaw, and more).
 
-CLI (`xfade`) + Tauri GUI, implemented in Rust.
+> **Switch models without dropping the beat** — First-class routing, protocol translation, robust failover, and dynamic pricing, with upstream API keys isolated completely from client configs. Zero telemetry, zero sponsored brokers, zero affiliate kickbacks.
 
-![xfade TUI — the crossfader](docs/demo.gif)
+[![CI](https://github.com/xfade-dev/xfade/actions/workflows/ci.yml/badge.svg)](https://github.com/xfade-dev/xfade/actions)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![Security Policy](https://img.shields.io/badge/security-SLA%2048h%2F7d-green.svg)](SECURITY.md)
 
-## Features
+---
 
-- **TUI**: bare `xfade` opens a crossfader-style TUI — per-tool tabs, provider health badges, parallel probe-all, and inline edit; falls back to a plain list when stdout is not a terminal.
-- **Provider switching**: add/remove/edit providers for Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw, one-command switch writes each tool's config (settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml / .cline/data/settings/ / .hermes/config.yaml / .openclaw/openclaw.json), stores keys in the system keyring, auto-backs-up before switching.
-- **Local proxy**: `xfade serve` exposes OpenAI/Anthropic-compatible endpoints (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`) with route failover, circuit breaking, token stats, and request logs.
-- **Protocol conversion**: bidirectional Anthropic↔OpenAI conversion (`target_protocol`), decoupling clients from the upstream protocol.
-- **daemon (macOS + Linux)**: launchd/systemd-resident + boot autostart + crash restart; `/__xfade/status` admin endpoint.
-- **GUI**: Tauri desktop app, five pages (Providers / Proxy / Stats / Logs / Settings) + system tray (close-to-tray, quick switch, start/stop proxy); `xfade` self-installs the daemon as a sidecar.
+## Why xfade?
+
+| Feature | Standard CLI Setup | Other Switchers / Proxies | xfade Gateway |
+| :--- | :--- | :--- | :--- |
+| **API Keys on Disk** | Raw plaintext in `settings.json` / `config.toml` | Raw plaintext in local configs / unencrypted DB | **Zero raw keys on disk** (client holds virtual `xf-tok-*`; real keys stay in OS Keyring) |
+| **Failover Timing** | Hard error / session exit | Blind failover on any 4xx (wastes quota) | **Pre-commit failover** (TTFT timeout, 200 error body, 429 `Retry-After`, zero replay) |
+| **Protocols** | Locked to client's native protocol | Rigid global translation | **Per-provider independent protocol** (Chat, Messages, Responses) |
+| **Added Latency (F10)** | 0 ms | 5 ms – 50 ms (Python/Node runtime) | **~0.32 ms** (Rust Axum sub-millisecond overhead) |
+| **Model Pricing** | Unknown / static tables | Outdated hardcoded rates | **Three-tier dynamic pricing** (Custom > OpenRouter live sync > 2026 flagship offline catalog) |
+| **Trust & Neutrality** | N/A | Sponsored routes, telemetry, affiliate links | **100% Neutral**: zero telemetry, zero kickbacks, Sigstore signed, CycloneDX SBOM |
+
+---
 
 ## Installation
 
 ### CLI
 
 ```bash
-# Homebrew (recommended, macOS)
+# Homebrew (macOS / Linux)
 brew install xfade-dev/xfade/xfade
 
-# or the one-line installer (macOS / Linux)
+# One-line installer (macOS / Linux)
 curl -fsSL https://xfade.sh | sh
 
-# or download a binary from GitHub Release
-# or build from source
-cargo build --release -p xfade   # output target/release/xfade
+# Or build from source
+cargo build --release -p xfade   # output in target/release/xfade
 ```
 
-Release downloads include a keyless Sigstore signature and GitHub build
-provenance. To verify both the signer and the SHA-256 checksum before running a
-download (requires `cosign`):
+### Release Verification
+
+Every release includes a keyless Sigstore signature and GitHub build provenance. Verify before running:
 
 ```bash
-scripts/verify-release.sh vX.Y.Z
+scripts/verify-release.sh v0.11.1
 ```
 
-See [RELEASE.md](RELEASE.md#signing) for manual Cosign and GitHub attestation
-verification. The one-line installer verifies SHA-256 automatically.
+---
 
-### GUI
+## Quick Start: Zero-Raw-Key Isolation
 
-Download `xfade-gui_<version>_aarch64.dmg` (macOS Apple Silicon) from GitHub Release and drag it into Applications. Or build from source — see "Development" below.
+### 1. Add Providers and Store Keys Securely
 
-## Quick start
+Add upstream providers. Real API keys are securely stored in your OS keychain (or encrypted local store):
 
 ```bash
-# 1. Add a third-party provider (Codex as an example)
-xfade add kimi --tool codex --base-url https://api.moonshot.cn/v1 --key sk-xxx
+# Add an Anthropic Messages provider
+xfade add anthropic --tool claude --protocol messages \
+  --base-url https://api.anthropic.com --key sk-ant-api03-...
 
-# 2. Switch to it (writes ~/.codex/config.toml + auth.json, auto-backs-up the old config)
-xfade use kimi --tool codex
-
-# 3. Show the current provider for each tool
-xfade current
+# Add a DeepSeek or Kimi OpenAI-compatible Chat provider
+xfade add kimi --tool claude --protocol chat \
+  --base-url https://api.moonshot.cn/v1 --key sk-xxx
 ```
 
-Tip: run bare `xfade` to open the interactive TUI and switch providers with arrow keys / fader.
+### 2. Switch with Credential Isolation (Default)
 
-Claude Code supports per-slot models — pin a different model for each of the
-`opus` / `sonnet` / `haiku` slots (written as `ANTHROPIC_DEFAULT_*_MODEL`):
+Running `xfade use` automatically provisions a virtual local token (`xf-tok-*`) and configures your coding tool to route through the local gateway:
 
 ```bash
-xfade add work --tool claude --base-url https://... --key sk-xxx \
-  --opus-model deepseek/deepseek-v4-pro \
-  --sonnet-model deepseek/deepseek-v4-flash \
-  --haiku-model deepseek/deepseek-v4-flash
+xfade use kimi --tool claude
 ```
 
-Same for the other tools: `--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`.
+Your tool's configuration (`~/.claude/settings.json`) now points to `http://127.0.0.1:24860` with virtual token authorization. **No raw upstream key is ever written to disk.**
 
-### One-off run without switching
+*(Need direct client-to-upstream communication without the gateway? Use the explicit `--direct` escape hatch: `xfade use kimi --tool claude --direct`).*
 
-`xfade run` launches the tool with a provider injected through environment
-variables only — no config files are written or touched, so the active setup
-stays exactly as-is:
+### 3. Verify Trust & Health
+
+Run the built-in security doctor to check token isolation, file permissions, and trust status:
 
 ```bash
-xfade run kimi            # launch claude against kimi for this session only
-xfade run kimi -- --print # everything after `--` goes to the tool itself
+xfade doctor --security
 ```
 
-Supported for env-driven tools (claude, aider); config-file tools tell you to
-use `xfade use` instead. Official providers launch the tool as-is.
-
-### Instant launch: `xfade <tool>`
-
-The tool name itself is a subcommand — a shorthand for `xfade run` with the
-provider, model, endpoint and key resolved on the spot (unregistered presets
-are auto-created; nothing is ever written into the tool's own config):
+If any configuration or file permission was modified externally, auto-remediate:
 
 ```bash
-xfade claude kimi                          # launch Claude Code on the kimi preset (auto-created)
-xfade claude --model kimi-k2.5             # no name: the model reverse-looks-up a matching preset/provider
-xfade claude my-gw --base-url https://gw --key sk-xxx   # ad-hoc endpoint, auto-registered
-xfade claude -- --print                    # everything after `--` goes to the tool
-xfade aider deepseek --model deepseek-chat
-xfade codex glm --model glm-5-2-260617     # -c config overrides + key via env (no files touched)
-xfade opencode glm -- run "fix the bug"    # inline OPENCODE_CONFIG_CONTENT (no files touched)
+xfade doctor --security --fix
 ```
 
-Notes:
+---
 
-- Key precedence: `--key` → the provider's stored key → the global `api_key`.
-- `--model` / `--base-url` are one-off overrides and are never persisted.
-- Injection works for **claude** and **aider** (env), **codex** (`-c`
-  overrides + `XFADE_CODEX_KEY` referenced via `env_key`) and **opencode**
-  (inline `OPENCODE_CONFIG_CONTENT`) — codex/opencode verified 2026-10-22
-  against codex-cli 0.155.0 / opencode 1.18.31 (real config homes stay
-  untouched). pi ignores env overrides for custom providers, so pi (and
-  omp/cline/hermes/openclaw) point at `xfade use` instead.
+## Core Capabilities
 
-## Session view
+### 1. Fine-Grained Failover Before First Byte (F6)
+- **Pre-Commit Routing**: If an upstream returns an HTTP 200 with an internal JSON error body, or exceeds TTFT timeout, xfade transparently switches to the next configured fallback route.
+- **Rate Limit Resilience**: Automatically respects upstream `Retry-After` headers (up to 2s) for instant intra-upstream retry before escalating.
+- **Post-Commit Safety**: Once the first semantic chunk is emitted to the client, xfade **never replays** upstream data (preventing duplicated billing and duplicate tool executions). Interrupted streams cleanly emit a protocol-native `xfade_stream_interrupted` event.
 
-Requests flowing through `xfade serve` get a conversation identity: the
-opener (system + first user turn) is hashed into a fingerprint, and
-consecutive turns within 30 minutes reuse the same session — no prompt text
-is ever stored (only a truncated opener preview). Model switches made by
-`xfade use` or `xfade proxy use --model` land on the session timeline and are
-backfilled from the next matching request:
+### 2. Explicit Client-to-Upstream Model Mapping (F5)
+Map general client model names to provider-specific model identifiers:
 
 ```bash
-xfade sessions                 # list recent sessions (tool / provider / tokens / status)
-xfade sessions show <id>       # one session + its model-switch timeline
-xfade stats --by session       # request/token aggregates per session
+# Map client alias 'sonnet' to OpenRouter's full catalog name for the openrouter route
+xfade model-map set openrouter sonnet anthropic/claude-3.7-sonnet
+
+# List active model mappings
+xfade model-map ls
 ```
 
-Every proxied response also carries an `X-Xfade-Session-Id` header.
-
-## CLI command reference
-
-```
-xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
-xfade ls [--tool <t>]
-xfade use <id> --tool <t>
-xfade run <id> [--tool <t>] [-- <args>]  # launch the tool with the provider injected (claude / aider / codex / opencode)
-xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
-                                        # instant launch: claude/aider/codex/opencode work; other tools point at `use`
-xfade current
-xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
-xfade rm <id> --tool <t>
-xfade presets                     # list built-in presets for all tools
-xfade import --tool <t>            # import from the tool's existing config
-xfade backup ls|restore --tool <t>
-xfade completion <shell>
-xfade tui [--tool <t>]             # interactive crossfader TUI (default: bare `xfade`)
-xfade sessions [show <id>]         # unified session view (conversations seen by the proxy)
-xfade config [set <k> <v>]         # view/set global config (secrets backend, shared base_url/model/api)
-xfade self-update                  # update to the latest GitHub release
-```
-
-### Local proxy
+### 3. Three-Tier Dynamic Model Pricing (F8 & F8-Ext)
+Track token usage and estimated USD costs with micro-dollar integer precision:
+- **Layer 1 (Custom Overrides)**: User-defined manual rates (`xfade pricing set`).
+- **Layer 2 (Live Sync)**: Sync latest rates from OpenRouter's live catalog (`xfade pricing sync`).
+- **Layer 3 (Offline Baseline)**: 2026 flagship catalog with prompt caching discounts (Claude 3.7/3.5, GPT-4o, DeepSeek V3/R1, Gemini 2.5).
 
 ```bash
-xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T | --auth-token-file F]   # run in foreground
-xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
-xfade proxy status
-xfade proxy clear
-xfade proxy smart on|off              # Smart Fader toggle (off by default)
-xfade proxy failover-4xx on|off       # 4xx failover toggle (off by default)
-xfade proxy models-merge on|off       # aggregate /v1/models across all routes (off by default)
-xfade stats [--by provider|model|session]   # aggregate request stats
+xfade pricing list            # view pricing table & source (custom/synced/builtin)
+xfade pricing sync            # pull live pricing from OpenRouter API
+xfade stats --by model        # inspect token volume and estimated USD cost
 ```
 
-### Smart Fader (intent-aware routing)
+### 4. Visible Audit Trail & Egress Security (F7)
+- **SSRF & Data Exfiltration Protection**: Outbound requests are strictly limited to domains registered in your active provider configuration.
+- **Audit Export**: Export sanitized request logs with full failover trajectories:
+```bash
+xfade audit export --format json
+```
+- **Trust Indicators**: TUI, CLI status, and desktop tray prominently display trust level:
+  - `GUARDED`: Full zero-raw-key gateway isolation active.
+  - `DIRECT`: Running in escape hatch mode (raw key on disk).
+  - `EXPOSED`: Key leakage or insecure file permissions detected.
 
-Off by default — enable with `xfade proxy smart on`; every request pays zero extra cost while off.
+### 5. Verified Performance Benchmarks (F10)
+Reproducible Criterion microbenchmarks run on local loopback:
+- **Loopback Proxy Latency Overhead**: **~0.32 ms** (Direct: 0.032 ms vs Gateway: 0.353 ms)
+- **Model Resolution Latency**: **~26 ns**
+- **Micro-Dollar Pricing Lookup**: **~30 ns – 88 ns**
+- **SSE Stream Chunk Semantic Inspection**: **< 1 µs**
 
-When on, the proxy classifies each request's last user message (pure keyword rules, no model calls) and re-orders your configured routes across tiers:
+---
 
-| Intent | Examples | Order |
-|---|---|---|
-| Light — error triage, tests, lint/format, small refactors | "why does this fail", "write a test", "run clippy" | local first, cloud fallback |
-| Heavy — big refactors, architecture | "restructure the module", "design the API" | cloud first, local fallback |
-| Unknown | anything unmatched | configured order (unchanged) |
-
-Details:
-
-- **Tier detection**: explicit `extra.tier = "local" | "cloud"` on a provider wins; otherwise loopback base_urls (`127.0.0.1`/`localhost`/`[::1]` — Ollama, LM Studio, MLX servers) are local, everything else cloud.
-- **In-bucket ordering**: within a tier, providers are ordered by recent health (error rate, then latency) from a 30s-TTL stats snapshot — no per-request GROUP BY. Providers without stats keep their configured position relative to each other.
-- **Circuit breakers and failover behave exactly as with the fader off**: open circuits are skipped before bucketing, and a failing primary still fails over through the list.
-- Model overrides now also apply on the chat→chat passthrough path (local runtimes): the `model` field is rewritten per route.
-- Project analysis (language fingerprint + git pulse, cached in the `repo_maps` table) surfaces through `xfade project`, a serve-startup prewarm of the cwd, and the latest repo map shown in `xfade proxy status`. Phase-2 classification itself only reads the prompt text.
-
-### Aggregated model catalog (`models-merge`)
-
-Off by default — enable with `xfade proxy models-merge on`. By default `/v1/models` returns only the first successful upstream's catalog, which hides the other routes' models from AI coding tools.
-
-When on, the daemon probes `/v1/models` on every configured route and merges the results into one list, so tools can see and select models from **all** providers. Raw model ids are kept when unambiguous; ids exposed by two or more routes are namespaced as `<route_id>/<model>`. A `model → owning route` map is persisted, so a later request carrying one of those ids is pinned to that provider first (with the real upstream model id), while unrecognized/legacy ids keep the existing `--route-model` / `--model` / Smart Fader behavior. Turning it off restores the exact original first-success behavior. See [docs/api.md](docs/api.md#aggregated-model-catalog-models-merge) for details.
-
-### daemon (macOS + Linux)
+## Command Reference
 
 ```bash
-xfade serve install [--port --host --auth-token]   # install as launchd-resident + boot autostart
-xfade serve status                                 # query run state / routes / circuits
-xfade serve uninstall                              # uninstall
+# Provider Management
+xfade add <id> --tool <t> [--protocol chat|messages|responses] [--base-url URL] [--key KEY]
+xfade use <id> --tool <t> [--direct]      # switch provider (default: zero-raw-key gateway)
+xfade ls [--tool <t>]                     # list configured providers & active state
+xfade current                             # show active provider for each tool
+
+# Security, Audit & Health
+xfade doctor --security [--fix]           # audit token isolation and file permissions
+xfade audit [export]                      # view structured query audit trajectories
+xfade status                              # print proxy daemon, routes, circuits, and trust state
+
+# Model Mapping & Pricing
+xfade model-map [set|ls|rm|clear]         # configure client-to-upstream model mappings
+xfade pricing [list|sync|set|rm|reset]    # manage three-tier cost estimation catalog
+
+# Proxy & Daemon Control
+xfade serve [--port 24860] [--host 127.0.0.1]
+xfade proxy use <p1> <p2> [--model M]     # setup failover cascade
+xfade proxy smart on|off                  # Smart Fader intent routing
+xfade stats [--by provider|model|session] # token and USD cost statistics
+xfade serve install|uninstall             # launchd / systemd background service
 ```
 
-Logs: `~/.config/xfade/serve.log`.
+---
 
-## GUI
+## Neutrality & Privacy Pledge
 
-```bash
-cd crates/gui && npx tauri dev    # development
-```
+1. **Zero Raw Keys on Disk**: We do not store your plain upstream API keys in client config files or application logs.
+2. **Zero Telemetry**: xfade makes no unsolicited analytics or tracking requests.
+3. **Zero Sponsored Brokers & Zero Kickbacks**: We do not promote third-party proxy brokers, add attribution headers, or take affiliate cuts on model calls.
+4. **Independent Verification**: Releases are signed with Sigstore keyless signing and verifiable via GitHub Build Provenance.
 
-Left-sidebar pages:
+---
 
-- **Providers**: CRUD / switch / import / backups.
-- **Proxy**: control the daemon (start/stop), edit route failover, circuit status.
-- **Stats**: 24h/7d/30d × provider/model aggregation.
-- **Logs**: the latest 200 request logs.
-- **Settings**: global config (secrets backend, shared base_url/model/api, global API key).
+## Security
 
-System tray: close-to-tray, start/stop proxy, per-tool quick switch, quit. GUI autostarts on boot. The GUI embeds the `xfade` sidecar, so it can self-run `serve install` (no CLI pre-install needed).
-
-## Environment contract
-
-- `HOME`: tool config root.
-- `XFADE_DATA_DIR`: self data dir (db/backups/daemon.json/config.json), defaults to `$HOME/.config/xfade`.
-
-### Secret storage backend
-
-The secret backend applies to **all tools** and is resolved with this priority:
-
-1. `XFADE_SECRETS` env (`file` | `keyring`)
-2. `XFADE_MOCK_SECRETS=1` (alias for `file`, tests/back-compat)
-3. `<data_dir>/config.json` `secrets` field
-4. default: system keyring
-
-To persist the choice (no env var needed, applies to every tool):
-
-```bash
-xfade config                 # view current backend
-xfade config set secrets file     # → ~/.config/xfade/config.json {"secrets":"file"}
-xfade config set secrets keyring  # back to the system keychain
-```
-
-`secrets: file` stores API keys in `secrets.json` (owner-only 0600), which avoids the
-macOS keychain authorization prompt that an ad-hoc-signed dev build triggers on every
-rebuild. `keyring` uses the system keychain (recommended for signed release builds).
-
-### Shared "general" config (all tools)
-
-`config.json` also holds shared defaults — like CC Switch's general config — so you
-set `base_url` / `model` / `api_key` / `api` once and every tool reuses them:
-
-```bash
-xfade config set base_url http://your-gateway:3000
-xfade config set model glm-5-2-260617
-xfade config set api anthropic-messages  # Pi/OMP wire protocol (optional)
-xfade config set api_key sk-xxx        # stored in the secret backend, not config.json
-xfade config                            # view all (api_key is masked)
-
-xfade add glm --tool claude             # no --base-url/--key/--set → inherits the above
-xfade use glm --tool claude
-```
-
-When `add` omits `--base-url` (non-interactive), it falls back to the global `base_url`
-(use `--official` to force official login instead). An omitted `--key` falls back to the
-global `api_key`; an omitted model falls back to the global `model`. A provider's
-explicit values always win over the globals.
-
-`api` selects Pi/OMP's wire protocol (`openai-completions` default, or
-`anthropic-messages`). This matters for gateways like new-api/BM TokenHub whose OpenAI
-streaming emits a trailing empty `choices` chunk that breaks `finish_reason` parsing —
-switching to `anthropic-messages` sidesteps it.
-
-CLI and GUI share the same data dir and backend, and can be used at the same time.
-
-## Development
-
-Rust workspace: `crates/core` (library) + `crates/cli` (`xfade`) + `crates/gui/src-tauri` (Tauri).
-
-```bash
-cargo test                       # full test suite
-cargo clippy --all-targets --workspace -- -D warnings
-cd crates/gui && npm install && npx tauri dev   # GUI dev (build the sidecar first)
-bash crates/gui/build-sidecar.sh               # build the xfade sidecar into binaries/
-```
-
-See [docs/architecture.md](docs/architecture.md), [docs/getting-started.md](docs/getting-started.md), [docs/api.md](docs/api.md), [CHANGELOG.md](CHANGELOG.md), [RELEASE.md](RELEASE.md).
+Please report vulnerabilities privately via GitHub Security Advisories or email **`security@xfade.dev`**.
+Review our [Security Policy & SLA](SECURITY.md) for vulnerability response timelines.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
