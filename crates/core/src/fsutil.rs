@@ -28,9 +28,120 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    #[cfg(windows)]
+    {
+        // On Windows, set owner-only DACL before renaming over target.
+        let _ = set_private_dacl(&tmp);
+    }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Ensure `path` has private, owner-only permissions.
+/// - On Unix: sets file mode to `0o600`.
+/// - On Windows: sets DACL to Owner + SYSTEM full control, blocking inherited ACEs.
+pub fn set_private_dacl(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(windows)]
+    {
+        win_security::set_owner_only_dacl(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod win_security {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    type BOOL = i32;
+    type DWORD = u32;
+    type LPCWSTR = *const u16;
+    type HLOCAL = *mut std::ffi::c_void;
+    type PSECURITY_DESCRIPTOR = *mut std::ffi::c_void;
+
+    const SDDL_REVISION_1: DWORD = 1;
+    const DACL_SECURITY_INFORMATION: DWORD = 0x00000004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: DWORD = 0x80000000;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            StringSecurityDescriptor: LPCWSTR,
+            StringSDRevision: DWORD,
+            SecurityDescriptor: *mut PSECURITY_DESCRIPTOR,
+            SecurityDescriptorSize: *mut DWORD,
+        ) -> BOOL;
+
+        fn SetFileSecurityW(
+            lpFileName: LPCWSTR,
+            SecurityInformation: DWORD,
+            pSecurityDescriptor: PSECURITY_DESCRIPTOR,
+        ) -> BOOL;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(hMem: HLOCAL) -> HLOCAL;
+    }
+
+    pub fn set_owner_only_dacl(path: &Path) -> std::io::Result<()> {
+        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide_path.push(0);
+
+        // SDDL:
+        // D:P(A;;GA;;;OW)(A;;GA;;;SY)
+        // D: DACL
+        // P: SE_DACL_PROTECTED (disables inheritance)
+        // (A;;GA;;;OW): Allow Generic All to Owner
+        // (A;;GA;;;SY): Allow Generic All to Local System
+        let sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut p_sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut p_sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let ret = SetFileSecurityW(
+                wide_path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                p_sd,
+            );
+            LocalFree(p_sd);
+
+            if ret == 0 {
+                let err = std::io::Error::last_os_error();
+                // If running on a filesystem without ACL support (e.g., FAT32/exFAT),
+                // Windows returns ERROR_NOT_SUPPORTED (50) or ERROR_INVALID_FUNCTION (1).
+                if let Some(code) = err.raw_os_error() {
+                    if code == 1 || code == 50 {
+                        return Ok(());
+                    }
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Copy `src` to `dest` with owner-only permissions (0600 on Unix).

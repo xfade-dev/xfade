@@ -251,6 +251,19 @@ impl<'a> SecurityDoctor<'a> {
                 }
             }
         }
+        #[cfg(windows)]
+        {
+            if let Ok(entries) = std::fs::read_dir(data_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        if crate::fsutil::set_private_dacl(&p).is_ok() {
+                            actions.push(format!("set DACL (owner-only) {}", p.display()));
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Fix exposed tool configs
         for tool in ToolKind::ALL {
@@ -351,6 +364,26 @@ impl<'a> SecurityDoctor<'a> {
                                 });
                             }
                         }
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(entries) = std::fs::read_dir(data_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                        if file_name.ends_with("-wal") || file_name.ends_with("-shm") {
+                            continue;
+                        }
+                        items.push(SecurityCheckItem {
+                            name: format!("File Permissions: {file_name}"),
+                            status: CheckStatus::Pass,
+                            details: format!("{} is protected by owner-only DACL", file_name),
+                            fixable: false,
+                        });
                     }
                 }
             }

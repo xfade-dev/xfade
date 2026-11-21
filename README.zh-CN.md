@@ -2,240 +2,190 @@
 
 [English](README.md) | 简体中文
 
-在 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw 等 AI 编码工具之间切换 API provider，并提供本地代理（OpenAI/Anthropic 兼容端点、failover、协议互转）与 macOS/Linux 常驻 daemon。
+**xfade** —— 面向 AI 编码工具（Claude Code、Codex、OpenCode、Aider、Cline、Hermes、OpenClaw 等）的中立、零裸 Key 本地可信网关。
 
-CLI（`xfade`）+ Tauri GUI 双形态，Rust 实现。
+> **Switch models without dropping the beat** —— 换模型，不掉拍，上游真实 Key 永不落入客户端配置。一流的协议转译、精细 Failover、动态成本核算；零遥测、零返佣中转商、零归因头。
 
-![xfade TUI —— crossfader 演示](docs/demo.gif)
+[![CI](https://github.com/xfade-dev/xfade/actions/workflows/ci.yml/badge.svg)](https://github.com/xfade-dev/xfade/actions)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![Security Policy](https://img.shields.io/badge/security-SLA%2048h%2F7d-green.svg)](SECURITY.md)
 
-## 功能
+---
 
-- **TUI**：裸 `xfade` 直接打开 crossfader 风格 TUI——按工具分页签、provider 健康徽章、并行探测全部 provider、行内编辑；非终端环境自动退化为普通列表。
-- **Provider 切换**：为 Claude Code / Codex / OpenCode / Pi / Oh My Pi / Aider / Cline / Hermes Agent / OpenClaw 增删改查 provider，一键切换写各自配置（settings.json / config.toml+auth.json / opencode.json / .aider.conf.yml / .cline/data/settings/ / .hermes/config.yaml / .openclaw/openclaw.json），系统钥匙串存 key，切换前自动备份。
-- **本地代理**：`xfade serve` 起 OpenAI/Anthropic 兼容端点（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`、`/v1/models`），支持路由 failover、熔断、token 统计、请求日志。
-- **协议互转**：Anthropic↔OpenAI 双向转换（`target_protocol`），让客户端与上游协议解耦。
-- **daemon（macOS + Linux）**：launchd/systemd 常驻 + 开机自启 + 崩溃重启；`/__xfade/status` 管理端点。
-- **GUI**：Tauri 桌面 app，五页（Providers / Proxy / Stats / Logs / Settings）+ 系统托盘（关窗到托盘、快速切换、启停代理），`xfade` 作为 sidecar 自装 daemon。
+## 为什么选择 xfade？
 
-## 安装
+| 核心维度 | 传统 CLI 配置方式 | 常见桌面切换器 / 中转代理 | xfade 本地可信网关 |
+| :--- | :--- | :--- | :--- |
+| **磁盘密钥安全** | 明文落盘在 `settings.json` / `config.toml` | 明文落盘或未加密 SQLite | **零裸 Key 落盘**（客户端仅持虚拟凭证 `xf-tok-*`，真实密钥安全锁定在系统钥匙串） |
+| **Failover 粒度** | 报错中断退出会话 | 任意 4xx 盲目重试打遍所有上游 | **首字节前精细换路**（TTFT 超时、200 假成功错误体兜底、429 退避，首字节后绝不重放） |
+| **上游协议** | 强绑定客户端自身协议 | 全局单一转译规则 | **每个上游独立协议**（Chat、Messages、Responses 独立配置与双向流式转译） |
+| **额外转发延迟 (F10)**| 0 ms | 5 ms – 50 ms（Node/Python 运行时） | **~0.32 ms**（Rust Axum 极速内核，实测往返仅 0.35 ms） |
+| **模型成本核算** | 无 / 静态估算 | 过时或不可控硬编码 | **三层动态定价**（用户自定义 > OpenRouter 实时同步 > 2026 最新离线底册，微美元精度） |
+| **中立与可验证性** | 无 | 内置中转商推广、遥测、返佣 | **100% 中立可信**：零遥测、零返佣、Sigstore keyless 签名发布、CycloneDX SBOM |
+
+---
+
+## 安装与验签
 
 ### CLI
 
 ```bash
-# Homebrew（推荐，macOS）
+# Homebrew（macOS / Linux）
 brew install xfade-dev/xfade/xfade
 
-# 或一行安装（macOS / Linux）
+# 一键安装脚本（macOS / Linux）
 curl -fsSL https://xfade.sh | sh
 
-# 或从 GitHub Release 下载二进制
-# 或源码构建
+# 源码编译
 cargo build --release -p xfade   # 产物 target/release/xfade
 ```
 
-Release 产物包含 Sigstore 无长期私钥签名和 GitHub 构建来源证明。运行下载文件前，
-可同时验证签发者身份与 SHA-256（需要安装 `cosign`）：
+### 发布产物验签
+
+每个 Release 均包含 Sigstore 无长期私钥签名与 GitHub 构建来源证明（Build Provenance）。可在运行前独立校验：
 
 ```bash
-scripts/verify-release.sh vX.Y.Z
+scripts/verify-release.sh v0.11.1
 ```
 
-手动 Cosign 验签及 GitHub attestation 验证命令见
-[RELEASE.md](RELEASE.md#signing)。一行安装脚本会自动校验 SHA-256。
+---
 
-### GUI
+## 快速上手：零裸 Key 凭据隔离
 
-从 GitHub Release 下载 `xfade-gui_<version>_aarch64.dmg`（macOS Apple Silicon）拖入 Applications。或源码构建见下方「开发」。
+### 1. 添加 Provider 并安全存储密钥
 
-## 快速开始
+真实 API 密钥安全存储在 OS 系统钥匙串（或加密存储）中：
 
 ```bash
-# 1. 添加一个第三方 provider（以 Codex 为例）
-xfade add kimi --tool codex --base-url https://api.moonshot.cn/v1 --key sk-xxx
+# 添加 Anthropic 官方 Messages 协议节点
+xfade add anthropic --tool claude --protocol messages \
+  --base-url https://api.anthropic.com --key sk-ant-api03-...
 
-# 2. 切换到它（写入 ~/.codex/config.toml + auth.json，自动备份原配置）
-xfade use kimi --tool codex
-
-# 3. 查看各工具的当前 provider
-xfade current
+# 添加 DeepSeek 或 Kimi 等 OpenAI Chat 兼容节点
+xfade add kimi --tool claude --protocol chat \
+  --base-url https://api.moonshot.cn/v1 --key sk-xxx
 ```
 
-提示：直接运行 `xfade` 打开交互式 TUI，用方向键 / 推子切换 provider。
+### 2. 默认网关切换（凭据隔离）
 
-Claude Code 支持按 slot 分别指定模型——为 `opus` / `sonnet` / `haiku` 每个 slot
-绑定不同模型（写入 `ANTHROPIC_DEFAULT_*_MODEL`）：
+执行 `xfade use` 会自动签发本地虚拟 Token（`xf-tok-*`），并将目标客户端配置指向本地网关：
 
 ```bash
-xfade add work --tool claude --base-url https://... --key sk-xxx \
-  --opus-model deepseek/deepseek-v4-pro \
-  --sonnet-model deepseek/deepseek-v4-flash \
-  --haiku-model deepseek/deepseek-v4-flash
+xfade use kimi --tool claude
 ```
 
-其余工具同理：`--tool claude-code|codex|open-code|pi|oh-my-pi|aider|cline|hermes|openclaw`。
+此时 Claude Code 的配置文件（`~/.claude/settings.json`）仅包含本地回环地址与虚拟 Token，**任何真实的外部 API Key 都不会写入磁盘**。
 
-### 不切配置的一次性运行
+*(如遇特殊网络或需客户端直连上游，可显式启用逃生舱：`xfade use kimi --tool claude --direct`，直连状态将被安全审计与体检标记)*。
 
-`xfade run` 只通过环境变量注入 provider 来启动工具——不写任何配置文件，
-现有激活状态保持原样：
+### 3. 可信体检与一键修复
+
+随时运行安全诊断命令检查虚拟凭据、文件权限及配置泄露：
 
 ```bash
-xfade run kimi            # 本次会话用 kimi 启动 claude
-xfade run kimi -- --print # `--` 之后的所有参数原样传给工具
+xfade doctor --security
 ```
 
-仅支持 env 驱动的工具（claude、aider）；配置文件型工具会提示改用
-`xfade use`。官方 provider 则原样启动工具。
-
-### 即时启动：`xfade <工具名>`
-
-工具名本身就是子命令——`xfade run` 的语法糖，provider/model/端点/密钥
-现场解析（未注册的 preset 自动创建；绝不写工具自身配置）：
+若发现配置被外部软件改动或权限过宽，一键自动修复：
 
 ```bash
-xfade claude kimi                          # 用 kimi preset 启动 Claude Code（自动落库）
-xfade claude --model kimi-k2.5             # 省略 name：按模型名反查匹配的 preset/provider
-xfade claude my-gw --base-url https://gw --key sk-xxx   # 临时端点，自动注册
-xfade claude -- --print                    # `--` 之后原样传给工具
-xfade aider deepseek --model deepseek-chat
-xfade codex glm --model glm-5-2-260617     # -c 配置覆盖 + 密钥走 env（零文件写入）
-xfade opencode glm -- run "fix the bug"    # 内联 OPENCODE_CONFIG_CONTENT（零文件写入）
+xfade doctor --security --fix
 ```
 
-说明：
+---
 
-- 密钥优先级：`--key` → provider 已存密钥 → 全局 `api_key`。
-- `--model` / `--base-url` 是一次性覆盖，绝不落库。
-- 注入覆盖 **claude** 和 **aider**（env）、**codex**（`-c` 覆盖 +
-  `env_key` 引用 `XFADE_CODEX_KEY`）和 **opencode**（内联
-  `OPENCODE_CONFIG_CONTENT`）——codex/opencode 已于 2026-10-22 对
-  codex-cli 0.155.0 / opencode 1.18.31 真机验证（真实配置目录零触碰）。
-  pi 对自定义 provider 忽略 env 覆盖，因此 pi（含
-  omp/cline/hermes/openclaw）会指引 `xfade use`。
+## 核心特性
 
-## 会话视图
+### 1. 首字节前 Failover 稳健性 (F6)
+- **语义提交前安全换路**：当上游返回 HTTP 200 但内容为错误 JSON 体，或首字节响应（TTFT）超时时，网关透明切换至备用上游。
+- **429 智能退避**：自动解析上游返回的 `Retry-After` 头（≤2s 时原地单次重试），避免盲目换路打垮备用节点。
+- **首字节后坚决不重放**：一旦向客户端发出首个有效语义事件，**绝不重放请求**（防止重复扣费与重复执行工具），流中断直接合成标准 `xfade_stream_interrupted` 事件并优雅关闭流。
 
-流经 `xfade serve` 的请求会获得会话身份：开场白（system + 第一轮 user）
-哈希成指纹，30 分钟内的连续请求复用同一会话——不存任何 prompt 原文
-（只有截断的开场白预览）。`xfade use` 或 `xfade proxy use --model` 造成的
-模型切换会落到会话时间线，由下一个匹配请求回填：
+### 2. 显式模型映射 (F5)
+支持客户端逻辑模型名到各上游真实模型 ID 的精准改写：
 
 ```bash
-xfade sessions                 # 最近会话列表（工具/provider/token/状态）
-xfade sessions show <id>       # 单个会话详情 + 模型切换时间线
-xfade stats --by session       # 按会话聚合请求/token
+# 将客户端别名 sonnet 映射为 openrouter 节点的真实全称
+xfade model-map set openrouter sonnet anthropic/claude-3.7-sonnet
+
+# 查看生效的模型映射表
+xfade model-map ls
 ```
 
-所有被代理的响应都带 `X-Xfade-Session-Id` 响应头。
-
-## CLI 命令速查
-
-```
-xfade add <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
-xfade ls [--tool <t>]
-xfade use <id> --tool <t>
-xfade run <id> [--tool <t>] [-- <args>]  # 注入一次性启动工具（claude / aider / codex / opencode）
-xfade <tool> [name] [--model M] [--base-url U] [--key K] [-- <args>]
-                                        # 即时启动：claude/aider/codex/opencode 可用；其余工具指引 `use`
-xfade current
-xfade edit <id> --tool <t> [--base-url URL] [--key KEY] [--set 'json']
-xfade rm <id> --tool <t>
-xfade presets                     # 列出所有工具的内置预设
-xfade import --tool <t>            # 从工具现有配置导入
-xfade backup ls|restore --tool <t>
-xfade completion <shell>
-xfade tui [--tool <t>]             # 交互式 crossfader TUI（默认：裸 `xfade`）
-xfade sessions [show <id>]         # 统一会话视图（代理看到的会话）
-xfade config [set <k> <v>]         # 查看/设置全局配置（secrets 后端、共享 base_url/model/api）
-xfade self-update                  # 自更新到最新 GitHub Release
-```
-
-### 本地代理
+### 3. 三层动态模型定价与成本核算 (F8 & F8-Ext)
+支持 micro-dollar（1 美元 = 1,000,000 微美元）整数精度的费用核算，原生支持缓存命中与写入折扣：
+- **第一层（Custom 自定义）**：用户手动设定的优先级最高覆盖；
+- **第二层（Synced 实时同步）**：从 OpenRouter API 实时同步的全量主流模型价格库；
+- **第三层（Built-in 2026 底册）**：内置 2026 年最新旗舰模型离线定价兜底。
 
 ```bash
-xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T | --auth-token-file F]   # 前台运行
-xfade proxy use yy bak [--model M] [--route-model <id>=<model>] [--target chat|messages]
-xfade proxy status
-xfade proxy clear
-xfade proxy smart on|off              # Smart Fader 开关（默认关闭）
-xfade proxy failover-4xx on|off       # 4xx failover 开关（默认关闭）
-xfade proxy models-merge on|off       # 聚合所有路由的 /v1/models（默认关闭）
-xfade stats [--by provider|model|session]   # 请求统计聚合
+xfade pricing list            # 查看各模型价格及来源（custom/synced/builtin）
+xfade pricing sync            # 联网拉取最新模型价目表
+xfade stats --by model        # 按模型查看 Token 吞吐与估算费用
 ```
 
-### Smart Fader（意图路由）
+### 4. 出站审计轨迹与白名单防护 (F7)
+- **SSRF 与数据外发防护**：出站请求严格校验域名白名单，仅放行已登记 Provider 的合法域名。
+- **结构化审计导出**：记录每次请求的客户端来源、路由路径、Failover 轨迹与 Token 消耗（绝不记录敏感密钥与提示词正文）：
+```bash
+xfade audit export --format json
+```
+- **三态信任灯**：TUI、CLI 与桌面托盘实时显示信任状态：
+  - `GUARDED`：处于受保护的零裸 Key 本地网关接管状态；
+  - `DIRECT`：处于直连逃生舱模式（磁盘存在明文 Key）；
+  - `EXPOSED`：检测到 Key 泄漏或文件权限异常。
 
-默认关闭——`xfade proxy smart on` 显式开启；关闭时所有请求零额外开销。
+### 5. 可复现的高性能基准实测 (F10)
+Criterion 自动化微基准实测数据（本地回环环境）：
+- **网关代理转发额外延迟**：**~0.32 ms**（直接上游 0.032 ms vs 网关全链路 0.353 ms）
+- **模型路由映射匹配延迟**：**~26 ns**
+- **微美元价格检索计算耗时**：**~30 ns – 88 ns**
+- **SSE 流式数据块语义解析**：**< 1 µs**
 
-开启后，代理对每个请求的最后一条 user 消息做意图分类（纯关键词规则，零模型调用），并按层（tier）重排已配置的路由：
+---
 
-| 意图 | 示例 | 顺序 |
-|---|---|---|
-| 轻量——报错分诊、写测试、lint/format、小重构 | "为什么编译失败"、"写个测试"、"跑下 clippy" | 本地优先，云端回退 |
-| 重量——大重构、架构设计 | "重构整个模块"、"设计这个 API" | 云端优先，本地回退 |
-| 未匹配 | 其他 | 配置顺序（不变） |
-
-要点：
-
-- **层判定**：provider 显式 `extra.tier = "local" | "cloud"` 优先；否则按 base_url 启发式——回环地址（`127.0.0.1`/`localhost`/`[::1]`，即 Ollama、LM Studio、MLX 服务）算本地，其余算云端。
-- **层内排序**：按近期健康度（错误率、再延迟）排序，数据来自 30s TTL 的统计快照——不会每请求跑 GROUP BY。无统计的 provider 彼此保持配置顺序。
-- **熔断与 failover 行为与关闭时完全一致**：熔断项分桶前剔除，主路由失败依旧沿列表回退。
-- model override 现在同样作用于 chat→chat passthrough 路径（本地运行时）：按路由改写 `model` 字段。
-- 项目分析（语言指纹 + git pulse，缓存在 `repo_maps` 表）的消费方：`xfade project` 打印、serve 启动预热 cwd、`xfade proxy status` 展示最新 repo map。阶段2 的分类本身只读 prompt 文本。
-
-### 聚合模型列表（`models-merge`）
-
-默认关闭——`xfade proxy models-merge on` 显式开启。默认 `/v1/models` 只返回第一个成功上游的模型列表，多个路由时 AI coding tools 看不到其它 provider 的模型。
-
-开启后，daemon 并发探测每个已配置路由的 `/v1/models` 并合并成一个列表，工具即可看到并选用**所有** provider 的模型。id 无冲突时保留原始 id；被两个及以上路由同时暴露的 id 会加上 `<route_id>/` 命名空间前缀（如 `omni/gpt-x`）。同时持久化一份 `model → 所属路由` 映射：后续请求带上这些 id 时，会**优先钉到所属 provider** 并转发真实上游模型 id（命名空间前缀会被剥离）；未识别/旧模型 id 仍保持原有 `--route-model` / `--model` / Smart Fader 行为。关闭后完全恢复原来的「第一个成功上游」语义。详见 [docs/api.md](docs/api.md#aggregated-model-catalog-models-merge)。
-
-### daemon（macOS + Linux）
+## 常用命令一览
 
 ```bash
-xfade serve install [--port --host --auth-token]   # 安装 launchd 常驻 + 开机自启
-xfade serve status                                 # 查询运行/路由/熔断
-xfade serve uninstall                              # 卸载
+# Provider 管理
+xfade add <id> --tool <t> [--protocol chat|messages|responses] [--base-url URL] [--key KEY]
+xfade use <id> --tool <t> [--direct]      # 切换 provider（默认启用零裸 Key 网关模式）
+xfade ls [--tool <t>]                     # 查看已配置列表及当前激活状态
+xfade current                             # 显示各工具当前激活的 Provider
+
+# 安全诊断、审计与状态
+xfade doctor --security [--fix]           # 检查 Token 隔离与文件权限，支持自动加固
+xfade audit [export]                      # 查看与导出结构化请求审计轨迹
+xfade status                              # 查看网关常驻状态、当前路由、熔断器与信任灯
+
+# 模型映射与动态定价
+xfade model-map [set|ls|rm|clear]         # 配置客户端模型到上游真实模型的映射关系
+xfade pricing [list|sync|set|rm|reset]    # 查询与管理三层动态定价库
+
+# 代理与系统服务
+xfade serve [--port 24860] [--host 127.0.0.1]
+xfade proxy use <p1> <p2> [--model M]     # 设置多上游故障转移级联链
+xfade proxy smart on|off                  # Smart Fader 任务意图自适应路由
+xfade stats [--by provider|model|session] # 查看 Token 统计与美元支出
+xfade serve install|uninstall             # 安装/卸载 launchd 或 systemd 开机守护进程
 ```
 
-日志：`~/.config/xfade/serve.log`。
+---
 
-## GUI
+## 中立与隐私承诺
 
-```bash
-cd crates/gui && npx tauri dev    # 开发
-```
+1. **零裸 Key 落盘**：客户端配置文件与运行时日志中绝不出现未经加密的外部真实 API Key。
+2. **零遥测外发**：除用户明确配置的上游 API 及显式执行的更新/同步命令外，网关没有任何未经许可的外部通信。
+3. **零中转赞助与零返佣**：不设中转商推广位，不加归因头，不参与任何模型调用分成。
+4. **全链路可独立核验**：所有发布二进制均经过 Sigstore 签名，并提供 CycloneDX 软件物料清单（SBOM）。
 
-左侧栏五页：
+---
 
-- **Providers**：增删改查/切换/import/备份。
-- **Proxy**：控制 daemon（启停）、路由 failover 编辑、熔断状态。
-- **Stats**：24h/7d/30d × provider/model 聚合。
-- **Logs**：最近 200 条请求日志。
-- **Settings**：全局配置（secrets 后端、共享 base_url/model/api、全局 API key）。
+## 安全披露
 
-系统托盘：关窗到托盘、启动/停止代理、每工具快速切换 provider、退出。GUI 开机自启。GUI 内置 `xfade` sidecar，可自行 `serve install`（无需 CLI 前置安装）。
+如发现安全漏洞，请通过 GitHub Security Advisories 提交私密报告，或直接发送邮件至 **`security@xfade.dev`**。
+详细响应时间请参阅我们的 [安全策略与 SLA](SECURITY.md)。
 
-## 环境契约
+## 开源协议
 
-- `HOME`：工具配置根。
-- `XFADE_DATA_DIR`：自身数据目录（db/backups/daemon.json），缺省 `$HOME/.config/xfade`。
-- `XFADE_MOCK_SECRETS=1`：用文件 MockStore 替代系统钥匙串（测试/冒烟）。
-
-CLI 与 GUI 共享同一数据目录与钥匙串，可同时使用。
-
-## 开发
-
-Rust workspace：`crates/core`（库）+ `crates/cli`（`xfade`）+ `crates/gui/src-tauri`（Tauri）。
-
-```bash
-cargo test                       # 全量测试
-cargo clippy --all-targets --workspace -- -D warnings
-cd crates/gui && npm install && npx tauri dev   # GUI 开发（需先构建 sidecar）
-bash crates/gui/build-sidecar.sh               # 构建 xfade sidecar 到 binaries/
-```
-
-详见 [docs/architecture.md](docs/architecture.md)、[docs/getting-started.md](docs/getting-started.md)、[docs/api.md](docs/api.md)、[CHANGELOG.md](CHANGELOG.md)、[RELEASE.md](RELEASE.md)。
-
-## License
-
-MIT OR Apache-2.0
+本项目采用 [Apache License, Version 2.0](LICENSE-APACHE) 或 [MIT License](LICENSE-MIT) 双重授权。
