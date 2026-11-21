@@ -1,5 +1,5 @@
 class Xfade < Formula
-  desc "Route AI providers for AI coding tools, with local proxy"
+  desc "Vendor-neutral, zero-raw-key gateway for AI coding CLIs"
   homepage "https://xfade.dev"
   license any_of: ["MIT", "Apache-2.0"]
 
