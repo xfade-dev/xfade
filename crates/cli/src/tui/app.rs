@@ -150,6 +150,19 @@ impl App {
         self.reload(core);
     }
 
+    pub fn prev_tool(&mut self, core: &Core) {
+        let idx = ToolKind::ALL
+            .iter()
+            .position(|t| *t == self.tool)
+            .unwrap_or(0);
+        let n = ToolKind::ALL.len();
+        self.tool = ToolKind::ALL[(idx + n - 1) % n];
+        self.providers.clear();
+        self.probes.clear();
+        self.selected = 0;
+        self.reload(core);
+    }
+
     pub fn selected_provider(&self) -> Option<&Provider> {
         self.providers.get(self.selected)
     }
@@ -498,6 +511,18 @@ mod tests {
         assert_eq!(middle.len(), ToolKind::ALL.len());
         // Providers were reloaded for the final tool.
         assert!(app.providers.iter().all(|p| p.tool == app.tool));
+    }
+
+    #[test]
+    fn prev_tool_cycles_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        let start = app.tool;
+        app.next_tool(&core);
+        assert_ne!(app.tool, start);
+        app.prev_tool(&core);
+        assert_eq!(app.tool, start);
     }
 
     #[test]

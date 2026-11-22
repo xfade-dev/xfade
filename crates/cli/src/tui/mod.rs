@@ -207,7 +207,11 @@ fn event_loop(
                 app.next_tool(core);
                 stats = load_stats(core, &app.tool);
             }
-            KeyCode::Enter => {
+            KeyCode::BackTab => {
+                app.prev_tool(core);
+                stats = load_stats(core, &app.tool);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 app.switch_selected(core);
                 stats = load_stats(core, &app.tool);
             }

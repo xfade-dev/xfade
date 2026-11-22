@@ -704,16 +704,21 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.is_editing() {
-        "editing…"
+        "editing: [Tab] next field   [Enter] save   [Esc] cancel"
     } else {
-        "[↑/↓ j/k] move   [Enter] switch   [t] test   [e] edit   [Tab] tool   [q] quit"
+        "[↑/↓ j/k] move   [Enter/Space] switch   [t] test   [e] edit   [Tab] tool   [q] quit"
     };
     let mut lines = vec![Line::from(Span::styled(
         hints,
         Style::default().fg(Color::DarkGray),
     ))];
     if let Some(m) = &app.message {
-        lines.push(Line::from(m.clone()));
+        lines.push(Line::from(Span::styled(
+            m.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -756,6 +761,25 @@ mod tests {
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer().clone();
         b.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn test_compact_terminal_degrades_to_single_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(60, 20); // Width 60 < 70
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("Provider Details:"), "should not render right pane in narrow mode:\n{text}");
+        assert!(text.contains("Providers (claude)"), "should render list:\n{text}");
     }
 
     #[test]
