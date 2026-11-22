@@ -146,6 +146,8 @@ impl App {
         // don't bleed into the new tool's providers.
         self.providers.clear();
         self.probes.clear();
+        self.probing.clear();
+        self.message = None;
         self.selected = 0;
         self.reload(core);
     }
@@ -159,6 +161,8 @@ impl App {
         self.tool = ToolKind::ALL[(idx + n - 1) % n];
         self.providers.clear();
         self.probes.clear();
+        self.probing.clear();
+        self.message = None;
         self.selected = 0;
         self.reload(core);
     }

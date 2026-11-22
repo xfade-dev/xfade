@@ -26,6 +26,9 @@ const MIN_HEIGHT: u16 = 13;
 /// Minimum terminal width for the dual-pane layout. Below this the layout
 /// degrades gracefully to a single list pane.
 pub const DUAL_PANE_MIN_WIDTH: u16 = 70;
+/// Minimum terminal height for the dual-pane layout. Below this the layout
+/// avoids vertical sub-box collapse and renders as a single list pane.
+pub const DUAL_PANE_MIN_HEIGHT: u16 = 18;
 
 pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
     let area = f.area();
@@ -46,7 +49,7 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
 
     draw_fader(f, app, stats, chunks[0]);
 
-    if area.width >= DUAL_PANE_MIN_WIDTH {
+    if area.width >= DUAL_PANE_MIN_WIDTH && area.height >= DUAL_PANE_MIN_HEIGHT {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -293,7 +296,7 @@ fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
             let tokens = stats
                 .iter()
                 .find(|r| r.group == p.id)
-                .map(|r| format_tokens((r.prompt_tokens + r.completion_tokens).max(0) as u64))
+                .map(|r| format_tokens(r.prompt_tokens.saturating_add(r.completion_tokens).max(0) as u64))
                 .unwrap_or_else(|| "-".into());
             spans.push(Span::raw(format!("   Tokens({STATS_DAYS}): ")));
             spans.push(Span::raw(tokens));
@@ -394,7 +397,7 @@ fn latency_badge(result: &ProbeResult) -> (String, Color) {
 fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     if app.providers.is_empty() {
         let msg = format!(
-            "No providers configured for {}.\n\nPress 'e' to add one, or run `xfade add`.",
+            "No providers configured for {}.\n\nRun `xfade add` in terminal to configure a provider.",
             app.tool.as_str()
         );
         let block = Block::default()
@@ -613,7 +616,7 @@ fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect
             Span::styled(
                 format!(
                     " · {} tokens",
-                    format_tokens((row.prompt_tokens + row.completion_tokens).max(0) as u64)
+                    format_tokens(row.prompt_tokens.saturating_add(row.completion_tokens).max(0) as u64)
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
@@ -659,7 +662,7 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
             if value.is_empty() {
                 "(blank = keep current key)".to_string()
             } else {
-                "*".repeat(value.len())
+                "*".repeat(value.chars().count())
             }
         } else {
             value.to_string()
@@ -704,9 +707,9 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.is_editing() {
-        "editing: [Tab] next field   [Enter] save   [Esc] cancel"
+        "editing: [Tab/BackTab] field   [Enter] save   [Esc] cancel"
     } else {
-        "[↑/↓ j/k] move   [Enter/Space] switch   [t] test   [e] edit   [Tab] tool   [q] quit"
+        "[↑/↓ j/k] move   [Enter/Space] switch   [t] test   [e] edit   [Tab/Shift+Tab] tool   [q] quit"
     };
     let mut lines = vec![Line::from(Span::styled(
         hints,
@@ -780,6 +783,65 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(!text.contains("Provider Details:"), "should not render right pane in narrow mode:\n{text}");
         assert!(text.contains("Providers (claude)"), "should render list:\n{text}");
+    }
+
+    #[test]
+    fn test_dual_pane_degrades_when_short_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let backend = TestBackend::new(80, 15); // Width 80 >= 70, but Height 15 < 18
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("Provider Details:"), "should degrade vertically to single pane:\n{text}");
+        assert!(text.contains("Providers (claude)"), "should render list:\n{text}");
+    }
+
+    #[test]
+    fn test_empty_provider_list_renders_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let app = App::new(ToolKind::ClaudeCode, &core); // No providers added
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No providers configured for"), "empty msg:\n{text}");
+        assert!(text.contains("Run `xfade add` in terminal"), "actionable instructions:\n{text}");
+    }
+
+    #[test]
+    fn test_token_saturation_large_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let p = Provider::new("sat", ToolKind::ClaudeCode, Some("http://sat:3000".into()));
+        core.add_provider(p, Some("sk-sat")).unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "sat", true).unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+
+        let stats = vec![StatsRow {
+            group: "sat".into(),
+            requests: 1,
+            prompt_tokens: i64::MAX - 10,
+            completion_tokens: 100, // Would overflow i64 without saturating_add
+            cost_usd_micros: 1000,
+            errors: 0,
+            avg_duration_ms: 10,
+        }];
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &stats)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Tokens(7d):"), "header tokens present:\n{text}");
     }
 
     #[test]

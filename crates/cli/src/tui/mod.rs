@@ -42,25 +42,28 @@ pub fn run_tui(core: &Core, tool: ToolKind) -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
         original_hook(info);
     }));
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal =
-        Terminal::new(backend).map_err(|e| CoreError::Proxy(format!("init terminal: {e}")))?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+            let _ = std::panic::take_hook();
+            return Err(CoreError::Proxy(format!("init terminal: {e}")));
+        }
+    };
 
     let result = event_loop(core, tool, &mut terminal);
 
     // ── Terminal cleanup ──────────────────────────────────────────────
-    disable_raw_mode().map_err(|e| CoreError::Proxy(format!("disable raw mode: {e}")))?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|e| CoreError::Proxy(format!("leave alternate screen: {e}")))?;
-    terminal
-        .show_cursor()
-        .map_err(|e| CoreError::Proxy(format!("show cursor: {e}")))?;
-
-    // Drop the TUI panic hook so later panics don't write terminal escapes.
+    // Ensure all restoration steps execute unconditionally even if one fails.
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = terminal.show_cursor();
     let _ = std::panic::take_hook();
 
     result
@@ -90,7 +93,7 @@ fn event_loop(
     let mut stats = load_stats(core, &app.tool);
 
     // Latency probes run in worker threads; results arrive over this channel.
-    let (probe_tx, probe_rx) = mpsc::channel::<(String, Option<u128>)>();
+    let (probe_tx, probe_rx) = mpsc::channel::<(ToolKind, String, Option<u128>)>();
     // Accumulators for the end-of-round summary message.
     let (mut probe_ok, mut probe_fail, mut probe_worst) = (0u32, 0u32, 0u128);
 
@@ -99,7 +102,10 @@ fn event_loop(
     let mut dirty = true;
     loop {
         let mut drained = false;
-        while let Ok((id, ms)) = probe_rx.try_recv() {
+        while let Ok((t, id, ms)) = probe_rx.try_recv() {
+            if t != app.tool {
+                continue;
+            }
             app.probing.remove(&id);
             match ms {
                 Some(ms) => {
@@ -191,7 +197,7 @@ fn event_loop(
                     stats = load_stats(core, &app.tool);
                 }
                 KeyCode::Tab | KeyCode::Down => app.edit_next_field(),
-                KeyCode::Up => app.edit_prev_field(),
+                KeyCode::BackTab | KeyCode::Up => app.edit_prev_field(),
                 KeyCode::Backspace => app.edit_backspace(),
                 KeyCode::Char(c) => app.edit_char(c),
                 _ => {}
@@ -240,12 +246,13 @@ fn event_loop(
                         });
                     } else {
                         let n = targets.len();
+                        let current_tool = app.tool;
                         for (id, host, port) in targets {
                             let tx = probe_tx.clone();
                             app.probing.insert(id.clone());
                             std::thread::spawn(move || {
                                 let ms = probe_latency(&host, port, Duration::from_secs(3));
-                                let _ = tx.send((id, ms));
+                                let _ = tx.send((current_tool, id, ms));
                             });
                         }
                         app.message = Some(format!("probing {n} providers…"));
