@@ -11,11 +11,68 @@ use xfade_core::{
 mod daemon;
 mod tui;
 
+const ROOT_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+Usage:
+  xfade <COMMAND> [OPTIONS]
+  xfade <TOOL> [PROVIDER] [-- <ARGS>...]
+
+CORE ROUTING & SWITCHING:
+  use          Switch provider (default: local gateway; --direct: write to disk)
+  run          Run a tool CLI with a provider injected via env vars (zero disk mutation)
+  ls           List providers
+  status       View current status (daemon, routes, circuit breaker, and trust status)
+  current      Show the currently-active provider per tool
+  tui          Interactive TUI for switching providers
+
+GATEWAY & TRAFFIC GOVERNANCE:
+  serve        Start the local proxy service / manage the daemon
+  proxy        Proxy route management (primary/fallback provider order)
+  model-map    Explicit model mappings across upstreams (alias: mm)
+  pricing      Manage model pricing catalogs, custom overrides, and live sync
+  stats        Request stats aggregation and cost estimation
+  sessions     Unified session view: conversations seen by the local gateway
+
+SECURITY & TRUST:
+  doctor       Run security health check and credential hygiene audit (--fix)
+  audit        View and export structured security audit logs
+  egress       Manage outbound egress whitelist and SSRF guard policy
+  handover     Generate seamless handover brief from recent session and git state
+
+CONFIGURATION & ASSETS:
+  add          Add a provider (omit NAME to enter interactive mode)
+  edit         Edit a provider
+  rm           Remove a provider (the active one cannot be removed)
+  import       Manually import the tool's current config as the imported snapshot
+  presets      List built-in presets
+  config       View or set global config (e.g. secrets backend)
+  backup       Backup management
+
+TOOL LAUNCHERS (Zero-config instant run):
+  claude       Launch Claude Code with a provider injected via env
+  codex        Launch Codex — config overrides via `-c` + key via env
+  opencode     Launch OpenCode — inline OPENCODE_CONFIG_CONTENT
+  aider        Launch Aider with a provider injected via env
+  pi, omp      Launch Pi / Oh My Pi
+  cline        Launch Cline
+  hermes       Launch Hermes Agent
+  openclaw     Launch OpenClaw
+
+GENERAL:
+  self-update  Update xfade to the latest GitHub release
+  completion   Generate shell completions
+  project      Show the analyzer's fingerprint of the current project
+
+{options}
+Use 'xfade <command> --help' for more information about a specific command.
+";
+
 #[derive(Parser)]
 #[command(
     name = "xfade",
     version,
-    about = "Route AI providers for AI coding tools"
+    about = "Vendor-neutral, zero-raw-key gateway for AI coding CLIs",
+    help_template = ROOT_HELP_TEMPLATE
 )]
 struct Cli {
     #[command(subcommand)]

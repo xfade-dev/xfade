@@ -375,6 +375,23 @@ fn serve_help_lists_options() {
 }
 
 #[test]
+fn root_help_displays_command_categories() {
+    let home = tempfile::tempdir().unwrap();
+    xfade(home.path())
+        .args(["--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("CORE ROUTING & SWITCHING:")
+                .and(predicate::str::contains("GATEWAY & TRAFFIC GOVERNANCE:"))
+                .and(predicate::str::contains("SECURITY & TRUST:"))
+                .and(predicate::str::contains("CONFIGURATION & ASSETS:"))
+                .and(predicate::str::contains("TOOL LAUNCHERS"))
+                .and(predicate::str::contains("GENERAL:")),
+        );
+}
+
+#[test]
 fn use_third_party_preset_without_key_errors() {
     // Regression: `xfade use glm --tool claude` used to auto-create the provider with a
     // placeholder key, which got written into ANTHROPIC_AUTH_TOKEN and broke Claude Code auth.
