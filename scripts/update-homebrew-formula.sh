@@ -33,6 +33,7 @@ fi
 
 SHA_ARM64="$(awk '$2 == "xfade-aarch64-apple-darwin.tar.gz" {print $1}' "$TMP/SHA256SUMS")"
 SHA_INTEL="$(awk '$2 == "xfade-x86_64-apple-darwin.tar.gz" {print $1}' "$TMP/SHA256SUMS")"
+SHA_LINUX="$(awk '$2 == "xfade-x86_64-unknown-linux-gnu.tar.gz" {print $1}' "$TMP/SHA256SUMS")"
 
 if [ -z "$SHA_ARM64" ] || [ -z "$SHA_INTEL" ]; then
   echo "Error: Could not find sha256 for macOS assets in SHA256SUMS:" >&2
@@ -42,6 +43,9 @@ fi
 
 echo "  macOS ARM64 sha256: ${SHA_ARM64}"
 echo "  macOS Intel sha256: ${SHA_INTEL}"
+if [ -n "$SHA_LINUX" ]; then
+  echo "  Linux x86_64 sha256: ${SHA_LINUX}"
+fi
 
 # 1. Update the local formula in this repository
 FORMULA_PATH="homebrew/Formula/xfade.rb"
@@ -60,6 +64,13 @@ class Xfade < Formula
     on_intel do
       url "https://github.com/xfade-dev/xfade/releases/download/${TAG}/xfade-x86_64-apple-darwin.tar.gz"
       sha256 "${SHA_INTEL}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/xfade-dev/xfade/releases/download/${TAG}/xfade-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "${SHA_LINUX}"
     end
   end
 

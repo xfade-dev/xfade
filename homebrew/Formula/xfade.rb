@@ -15,6 +15,13 @@ class Xfade < Formula
     end
   end
 
+  on_linux do
+    on_intel do
+      url "https://github.com/xfade-dev/xfade/releases/download/v0.12.1/xfade-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "78b7a8bb9e40c1322819ed94d50e32fbedcacd62fc812bb7d281b09d7cb59d4b"
+    end
+  end
+
   def install
     bin.install "xfade"
   end
