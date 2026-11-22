@@ -62,7 +62,11 @@ pub fn run_tui(core: &Core, tool: ToolKind) -> Result<()> {
     // ── Terminal cleanup ──────────────────────────────────────────────
     // Ensure all restoration steps execute unconditionally even if one fails.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
     let _ = terminal.show_cursor();
     let _ = std::panic::take_hook();
 

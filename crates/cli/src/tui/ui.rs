@@ -296,7 +296,9 @@ fn draw_fader(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
             let tokens = stats
                 .iter()
                 .find(|r| r.group == p.id)
-                .map(|r| format_tokens(r.prompt_tokens.saturating_add(r.completion_tokens).max(0) as u64))
+                .map(|r| {
+                    format_tokens(r.prompt_tokens.saturating_add(r.completion_tokens).max(0) as u64)
+                })
                 .unwrap_or_else(|| "-".into());
             spans.push(Span::raw(format!("   Tokens({STATS_DAYS}): ")));
             spans.push(Span::raw(tokens));
@@ -595,11 +597,7 @@ fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect
         } else {
             100.0
         };
-        let ok_color = if ok >= 95.0 {
-            Color::Green
-        } else {
-            Color::Red
-        };
+        let ok_color = if ok >= 95.0 { Color::Green } else { Color::Red };
 
         lines.push(Line::from(vec![
             Span::styled("  • Requests:   ", Style::default().fg(Color::DarkGray)),
@@ -616,7 +614,11 @@ fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect
             Span::styled(
                 format!(
                     " · {} tokens",
-                    format_tokens(row.prompt_tokens.saturating_add(row.completion_tokens).max(0) as u64)
+                    format_tokens(
+                        row.prompt_tokens
+                            .saturating_add(row.completion_tokens)
+                            .max(0) as u64
+                    )
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
@@ -781,8 +783,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app, &[])).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("Provider Details:"), "should not render right pane in narrow mode:\n{text}");
-        assert!(text.contains("Providers (claude)"), "should render list:\n{text}");
+        assert!(
+            !text.contains("Provider Details:"),
+            "should not render right pane in narrow mode:\n{text}"
+        );
+        assert!(
+            text.contains("Providers (claude)"),
+            "should render list:\n{text}"
+        );
     }
 
     #[test]
@@ -800,8 +808,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app, &[])).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("Provider Details:"), "should degrade vertically to single pane:\n{text}");
-        assert!(text.contains("Providers (claude)"), "should render list:\n{text}");
+        assert!(
+            !text.contains("Provider Details:"),
+            "should degrade vertically to single pane:\n{text}"
+        );
+        assert!(
+            text.contains("Providers (claude)"),
+            "should render list:\n{text}"
+        );
     }
 
     #[test]
@@ -814,8 +828,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app, &[])).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("No providers configured for"), "empty msg:\n{text}");
-        assert!(text.contains("Run `xfade add` in terminal"), "actionable instructions:\n{text}");
+        assert!(
+            text.contains("No providers configured for"),
+            "empty msg:\n{text}"
+        );
+        assert!(
+            text.contains("Run `xfade add` in terminal"),
+            "actionable instructions:\n{text}"
+        );
     }
 
     #[test]
@@ -824,7 +844,8 @@ mod tests {
         let core = test_core(&dir);
         let p = Provider::new("sat", ToolKind::ClaudeCode, Some("http://sat:3000".into()));
         core.add_provider(p, Some("sk-sat")).unwrap();
-        core.use_provider(ToolKind::ClaudeCode, "sat", true).unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "sat", true)
+            .unwrap();
         let app = App::new(ToolKind::ClaudeCode, &core);
 
         let stats = vec![StatsRow {
@@ -841,7 +862,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app, &stats)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Tokens(7d):"), "header tokens present:\n{text}");
+        assert!(
+            text.contains("Tokens(7d):"),
+            "header tokens present:\n{text}"
+        );
     }
 
     #[test]
@@ -874,10 +898,19 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app, &stats)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Provider Details: deepseek"), "details title:\n{text}");
-        assert!(text.contains("https://api.deepseek.com/v1"), "endpoint:\n{text}");
+        assert!(
+            text.contains("Provider Details: deepseek"),
+            "details title:\n{text}"
+        );
+        assert!(
+            text.contains("https://api.deepseek.com/v1"),
+            "endpoint:\n{text}"
+        );
         assert!(text.contains("Chat"), "protocol:\n{text}");
-        assert!(text.contains("Gateway & Traffic Health"), "metrics title:\n{text}");
+        assert!(
+            text.contains("Gateway & Traffic Health"),
+            "metrics title:\n{text}"
+        );
         assert!(text.contains("$0.0350"), "estimated cost:\n{text}");
     }
 

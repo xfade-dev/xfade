@@ -2,6 +2,20 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.12.1 — 2026-11-22
+
+### CLI Ergonomics & Command Grouping
+- **feat(cli)**: Structured top-level command categorization in `xfade --help`, organizing 34 subcommands into 6 logical functional groups (`CORE ROUTING & SWITCHING`, `GATEWAY & TRAFFIC GOVERNANCE`, `SECURITY & TRUST`, `CONFIGURATION & ASSETS`, `TOOL LAUNCHERS`, `GENERAL`) for immediate clarity while maintaining 100% backward compatibility.
+
+### TUI Dual-Pane Modernization & Dashboard
+- **feat(tui)**: Adaptive dual-pane layout for `xfade tui` on wide displays (width ≥ 70, height ≥ 18), providing a responsive provider list on the left and stacked detail/traffic health cards on the right.
+- **feat(tui)**: Right-hand cards display detailed provider endpoint, protocol format, default model, multi-slot bindings (Claude `haiku`/`sonnet`/`opus`), OS keychain credential references (`ref:<id>`), and 7-day gateway performance metrics (request volume, error rate, latency, and estimated micro-dollar cost).
+- **feat(tui)**: Enhanced keyboard controls: `Space` or `Enter` to switch providers, `Tab` and `Shift+Tab` (`BackTab`) for bidirectional tool tab cycling, and `BackTab` field navigation in edit mode.
+- **feat(tui)**: Smooth responsive degradation: automatically falls back to compact single-pane view on terminal dimensions below 70 width or 18 height.
+- **fix(tui)**: Hardened terminal safety with unconditional teardown cleanup and cursor restoration on panics (`crossterm::cursor::Show`).
+- **fix(tui)**: Scoped background latency probes strictly to active `ToolKind` to eliminate cross-tool latency probe leaks when cycling tools.
+- **fix(tui)**: Saturated token addition arithmetic to prevent debug-build integer overflow panics on large usage aggregations.
+
 ## v0.12.0 — 2026-11-21
 
 ### Security & Credential Isolation (F1, F2, F7, T7, T8)
