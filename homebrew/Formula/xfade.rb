@@ -6,12 +6,12 @@ class Xfade < Formula
   # This formula belongs to the standalone tap repo homebrew-xfade; url/sha256 are updated after each release.
   on_macos do
     on_arm do
-      url "https://github.com/xfade-dev/xfade/releases/download/v0.12.0/xfade-aarch64-apple-darwin.tar.gz"
-      sha256 "ce969bb74ad2625256c0ddbf2b02ecb5ad8422a1ed4095fb8db58e5eeb956f39"
+      url "https://github.com/xfade-dev/xfade/releases/download/v0.12.1/xfade-aarch64-apple-darwin.tar.gz"
+      sha256 "deab745c31e686aa84c41067f06ff1f4cad74246e4998b0bfcba2450aa27af84"
     end
     on_intel do
-      url "https://github.com/xfade-dev/xfade/releases/download/v0.12.0/xfade-x86_64-apple-darwin.tar.gz"
-      sha256 "ef07c26f7f16d5b70f11b40a0bdbfc8b8861c6c0cf1d466fb1d241f45e7be6f7"
+      url "https://github.com/xfade-dev/xfade/releases/download/v0.12.1/xfade-x86_64-apple-darwin.tar.gz"
+      sha256 "bc3ca8cfe02de0d83e1758b1a066b36a2dd615f48c51dabcebd1d46f3d34e314"
     end
   end
 
