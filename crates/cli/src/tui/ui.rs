@@ -23,6 +23,10 @@ pub const STATS_DAYS: &str = "7d";
 const MIN_WIDTH: u16 = 30;
 const MIN_HEIGHT: u16 = 13;
 
+/// Minimum terminal width for the dual-pane layout. Below this the layout
+/// degrades gracefully to a single list pane.
+pub const DUAL_PANE_MIN_WIDTH: u16 = 70;
+
 pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
     let area = f.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -41,11 +45,32 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
         .split(area);
 
     draw_fader(f, app, stats, chunks[0]);
-    if app.is_editing() {
-        draw_edit(f, app, chunks[1]);
+
+    if area.width >= DUAL_PANE_MIN_WIDTH {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(chunks[1]);
+
+        draw_list(f, app, stats, cols[0]);
+        if app.is_editing() {
+            draw_edit(f, app, cols[1]);
+        } else {
+            let right_panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                .split(cols[1]);
+            draw_provider_details(f, app, right_panes[0]);
+            draw_gateway_metrics(f, app, stats, right_panes[1]);
+        }
     } else {
-        draw_list(f, app, stats, chunks[1]);
+        if app.is_editing() {
+            draw_edit(f, app, chunks[1]);
+        } else {
+            draw_list(f, app, stats, chunks[1]);
+        }
     }
+
     draw_footer(f, app, chunks[2]);
 }
 
@@ -367,6 +392,22 @@ fn latency_badge(result: &ProbeResult) -> (String, Color) {
 }
 
 fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
+    if app.providers.is_empty() {
+        let msg = format!(
+            "No providers configured for {}.\n\nPress 'e' to add one, or run `xfade add`.",
+            app.tool.as_str()
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Providers ({}) ", app.tool.as_str()));
+        let p = Paragraph::new(msg)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
         .providers
         .iter()
@@ -374,7 +415,11 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
         .map(|(i, p)| {
             let mark = if p.is_active { "*" } else { " " };
             let base = p.base_url.as_deref().unwrap_or("(official)");
-            let mut spans = vec![Span::raw(format!("{mark} {:<18} {base:<40} ", p.id))];
+            let mut spans = if area.width >= 55 {
+                vec![Span::raw(format!("{mark} {:<14} {:<20} ", p.id, base))]
+            } else {
+                vec![Span::raw(format!("{mark} {:<13} ", p.id))]
+            };
             if app.probing.contains(p.id.as_str()) {
                 spans.push(Span::styled(
                     app.spinner_glyph().to_string(),
@@ -416,6 +461,193 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
             .title(format!(" Providers ({}) ", app.tool.as_str())),
     );
     f.render_widget(list, area);
+}
+
+fn draw_provider_details(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match app.selected_provider() {
+            Some(p) => format!(" Provider Details: {} ", p.id),
+            None => " Provider Details ".to_string(),
+        });
+
+    let Some(p) = app.selected_provider() else {
+        let p = Paragraph::new("No provider selected.").block(block);
+        f.render_widget(p, area);
+        return;
+    };
+
+    let base_url = p.base_url.as_deref().unwrap_or("(official vendor login)");
+    let protocol = match p.protocol {
+        xfade_core::ProviderProtocol::Chat => "Chat (OpenAI-compatible)",
+        xfade_core::ProviderProtocol::Messages => "Messages (Anthropic)",
+        xfade_core::ProviderProtocol::Responses => "Responses (OpenAI v1/responses)",
+    };
+    let model = p
+        .extra
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(default model)");
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  • Endpoint:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(base_url, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  • Protocol:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(protocol, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  • Model:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(model, Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    // Optional slot overrides (e.g. for Claude Code)
+    let opus = p.extra.get("opus_model").and_then(|v| v.as_str());
+    let sonnet = p.extra.get("sonnet_model").and_then(|v| v.as_str());
+    let haiku = p.extra.get("haiku_model").and_then(|v| v.as_str());
+    if opus.is_some() || sonnet.is_some() || haiku.is_some() {
+        let mut slot_parts = Vec::new();
+        if let Some(s) = haiku {
+            slot_parts.push(format!("haiku:{s}"));
+        }
+        if let Some(s) = sonnet {
+            slot_parts.push(format!("sonnet:{s}"));
+        }
+        if let Some(s) = opus {
+            slot_parts.push(format!("opus:{s}"));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  • Slots:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(slot_parts.join(" · "), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    let status_str = if p.is_active {
+        Span::styled(
+            "ACTIVE (Serving tool)",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("STANDBY", Style::default().fg(Color::DarkGray))
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  • Status:     ", Style::default().fg(Color::DarkGray)),
+        status_str,
+    ]));
+
+    let key_ref = format!("OS Keychain [ref:{}]", p.key_ref);
+    lines.push(Line::from(vec![
+        Span::styled("  • Credential: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(key_ref, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Gateway & Traffic Health ");
+
+    let Some(p) = app.selected_provider() else {
+        let p = Paragraph::new("No provider selected.").block(block);
+        f.render_widget(p, area);
+        return;
+    };
+
+    let maybe_stat = stats.iter().find(|r| r.group == p.id);
+    let mut lines = Vec::new();
+
+    // Trust badge line
+    let (trust_badge, trust_color) = match app.trust {
+        xfade_core::security::TrustState::Guarded => {
+            ("GUARDED (Zero raw keys on disk)", Color::Green)
+        }
+        xfade_core::security::TrustState::Direct => {
+            ("DIRECT (Escape hatch enabled)", Color::Yellow)
+        }
+        xfade_core::security::TrustState::Exposed => {
+            ("EXPOSED (Security review needed)", Color::Red)
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  • Security:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            trust_badge,
+            Style::default()
+                .fg(trust_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if let Some(row) = maybe_stat {
+        let ok = if row.requests > 0 {
+            100.0 * (1.0 - row.errors as f64 / row.requests as f64)
+        } else {
+            100.0
+        };
+        let ok_color = if ok >= 95.0 {
+            Color::Green
+        } else {
+            Color::Red
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  • Requests:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} reqs", row.requests),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" ({ok:.1}% ok)"), Style::default().fg(ok_color)),
+        ]));
+
+        lines.push(Line::from(vec![
+            Span::styled("  • Latency:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("avg {}ms", row.avg_duration_ms), Style::default()),
+            Span::styled(
+                format!(
+                    " · {} tokens",
+                    format_tokens((row.prompt_tokens + row.completion_tokens).max(0) as u64)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        let cost = row.cost_usd_micros as f64 / 1_000_000.0;
+        lines.push(Line::from(vec![
+            Span::styled("  • Est. Cost:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("${cost:.4} (est)"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  • Traffic:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "No proxy calls recorded in last 7d",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  • Circuit:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "CLOSED (Healthy / Standby)",
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
 }
 
 fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
@@ -524,6 +756,43 @@ mod tests {
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer().clone();
         b.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn test_dual_pane_renders_details_and_metrics_when_wide() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut p = Provider::new(
+            "deepseek",
+            ToolKind::ClaudeCode,
+            Some("https://api.deepseek.com/v1".into()),
+        );
+        p.protocol = xfade_core::ProviderProtocol::Chat;
+        p.extra = serde_json::json!({"model": "deepseek-chat"});
+        core.add_provider(p, Some("sk-secret")).unwrap();
+        core.use_provider(ToolKind::ClaudeCode, "deepseek", true)
+            .unwrap();
+
+        let app = App::new(ToolKind::ClaudeCode, &core);
+        let stats = vec![StatsRow {
+            group: "deepseek".into(),
+            requests: 50,
+            prompt_tokens: 10_000,
+            completion_tokens: 2_000,
+            cost_usd_micros: 35_000, // $0.035
+            errors: 0,
+            avg_duration_ms: 220,
+        }];
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &stats)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Provider Details: deepseek"), "details title:\n{text}");
+        assert!(text.contains("https://api.deepseek.com/v1"), "endpoint:\n{text}");
+        assert!(text.contains("Chat"), "protocol:\n{text}");
+        assert!(text.contains("Gateway & Traffic Health"), "metrics title:\n{text}");
+        assert!(text.contains("$0.0350"), "estimated cost:\n{text}");
     }
 
     #[test]
