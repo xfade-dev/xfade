@@ -214,6 +214,8 @@ fn event_loop(
                 }
                 KeyCode::Tab | KeyCode::Down => app.edit_next_field(),
                 KeyCode::BackTab | KeyCode::Up => app.edit_prev_field(),
+                KeyCode::Left => app.edit_cycle(false),
+                KeyCode::Right => app.edit_cycle(true),
                 KeyCode::Backspace => app.edit_backspace(),
                 KeyCode::Char(c) => app.edit_char(c),
                 _ => {}

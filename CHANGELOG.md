@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.12.3 — 2026-11-23
+
+### TUI Forms: Guided Choices
+- **feat(tui)**: Fixed-choice fields are now radio-style selectors instead of free text, so first-time users see every valid value: global **Secrets** (`keyring` / `file`), global **API** (`openai-completions` / `anthropic-messages`, `openai-completions` preselected) and the add form's **Protocol** (`auto` / `chat` / `messages` / `responses`). Pick with `←/→` or Space; Backspace resets to the default.
+- **feat(tui)**: Each field in the global defaults form shows an explanatory hint when focused (what it stores, which tools use it, and that a Secrets backend change needs a restart; keys are not migrated).
+- **fix(tui)**: Form scrolling now counts wrapped rows, so the focused field is no longer clipped when option rows wrap in narrow panes.
+
 ## v0.12.2 — 2026-11-23
 
 ### TUI Provider & Global Defaults Management

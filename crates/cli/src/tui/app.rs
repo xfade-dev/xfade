@@ -20,6 +20,35 @@ const FLASH_DURATION: Duration = Duration::from_millis(450);
 /// mask a shorter intro.
 const INTRO_DURATION: Duration = Duration::from_millis(1200);
 
+/// Fixed-choice fields are picked with Left/Right/Space instead of typed, so a
+/// first-time user sees every valid value. Each entry is `(stored, shown)`.
+pub const SECRETS_CHOICES: [(&str, &str); 2] = [("keyring", "keyring"), ("file", "file")];
+pub const API_CHOICES: [(&str, &str); 2] = [
+    ("openai-completions", "openai-completions"),
+    ("anthropic-messages", "anthropic-messages"),
+];
+/// Pre-selected API type; matches what Pi/OMP/OpenClaw fall back to when unset.
+const DEFAULT_API: &str = "openai-completions";
+pub const PROTOCOL_CHOICES: [(&str, &str); 4] = [
+    ("", "auto"),
+    ("chat", "chat"),
+    ("messages", "messages"),
+    ("responses", "responses"),
+];
+
+/// Next/previous stored value in `choices`, wrapping. A current value outside
+/// the list (e.g. hand-edited `config.json`) steps onto the first/last entry.
+fn cycle_choice(choices: &[(&str, &str)], current: &str, forward: bool) -> String {
+    let n = choices.len();
+    let next = match choices.iter().position(|(v, _)| *v == current) {
+        Some(i) if forward => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None if forward => 0,
+        None => n - 1,
+    };
+    choices[next].0.to_string()
+}
+
 /// Outcome of a latency probe against one provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -367,7 +396,7 @@ impl App {
             secrets: config.secrets.to_string(),
             base_url: config.base_url.unwrap_or_default(),
             model: config.model.unwrap_or_default(),
-            api: config.api.unwrap_or_default(),
+            api: config.api.unwrap_or_else(|| DEFAULT_API.to_string()),
             api_key: String::new(),
             api_key_is_set,
         });
@@ -383,17 +412,47 @@ impl App {
                 AddField::BaseUrl => a.base_url.push(c),
                 AddField::Model => a.model.push(c),
                 AddField::ApiKey => a.api_key.push(c),
-                AddField::Protocol => a.protocol.push(c),
+                // Choice fields: Space steps forward, other keys are ignored.
+                AddField::Protocol if c == ' ' => {
+                    a.protocol = cycle_choice(&PROTOCOL_CHOICES, &a.protocol, true)
+                }
                 AddField::Official if c == ' ' => a.official = !a.official,
-                AddField::Official => {}
+                AddField::Protocol | AddField::Official => {}
             }
         } else if let Some(config) = self.config_edit.as_mut() {
             match config.field {
-                ConfigField::Secrets => config.secrets.push(c),
+                ConfigField::Secrets if c == ' ' => {
+                    config.secrets = cycle_choice(&SECRETS_CHOICES, &config.secrets, true)
+                }
+                ConfigField::Api if c == ' ' => {
+                    config.api = cycle_choice(&API_CHOICES, &config.api, true)
+                }
+                ConfigField::Secrets | ConfigField::Api => {}
                 ConfigField::BaseUrl => config.base_url.push(c),
                 ConfigField::Model => config.model.push(c),
-                ConfigField::Api => config.api.push(c),
                 ConfigField::ApiKey => config.api_key.push(c),
+            }
+        }
+    }
+
+    /// Left/Right on a choice field steps through its options (no-op on text
+    /// fields). Space does the same going forward.
+    pub fn edit_cycle(&mut self, forward: bool) {
+        if let Some(a) = self.add.as_mut() {
+            match a.field {
+                AddField::Protocol => {
+                    a.protocol = cycle_choice(&PROTOCOL_CHOICES, &a.protocol, forward)
+                }
+                AddField::Official => a.official = !a.official,
+                _ => {}
+            }
+        } else if let Some(config) = self.config_edit.as_mut() {
+            match config.field {
+                ConfigField::Secrets => {
+                    config.secrets = cycle_choice(&SECRETS_CHOICES, &config.secrets, forward)
+                }
+                ConfigField::Api => config.api = cycle_choice(&API_CHOICES, &config.api, forward),
+                _ => {}
             }
         }
     }
@@ -415,25 +474,21 @@ impl App {
                 AddField::ApiKey => {
                     a.api_key.pop();
                 }
-                AddField::Protocol => {
-                    a.protocol.pop();
-                }
+                // Choice fields: Backspace resets to the default option.
+                AddField::Protocol => a.protocol.clear(),
                 AddField::Official => {}
             }
         } else if let Some(config) = self.config_edit.as_mut() {
             match config.field {
-                ConfigField::Secrets => {
-                    config.secrets.pop();
-                }
+                // Secrets always holds a valid backend; nothing to erase.
+                ConfigField::Secrets => {}
                 ConfigField::BaseUrl => {
                     config.base_url.pop();
                 }
                 ConfigField::Model => {
                     config.model.pop();
                 }
-                ConfigField::Api => {
-                    config.api.pop();
-                }
+                ConfigField::Api => config.api = DEFAULT_API.to_string(),
                 ConfigField::ApiKey => {
                     config.api_key.pop();
                 }
@@ -1397,6 +1452,106 @@ mod tests {
         app.request_delete();
         app.confirm_delete(&core, true);
         assert!(!app.probes.contains_key("gone"));
+    }
+
+    #[test]
+    fn config_choice_fields_cycle_instead_of_accepting_typed_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+
+        // Secrets: typed text is ignored; Space/Right/Left cycle and wrap.
+        app.edit_char('x');
+        assert_eq!(app.config_edit.as_ref().unwrap().secrets, "keyring");
+        app.edit_char(' ');
+        assert_eq!(app.config_edit.as_ref().unwrap().secrets, "file");
+        app.edit_cycle(true);
+        assert_eq!(app.config_edit.as_ref().unwrap().secrets, "keyring");
+        app.edit_cycle(false);
+        assert_eq!(app.config_edit.as_ref().unwrap().secrets, "file");
+        app.edit_backspace();
+        assert_eq!(app.config_edit.as_ref().unwrap().secrets, "file");
+
+        // API: openai (preselected) <-> anthropic; Backspace resets.
+        app.edit_next_field();
+        app.edit_next_field();
+        app.edit_next_field();
+        assert_eq!(app.config_edit.as_ref().unwrap().field, ConfigField::Api);
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "openai-completions");
+        app.edit_cycle(true);
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "anthropic-messages");
+        app.edit_cycle(true);
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "openai-completions");
+        app.edit_cycle(false);
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "anthropic-messages");
+        app.edit_backspace();
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "openai-completions");
+    }
+
+    #[test]
+    fn add_protocol_and_official_are_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        for _ in 0..4 {
+            app.edit_next_field();
+        }
+        assert_eq!(app.add.as_ref().unwrap().field, AddField::Protocol);
+        app.edit_char('z'); // ignored
+        assert_eq!(app.add.as_ref().unwrap().protocol, "");
+        app.edit_cycle(true);
+        assert_eq!(app.add.as_ref().unwrap().protocol, "chat");
+        app.edit_char(' ');
+        assert_eq!(app.add.as_ref().unwrap().protocol, "messages");
+        app.edit_cycle(false);
+        app.edit_cycle(false);
+        assert_eq!(app.add.as_ref().unwrap().protocol, "");
+        app.edit_cycle(false);
+        assert_eq!(app.add.as_ref().unwrap().protocol, "responses");
+        app.edit_backspace();
+        assert_eq!(app.add.as_ref().unwrap().protocol, "");
+
+        app.edit_next_field();
+        assert_eq!(app.add.as_ref().unwrap().field, AddField::Official);
+        app.edit_cycle(true);
+        assert!(app.add.as_ref().unwrap().official);
+        app.edit_cycle(false);
+        assert!(!app.add.as_ref().unwrap().official);
+    }
+
+    #[test]
+    fn cycle_choice_recovers_from_unknown_value() {
+        // A hand-edited config.json value outside the list must not trap the
+        // user: stepping lands on a valid option in either direction.
+        assert_eq!(
+            cycle_choice(&API_CHOICES, "weird", true),
+            "openai-completions"
+        );
+        assert_eq!(
+            cycle_choice(&API_CHOICES, "weird", false),
+            "anthropic-messages"
+        );
+    }
+
+    #[test]
+    fn config_saves_chosen_secrets_and_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+        app.edit_cycle(true); // secrets -> file
+        for _ in 0..3 {
+            app.edit_next_field();
+        }
+        assert_eq!(app.config_edit.as_ref().unwrap().api, "openai-completions");
+        app.edit_cycle(true); // api -> anthropic-messages
+        app.submit_input(&core);
+        let cfg = core.config();
+        assert_eq!(cfg.secrets, SecretsBackend::File);
+        assert_eq!(cfg.api.as_deref(), Some("anthropic-messages"));
+        assert!(app.message.as_deref().unwrap().contains("restart"));
     }
 
     #[test]

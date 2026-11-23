@@ -12,7 +12,10 @@ use std::sync::OnceLock;
 use xfade_core::store::db::StatsRow;
 use xfade_core::ToolKind;
 
-use crate::tui::app::{AddField, App, ConfigField, EditField, ProbeResult};
+use crate::tui::app::{
+    AddField, App, ConfigField, EditField, ProbeResult, API_CHOICES, PROTOCOL_CHOICES,
+    SECRETS_CHOICES,
+};
 
 /// Stats window shown in the header (e.g. `7d`), parsed by `crate::parse_since`.
 pub const STATS_DAYS: &str = "7d";
@@ -754,11 +757,96 @@ fn input_line(
 /// Render a form, scrolling so the focused row stays visible. Short terminals
 /// (the single-pane layout can leave only a few rows) would otherwise clip the
 /// field being edited.
+/// Rows `line` occupies once word-wrapped to `width` columns (mirrors the
+/// greedy wrapping of `Paragraph` with `Wrap`).
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let (mut rows, mut used) = (1usize, 0usize);
+    for word in text.split_inclusive(' ') {
+        let w = word.chars().count();
+        // A trailing space may hang past the edge; only the word must fit.
+        let trimmed = word.trim_end_matches(' ').chars().count();
+        if used > 0 && used + trimmed > width {
+            rows += 1;
+            used = 0;
+        }
+        if trimmed > width {
+            rows += (trimmed - 1) / width;
+            used = (trimmed - 1) % width + 1 + (w - trimmed);
+        } else {
+            used += w;
+        }
+    }
+    rows
+}
+
 fn render_form(f: &mut Frame, area: Rect, title: String, lines: Vec<Line<'static>>, focus: usize) {
     let inner_height = area.height.saturating_sub(2) as usize;
-    let scroll = (focus + 1).saturating_sub(inner_height) as u16;
+    let inner_width = area.width.saturating_sub(2) as usize;
+    // Rows are counted after wrapping: option lists and hints wrap in narrow
+    // panes, so a logical row index would scroll to the wrong place.
+    let rows_through_focus: usize = lines
+        .iter()
+        .take(focus + 1)
+        .map(|l| wrapped_rows(l, inner_width))
+        .sum();
+    let scroll = rows_through_focus.saturating_sub(inner_height) as u16;
     let block = Block::default().borders(Borders::ALL).title(title);
-    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
+/// A fixed-choice row: every valid value is listed, the current one marked
+/// `(•)`. If the stored value isn't one of them (hand-edited config), it is
+/// appended so the form never hides what is actually saved.
+fn choice_line(
+    label: &str,
+    choices: &[(&str, &str)],
+    current: &str,
+    focused: bool,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!("{label:<12}"))];
+    let known = choices.iter().any(|(v, _)| *v == current);
+    let mut push = |selected: bool, text: String| {
+        let (mark, style) = match (selected, focused) {
+            (true, true) => (
+                "(•)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            (true, false) => ("(•)", Style::default().add_modifier(Modifier::BOLD)),
+            (false, _) => ("( )", Style::default().fg(Color::DarkGray)),
+        };
+        spans.push(Span::styled(format!("{mark} {text}  "), style));
+    };
+    for (value, shown) in choices {
+        push(*value == current, (*shown).to_string());
+    }
+    if !known {
+        push(true, format!("{current} (custom)"));
+    }
+    Line::from(spans)
+}
+
+/// One-line explanation of the focused field, so nobody has to guess what to
+/// type. Shown under the form.
+fn hint_lines(text: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
 }
 
 fn draw_add(f: &mut Frame, app: &App, area: Rect) {
@@ -777,8 +865,7 @@ fn draw_add(f: &mut Frame, app: &App, area: Rect) {
         (false, _) => (add.model.clone(), false),
     };
     let key_hint = add.api_key.is_empty();
-    let proto_hint = add.protocol.is_empty();
-    let lines = vec![
+    let mut lines = vec![
         input_line(
             "ID:",
             add.id.clone(),
@@ -811,16 +898,11 @@ fn draw_add(f: &mut Frame, app: &App, area: Rect) {
             true,
             key_hint,
         ),
-        input_line(
+        choice_line(
             "Protocol:",
-            if proto_hint {
-                "(auto)".into()
-            } else {
-                add.protocol.clone()
-            },
+            &PROTOCOL_CHOICES,
+            &add.protocol,
             add.field == AddField::Protocol,
-            false,
-            proto_hint,
         ),
         input_line(
             "Official:",
@@ -829,19 +911,31 @@ fn draw_add(f: &mut Frame, app: &App, area: Rect) {
             false,
             false,
         ),
-        Line::from(Span::styled(
-            "Protocol: chat/messages/responses · Space toggles Official",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
-    let focus = match add.field {
-        AddField::Id => 0,
-        AddField::BaseUrl => 1,
-        AddField::Model => 2,
-        AddField::ApiKey => 3,
-        AddField::Protocol => 4,
-        AddField::Official => 5,
+    let (focus, hint) = match add.field {
+        AddField::Id => (0, "Name for this provider, e.g. kimi. Must be new for this tool."),
+        AddField::BaseUrl => (
+            1,
+            "Upstream endpoint, e.g. https://api.moonshot.cn/v1. Blank = global default.",
+        ),
+        AddField::Model => (
+            2,
+            "Model sent upstream. Blank = global default, or the tool's own default.",
+        ),
+        AddField::ApiKey => (
+            3,
+            "Key for this provider. Blank = copy the global API key. Stored in the secrets backend.",
+        ),
+        AddField::Protocol => (
+            4,
+            "←/→ or Space. How xfade talks to this upstream. auto = chat (messages for anthropic.com).",
+        ),
+        AddField::Official => (
+            5,
+            "Space toggles. Official = use the tool's own login; no URL or key is stored.",
+        ),
     };
+    lines.extend(hint_lines(hint));
     render_form(
         f,
         area,
@@ -859,17 +953,16 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
     let key_text = if !key_empty {
         config.api_key.clone()
     } else if config.api_key_is_set {
-        "(blank = keep current key)".to_string()
+        "(set · blank = keep current)".to_string()
     } else {
-        "(blank = unset)".to_string()
+        "(not set)".to_string()
     };
-    let lines = vec![
-        input_line(
+    let mut lines = vec![
+        choice_line(
             "Secrets:",
-            config.secrets.clone(),
+            &SECRETS_CHOICES,
+            &config.secrets,
             config.field == ConfigField::Secrets,
-            false,
-            false,
         ),
         input_line(
             "Base URL:",
@@ -885,12 +978,11 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             false,
             false,
         ),
-        input_line(
+        choice_line(
             "API:",
-            config.api.clone(),
+            &API_CHOICES,
+            &config.api,
             config.field == ConfigField::Api,
-            false,
-            false,
         ),
         input_line(
             "API Key:",
@@ -899,25 +991,46 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             true,
             key_empty,
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Creation-time defaults only · backend change requires restart",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
-    let focus = match config.field {
-        ConfigField::Secrets => 0,
-        ConfigField::BaseUrl => 1,
-        ConfigField::Model => 2,
-        ConfigField::Api => 3,
-        ConfigField::ApiKey => 4,
+    let secrets_hint = if config.secrets != config.active_secrets.to_string() {
+        "←/→ or Space. Where API keys are stored. Change applies after restart; keys are not migrated."
+    } else {
+        "←/→ or Space. Where API keys are stored. keyring = OS keychain; file = secrets.json (0600), for servers/SSH."
     };
-    render_form(f, area, " Global defaults ".to_string(), lines, focus);
+    let (focus, hint) = match config.field {
+        ConfigField::Secrets => (0, secrets_hint),
+        ConfigField::BaseUrl => (
+            1,
+            "Default endpoint copied into new providers that leave Base URL blank.",
+        ),
+        ConfigField::Model => (
+            2,
+            "Default model copied into new providers that leave Model blank.",
+        ),
+        ConfigField::Api => (
+            3,
+            "←/→ or Space. Only Pi, Oh My Pi and OpenClaw use it. Pick anthropic-messages for /v1/messages gateways.",
+        ),
+        ConfigField::ApiKey => (
+            4,
+            "Copied into new providers that leave API Key blank. Not shown after saving.",
+        ),
+    };
+    lines.extend(hint_lines(hint));
+    render_form(
+        f,
+        area,
+        " Global defaults · used when creating providers ".to_string(),
+        lines,
+        focus,
+    );
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.delete_confirm.is_some() {
         "confirm removal: [y] yes   [n/Esc] cancel"
+    } else if app.is_adding() || app.is_configuring() {
+        "Tab next field  ←/→ or Space choose  Enter save  Esc cancel"
     } else if app.is_input_mode() {
         "editing: [Tab/BackTab] field   [Enter] save   [Esc] cancel"
     } else {
@@ -1432,6 +1545,33 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_rows_counts_word_wrap() {
+        let line = Line::from("aaaa bbbb cccc");
+        assert_eq!(wrapped_rows(&line, 20), 1);
+        assert_eq!(wrapped_rows(&line, 9), 2);
+        assert_eq!(wrapped_rows(&line, 4), 3);
+        assert_eq!(wrapped_rows(&line, 0), 1);
+        assert_eq!(wrapped_rows(&Line::from("abcdefghij"), 4), 3);
+    }
+
+    #[test]
+    fn focused_field_stays_visible_when_option_rows_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+        for _ in 0..4 {
+            app.edit_next_field(); // -> API Key, the last field
+        }
+        // Narrow + short: the Secrets/API option rows wrap here.
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("API Key:"), "focused row clipped:\n{text}");
+    }
+
+    #[test]
     fn footer_hints_fit_in_80_columns() {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir);
@@ -1441,6 +1581,66 @@ mod tests {
         terminal.draw(|f| draw(f, &app, &[])).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("q quit"), "footer truncated:\n{text}");
+    }
+
+    #[test]
+    fn global_form_lists_every_secrets_and_api_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        for option in [
+            "keyring",
+            "file",
+            "default",
+            "openai-completions",
+            "anthropic-messages",
+        ] {
+            assert!(text.contains(option), "option {option} missing:\n{text}");
+        }
+        assert!(text.contains("(•) keyring"), "selection marker:\n{text}");
+        // Focus starts on Secrets, so its explanation is on screen.
+        assert!(text.contains("OS keychain"), "secrets hint:\n{text}");
+    }
+
+    #[test]
+    fn global_form_explains_api_field_when_focused() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+        for _ in 0..3 {
+            app.edit_next_field();
+        }
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Only Pi, Oh My Pi and OpenClaw"), "{text}");
+    }
+
+    #[test]
+    fn add_form_lists_protocol_options_and_hints_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        for _ in 0..4 {
+            app.edit_next_field(); // -> Protocol
+        }
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        for option in ["auto", "chat", "messages", "responses"] {
+            assert!(text.contains(option), "option {option} missing:\n{text}");
+        }
+        assert!(text.contains("How xfade talks to this upstream"), "{text}");
     }
 
     #[test]
@@ -1455,7 +1655,7 @@ mod tests {
         terminal.draw(|f| draw(f, &app, &[])).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("Global defaults"), "{text}");
-        assert!(text.contains("Creation-time defaults only"), "{text}");
+        assert!(text.contains("used when creating providers"), "{text}");
         assert!(text.contains("Secrets:"), "{text}");
     }
 
