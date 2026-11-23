@@ -87,11 +87,26 @@ EOF
 echo "==> Updated local formula: ${FORMULA_PATH}"
 
 # 2. Clone and update the standalone tap repo: homebrew-xfade
-TAP_REPO="git@github.com:xfade-dev/homebrew-xfade.git"
+# CI: provide a write-enabled deploy key via TAP_DEPLOY_KEY (PEM body); it is
+# loaded into a per-run ssh-agent so the SSH remote works on runners.
+# Locally: no env needed — the default ssh config / agent is used as-is.
+TAP_REPO_URL="${TAP_REPO_URL:-git@github.com:xfade-dev/homebrew-xfade.git}"
+if [ -n "${TAP_DEPLOY_KEY:-}" ]; then
+  echo "==> Loading TAP_DEPLOY_KEY into a per-run ssh-agent..."
+  CI_SSH_DIR="$(mktemp -d)"
+  printf '%s\n' "$TAP_DEPLOY_KEY" > "$CI_SSH_DIR/deploy_key"
+  chmod 700 "$CI_SSH_DIR"
+  chmod 600 "$CI_SSH_DIR/deploy_key"
+  eval "$(ssh-agent -s)" >/dev/null
+  ssh-add "$CI_SSH_DIR/deploy_key"
+  mkdir -p "$HOME/.ssh"
+  touch "$HOME/.ssh/known_hosts"
+  ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+fi
 TAP_DIR="$TMP/homebrew-xfade"
 
-echo "==> Cloning tap repository: ${TAP_REPO}..."
-git clone "$TAP_REPO" "$TAP_DIR"
+echo "==> Cloning tap repository: ${TAP_REPO_URL}..."
+git clone "$TAP_REPO_URL" "$TAP_DIR"
 
 mkdir -p "$TAP_DIR/Formula"
 cp "$FORMULA_PATH" "$TAP_DIR/Formula/xfade.rb"
@@ -104,7 +119,7 @@ if git diff --quiet; then
   echo "==> Tap repository is already up to date with ${TAG}."
 else
   git commit -am "${TAG}"
-  echo "==> Pushing updated formula to ${TAP_REPO}..."
+  echo "==> Pushing updated formula to ${TAP_REPO_URL}..."
   git push origin master
   echo "==> Tap repository updated successfully!"
 fi

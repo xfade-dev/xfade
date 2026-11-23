@@ -167,3 +167,20 @@ jobs:
             release/xfade.cdx.json
             release/SHA256SUMS
             release/SHA256SUMS.sigstore.json
+
+  # Bump the standalone Homebrew tap (xfade-dev/homebrew-xfade) right after the
+  # release is published. Runs on the same tag push; the tap push uses a
+  # write-enabled deploy key (secret TAP_DEPLOY_KEY) scoped to that repo only.
+  homebrew-tap:
+    name: Update Homebrew tap
+    needs: [release]
+    runs-on: ubuntu-22.04
+    if: github.repository == 'xfade-dev/xfade'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Bump tap formula
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          bash scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}"
