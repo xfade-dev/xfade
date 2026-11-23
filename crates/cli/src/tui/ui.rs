@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use xfade_core::store::db::StatsRow;
 use xfade_core::ToolKind;
 
-use crate::tui::app::{App, EditField, ProbeResult};
+use crate::tui::app::{AddField, App, ConfigField, EditField, ProbeResult};
 
 /// Stats window shown in the header (e.g. `7d`), parsed by `crate::parse_since`.
 pub const STATS_DAYS: &str = "7d";
@@ -56,8 +56,8 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
             .split(chunks[1]);
 
         draw_list(f, app, stats, cols[0]);
-        if app.is_editing() {
-            draw_edit(f, app, cols[1]);
+        if app.is_input_mode() {
+            draw_input(f, app, cols[1]);
         } else {
             let right_panes = Layout::default()
                 .direction(Direction::Vertical)
@@ -67,8 +67,8 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
             draw_gateway_metrics(f, app, stats, right_panes[1]);
         }
     } else {
-        if app.is_editing() {
-            draw_edit(f, app, chunks[1]);
+        if app.is_input_mode() {
+            draw_input(f, app, chunks[1]);
         } else {
             draw_list(f, app, stats, chunks[1]);
         }
@@ -399,7 +399,7 @@ fn latency_badge(result: &ProbeResult) -> (String, Color) {
 fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     if app.providers.is_empty() {
         let msg = format!(
-            "No providers configured for {}.\n\nRun `xfade add` in terminal to configure a provider.",
+            "No providers configured for {}.\n\nPress [a] to add a provider.",
             app.tool.as_str()
         );
         let block = Block::default()
@@ -707,11 +707,221 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+    if app.is_adding() {
+        draw_add(f, app, area);
+    } else if app.is_configuring() {
+        draw_config(f, app, area);
+    } else {
+        draw_edit(f, app, area);
+    }
+}
+
+/// One form row. `masked` hides a typed secret; `placeholder` marks `value`
+/// as hint text (dimmed) rather than something the user typed.
+fn input_line(
+    label: &str,
+    value: String,
+    focused: bool,
+    masked: bool,
+    placeholder: bool,
+) -> Line<'static> {
+    let shown = if masked && !placeholder && !value.is_empty() {
+        "*".repeat(value.chars().count())
+    } else {
+        value
+    };
+    let style = if placeholder {
+        Style::default().fg(Color::DarkGray)
+    } else if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::raw(format!("{label:<12}")),
+        Span::styled(shown, style),
+        if focused {
+            Span::styled("_", Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        },
+    ])
+}
+
+/// Render a form, scrolling so the focused row stays visible. Short terminals
+/// (the single-pane layout can leave only a few rows) would otherwise clip the
+/// field being edited.
+fn render_form(f: &mut Frame, area: Rect, title: String, lines: Vec<Line<'static>>, focus: usize) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let scroll = (focus + 1).saturating_sub(inner_height) as u16;
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+fn draw_add(f: &mut Frame, app: &App, area: Rect) {
+    let Some(add) = app.add.as_ref() else {
+        return;
+    };
+    // Blank fields show the default Core will apply, dimmed.
+    let (url, url_hint) = match (add.base_url.is_empty(), add.global_base_url.as_deref()) {
+        (true, Some(g)) => (format!("(blank = global: {g})"), true),
+        (true, None) => ("(required unless Official)".to_string(), true),
+        (false, _) => (add.base_url.clone(), false),
+    };
+    let (model, model_hint) = match (add.model.is_empty(), add.global_model.as_deref()) {
+        (true, Some(g)) => (format!("(blank = global: {g})"), true),
+        (true, None) => ("(provider default)".to_string(), true),
+        (false, _) => (add.model.clone(), false),
+    };
+    let key_hint = add.api_key.is_empty();
+    let proto_hint = add.protocol.is_empty();
+    let lines = vec![
+        input_line(
+            "ID:",
+            add.id.clone(),
+            add.field == AddField::Id,
+            false,
+            false,
+        ),
+        input_line(
+            "Base URL:",
+            url,
+            add.field == AddField::BaseUrl,
+            false,
+            url_hint,
+        ),
+        input_line(
+            "Model:",
+            model,
+            add.field == AddField::Model,
+            false,
+            model_hint,
+        ),
+        input_line(
+            "API Key:",
+            if key_hint {
+                "(blank = global key)".into()
+            } else {
+                add.api_key.clone()
+            },
+            add.field == AddField::ApiKey,
+            true,
+            key_hint,
+        ),
+        input_line(
+            "Protocol:",
+            if proto_hint {
+                "(auto)".into()
+            } else {
+                add.protocol.clone()
+            },
+            add.field == AddField::Protocol,
+            false,
+            proto_hint,
+        ),
+        input_line(
+            "Official:",
+            if add.official { "[x]" } else { "[ ]" }.into(),
+            add.field == AddField::Official,
+            false,
+            false,
+        ),
+        Line::from(Span::styled(
+            "Protocol: chat/messages/responses · Space toggles Official",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let focus = match add.field {
+        AddField::Id => 0,
+        AddField::BaseUrl => 1,
+        AddField::Model => 2,
+        AddField::ApiKey => 3,
+        AddField::Protocol => 4,
+        AddField::Official => 5,
+    };
+    render_form(
+        f,
+        area,
+        format!(" Add provider for {} ", app.tool.as_str()),
+        lines,
+        focus,
+    );
+}
+
+fn draw_config(f: &mut Frame, app: &App, area: Rect) {
+    let Some(config) = app.config_edit.as_ref() else {
+        return;
+    };
+    let key_empty = config.api_key.is_empty();
+    let key_text = if !key_empty {
+        config.api_key.clone()
+    } else if config.api_key_is_set {
+        "(blank = keep current key)".to_string()
+    } else {
+        "(blank = unset)".to_string()
+    };
+    let lines = vec![
+        input_line(
+            "Secrets:",
+            config.secrets.clone(),
+            config.field == ConfigField::Secrets,
+            false,
+            false,
+        ),
+        input_line(
+            "Base URL:",
+            config.base_url.clone(),
+            config.field == ConfigField::BaseUrl,
+            false,
+            false,
+        ),
+        input_line(
+            "Model:",
+            config.model.clone(),
+            config.field == ConfigField::Model,
+            false,
+            false,
+        ),
+        input_line(
+            "API:",
+            config.api.clone(),
+            config.field == ConfigField::Api,
+            false,
+            false,
+        ),
+        input_line(
+            "API Key:",
+            key_text,
+            config.field == ConfigField::ApiKey,
+            true,
+            key_empty,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Creation-time defaults only · backend change requires restart",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let focus = match config.field {
+        ConfigField::Secrets => 0,
+        ConfigField::BaseUrl => 1,
+        ConfigField::Model => 2,
+        ConfigField::Api => 3,
+        ConfigField::ApiKey => 4,
+    };
+    render_form(f, area, " Global defaults ".to_string(), lines, focus);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let hints = if app.is_editing() {
+    let hints = if app.delete_confirm.is_some() {
+        "confirm removal: [y] yes   [n/Esc] cancel"
+    } else if app.is_input_mode() {
         "editing: [Tab/BackTab] field   [Enter] save   [Esc] cancel"
     } else {
-        "[↑/↓ j/k] move   [Enter/Space] switch   [t] test   [e] edit   [Tab/Shift+Tab] tool   [q] quit"
+        "j/k move  Enter use  a add  e edit  d del  g global  t test  Tab tool  q quit"
     };
     let mut lines = vec![Line::from(Span::styled(
         hints,
@@ -833,7 +1043,7 @@ mod tests {
             "empty msg:\n{text}"
         );
         assert!(
-            text.contains("Run `xfade add` in terminal"),
+            text.contains("Press [a] to add a provider"),
             "actionable instructions:\n{text}"
         );
     }
@@ -1168,6 +1378,85 @@ mod tests {
         assert!(text.contains("glm-4.6"), "model:\n{text}");
         assert!(text.contains("******"), "masked key:\n{text}");
         assert!(!text.contains("secret"), "api key must not render in clear");
+    }
+
+    #[test]
+    fn add_mode_renders_cli_synced_provider_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Add provider for claude"), "{text}");
+        assert!(text.contains("Protocol:"), "{text}");
+        assert!(text.contains("Official:"), "{text}");
+        assert!(text.contains("blank = global key"), "{text}");
+    }
+
+    #[test]
+    fn add_mode_shows_global_defaults_as_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.update_config(None, Some("https://g.example"), Some("g-model"), None)
+            .unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("blank = global: https://g.example"), "{text}");
+        assert!(text.contains("blank = global: g-model"), "{text}");
+    }
+
+    #[test]
+    fn form_scrolls_to_keep_focused_field_visible_in_short_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        for _ in 0..5 {
+            app.edit_next_field(); // -> Official, the 6th row
+        }
+        // Minimum height leaves only a few rows for the form.
+        let backend = TestBackend::new(60, MIN_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Official:"), "focused row clipped:\n{text}");
+    }
+
+    #[test]
+    fn footer_hints_fit_in_80_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let app = App::new(ToolKind::ClaudeCode, &core);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("q quit"), "footer truncated:\n{text}");
+    }
+
+    #[test]
+    fn global_config_mode_labels_values_as_creation_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Global defaults"), "{text}");
+        assert!(text.contains("Creation-time defaults only"), "{text}");
+        assert!(text.contains("Secrets:"), "{text}");
     }
 
     #[test]

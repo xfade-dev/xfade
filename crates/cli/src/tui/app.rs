@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use xfade_core::{Core, Provider, ToolKind};
+use xfade_core::{AddProviderInput, Core, Provider, ProviderProtocol, SecretsBackend, ToolKind};
 
 /// Normalized knob positions (0.0 = far local end, 1.0 = far cloud end).
 pub const FADER_LOCAL: f32 = 0.2;
@@ -43,12 +43,64 @@ pub struct EditState {
     pub api_key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddField {
+    Id,
+    BaseUrl,
+    Model,
+    ApiKey,
+    Protocol,
+    Official,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddState {
+    pub field: AddField,
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub protocol: String,
+    pub official: bool,
+    /// Global defaults shown as placeholders. They are applied by `Core` when a
+    /// field is left blank, not prefilled, so a blank field never looks like
+    /// an editable value that silently comes back.
+    pub global_base_url: Option<String>,
+    pub global_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigField {
+    Secrets,
+    BaseUrl,
+    Model,
+    Api,
+    ApiKey,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    pub field: ConfigField,
+    /// Backend this process is really using (not merely what `config.json`
+    /// says), so a pending backend switch can't send a key to the old store.
+    pub active_secrets: SecretsBackend,
+    pub secrets: String,
+    pub base_url: String,
+    pub model: String,
+    pub api: String,
+    pub api_key: String,
+    pub api_key_is_set: bool,
+}
+
 pub struct App {
     pub tool: ToolKind,
     pub providers: Vec<Provider>,
     pub selected: usize,
     pub message: Option<String>,
     pub edit: Option<EditState>,
+    pub add: Option<AddState>,
+    pub config_edit: Option<ConfigState>,
+    pub delete_confirm: Option<String>,
     /// provider id -> outcome of the latest `t` probe.
     pub probes: HashMap<String, ProbeResult>,
     /// Animated knob position; eased toward [`fader_target`] on every tick.
@@ -81,6 +133,9 @@ impl App {
             selected: 0,
             message: None,
             edit: None,
+            add: None,
+            config_edit: None,
+            delete_confirm: None,
             probes: HashMap::new(),
             fader_pos: 0.5,
             probing: HashSet::new(),
@@ -248,6 +303,18 @@ impl App {
         self.edit.is_some()
     }
 
+    pub fn is_adding(&self) -> bool {
+        self.add.is_some()
+    }
+
+    pub fn is_configuring(&self) -> bool {
+        self.config_edit.is_some()
+    }
+
+    pub fn is_input_mode(&self) -> bool {
+        self.is_editing() || self.is_adding() || self.is_configuring()
+    }
+
     pub fn switch_selected(&mut self, core: &Core) {
         let Some(id) = self.selected_provider().map(|p| p.id.clone()) else {
             return;
@@ -275,15 +342,102 @@ impl App {
         });
     }
 
+    pub fn start_add(&mut self, core: &Core) {
+        let config = core.config();
+        self.add = Some(AddState {
+            field: AddField::Id,
+            id: String::new(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            protocol: String::new(),
+            official: false,
+            global_base_url: config.base_url.filter(|u| !u.trim().is_empty()),
+            global_model: config.model.filter(|m| !m.trim().is_empty()),
+        });
+        self.message = None;
+    }
+
+    pub fn start_config(&mut self, core: &Core) {
+        let config = core.config();
+        let api_key_is_set = core.global_api_key().is_some();
+        self.config_edit = Some(ConfigState {
+            field: ConfigField::Secrets,
+            active_secrets: core.active_secrets_backend().unwrap_or(config.secrets),
+            secrets: config.secrets.to_string(),
+            base_url: config.base_url.unwrap_or_default(),
+            model: config.model.unwrap_or_default(),
+            api: config.api.unwrap_or_default(),
+            api_key: String::new(),
+            api_key_is_set,
+        });
+        self.message = None;
+    }
+
     pub fn edit_char(&mut self, c: char) {
         if let Some(e) = self.edit.as_mut() {
             focused_field_mut(e).push(c);
+        } else if let Some(a) = self.add.as_mut() {
+            match a.field {
+                AddField::Id => a.id.push(c),
+                AddField::BaseUrl => a.base_url.push(c),
+                AddField::Model => a.model.push(c),
+                AddField::ApiKey => a.api_key.push(c),
+                AddField::Protocol => a.protocol.push(c),
+                AddField::Official if c == ' ' => a.official = !a.official,
+                AddField::Official => {}
+            }
+        } else if let Some(config) = self.config_edit.as_mut() {
+            match config.field {
+                ConfigField::Secrets => config.secrets.push(c),
+                ConfigField::BaseUrl => config.base_url.push(c),
+                ConfigField::Model => config.model.push(c),
+                ConfigField::Api => config.api.push(c),
+                ConfigField::ApiKey => config.api_key.push(c),
+            }
         }
     }
 
     pub fn edit_backspace(&mut self) {
         if let Some(e) = self.edit.as_mut() {
             focused_field_mut(e).pop();
+        } else if let Some(a) = self.add.as_mut() {
+            match a.field {
+                AddField::Id => {
+                    a.id.pop();
+                }
+                AddField::BaseUrl => {
+                    a.base_url.pop();
+                }
+                AddField::Model => {
+                    a.model.pop();
+                }
+                AddField::ApiKey => {
+                    a.api_key.pop();
+                }
+                AddField::Protocol => {
+                    a.protocol.pop();
+                }
+                AddField::Official => {}
+            }
+        } else if let Some(config) = self.config_edit.as_mut() {
+            match config.field {
+                ConfigField::Secrets => {
+                    config.secrets.pop();
+                }
+                ConfigField::BaseUrl => {
+                    config.base_url.pop();
+                }
+                ConfigField::Model => {
+                    config.model.pop();
+                }
+                ConfigField::Api => {
+                    config.api.pop();
+                }
+                ConfigField::ApiKey => {
+                    config.api_key.pop();
+                }
+            }
         }
     }
 
@@ -293,6 +447,23 @@ impl App {
                 EditField::BaseUrl => EditField::Model,
                 EditField::Model => EditField::ApiKey,
                 EditField::ApiKey => EditField::BaseUrl,
+            };
+        } else if let Some(a) = self.add.as_mut() {
+            a.field = match a.field {
+                AddField::Id => AddField::BaseUrl,
+                AddField::BaseUrl => AddField::Model,
+                AddField::Model => AddField::ApiKey,
+                AddField::ApiKey => AddField::Protocol,
+                AddField::Protocol => AddField::Official,
+                AddField::Official => AddField::Id,
+            };
+        } else if let Some(config) = self.config_edit.as_mut() {
+            config.field = match config.field {
+                ConfigField::Secrets => ConfigField::BaseUrl,
+                ConfigField::BaseUrl => ConfigField::Model,
+                ConfigField::Model => ConfigField::Api,
+                ConfigField::Api => ConfigField::ApiKey,
+                ConfigField::ApiKey => ConfigField::Secrets,
             };
         }
     }
@@ -304,11 +475,174 @@ impl App {
                 EditField::Model => EditField::BaseUrl,
                 EditField::ApiKey => EditField::Model,
             };
+        } else if let Some(a) = self.add.as_mut() {
+            a.field = match a.field {
+                AddField::Id => AddField::Official,
+                AddField::BaseUrl => AddField::Id,
+                AddField::Model => AddField::BaseUrl,
+                AddField::ApiKey => AddField::Model,
+                AddField::Protocol => AddField::ApiKey,
+                AddField::Official => AddField::Protocol,
+            };
+        } else if let Some(config) = self.config_edit.as_mut() {
+            config.field = match config.field {
+                ConfigField::Secrets => ConfigField::ApiKey,
+                ConfigField::BaseUrl => ConfigField::Secrets,
+                ConfigField::Model => ConfigField::BaseUrl,
+                ConfigField::Api => ConfigField::Model,
+                ConfigField::ApiKey => ConfigField::Api,
+            };
         }
     }
 
     pub fn cancel_edit(&mut self) {
         self.edit = None;
+        self.add = None;
+        self.config_edit = None;
+    }
+
+    pub fn submit_input(&mut self, core: &Core) {
+        if self.edit.is_some() {
+            self.submit_edit(core);
+        } else if self.add.is_some() {
+            self.submit_add(core);
+        } else if self.config_edit.is_some() {
+            self.submit_config(core);
+        }
+    }
+
+    fn submit_add(&mut self, core: &Core) {
+        let Some(add) = self.add.take() else {
+            return;
+        };
+        let protocol = if add.protocol.trim().is_empty() {
+            None
+        } else {
+            match add.protocol.trim().parse::<ProviderProtocol>() {
+                Ok(protocol) => Some(protocol),
+                Err(error) => {
+                    self.message = Some(format!("Error: {error}"));
+                    self.add = Some(add);
+                    return;
+                }
+            }
+        };
+        let requested_url = Some(add.base_url.as_str()).filter(|u| !u.trim().is_empty());
+        // An empty URL with no global default would silently create an
+        // official-login provider; require that to be an explicit choice.
+        if !add.official && core.effective_base_url(requested_url, false).is_none() {
+            self.message = Some("Error: Base URL required (or tick Official)".into());
+            self.add = Some(add);
+            return;
+        }
+        let extra = if add.model.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!({ "model": add.model.trim() })
+        };
+        let input = AddProviderInput {
+            id: add.id.trim().to_string(),
+            tool: self.tool,
+            base_url: requested_url.map(|u| u.trim().to_string()),
+            api_key: Some(add.api_key.trim().to_string()).filter(|k| !k.is_empty()),
+            protocol,
+            extra,
+            official: add.official,
+            overwrite: false,
+        };
+        match core.add_provider_from_input(input) {
+            Ok(provider) => {
+                self.message = Some(format!("Added {}", provider.id));
+                self.reload(core);
+                if let Some(pos) = self.providers.iter().position(|p| p.id == provider.id) {
+                    self.selected = pos;
+                }
+            }
+            Err(error) => {
+                // Keep the form (and what was typed) so the user can fix it.
+                self.message = Some(format!("Error: {error}"));
+                self.add = Some(add);
+            }
+        }
+    }
+
+    fn submit_config(&mut self, core: &Core) {
+        let Some(config) = self.config_edit.take() else {
+            return;
+        };
+        let requested_backend = match config.secrets.trim().parse::<SecretsBackend>() {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.message = Some(format!("Error: {error}"));
+                self.config_edit = Some(config);
+                return;
+            }
+        };
+        if requested_backend != config.active_secrets && !config.api_key.trim().is_empty() {
+            self.message = Some(
+                "Error: backend change pending; save, restart xfade, then set the API key".into(),
+            );
+            self.config_edit = Some(config);
+            return;
+        }
+        let result = core.update_config(
+            Some(config.secrets.trim()),
+            Some(config.base_url.trim()),
+            Some(config.model.trim()),
+            Some(config.api.trim()),
+        );
+        if let Err(error) = result {
+            self.message = Some(format!("Error: {error}"));
+            self.config_edit = Some(config);
+            return;
+        }
+        if !config.api_key.trim().is_empty() {
+            if let Err(error) = core.set_global_api_key(config.api_key.trim()) {
+                self.message = Some(format!("Settings saved, but API key failed: {error}"));
+                return;
+            }
+        }
+        self.message = Some(if requested_backend != config.active_secrets {
+            "Saved global defaults; secrets backend changes after restart".into()
+        } else {
+            "Saved global defaults".into()
+        });
+    }
+
+    pub fn request_delete(&mut self) {
+        let Some((id, is_active)) = self
+            .selected_provider()
+            .map(|provider| (provider.id.clone(), provider.is_active))
+        else {
+            return;
+        };
+        if is_active {
+            self.message = Some("Error: the active provider cannot be removed".into());
+            return;
+        }
+        self.delete_confirm = Some(id.clone());
+        self.message = Some(format!("Remove {id}? [y/N]"));
+    }
+
+    pub fn confirm_delete(&mut self, core: &Core, confirmed: bool) {
+        let Some(id) = self.delete_confirm.take() else {
+            return;
+        };
+        if confirmed {
+            self.message = Some(match core.remove(self.tool, &id) {
+                Ok(()) => {
+                    // Drop stale probe state so a re-added id doesn't show an
+                    // old latency badge.
+                    self.probes.remove(&id);
+                    self.probing.remove(&id);
+                    format!("Removed {id}")
+                }
+                Err(error) => format!("Error: {error}"),
+            });
+            self.reload(core);
+        } else {
+            self.message = Some("Removal cancelled".into());
+        }
     }
 
     pub fn submit_edit(&mut self, core: &Core) {
@@ -920,6 +1254,189 @@ mod tests {
             written.contains("new:8080"),
             "active provider's live config must be re-applied, got: {written}"
         );
+    }
+
+    #[test]
+    fn submit_add_uses_shared_global_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.update_config(
+            None,
+            Some("https://global.example"),
+            Some("global-model"),
+            None,
+        )
+        .unwrap();
+        core.set_global_api_key("sk-global").unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+
+        app.start_add(&core);
+        {
+            let add = app.add.as_mut().unwrap();
+            add.id = "shared".into();
+            // Blank values exercise the shared Core defaults rather than
+            // merely persisting the values prefilled by start_add.
+            add.base_url.clear();
+            add.model.clear();
+        }
+        app.submit_input(&core);
+
+        let provider = app
+            .providers
+            .iter()
+            .find(|provider| provider.id == "shared")
+            .unwrap();
+        assert_eq!(provider.base_url.as_deref(), Some("https://global.example"));
+        assert_eq!(provider.extra["model"], "global-model");
+        assert_eq!(core.secrets().get(&provider.key_ref).unwrap(), "sk-global");
+    }
+
+    #[test]
+    fn start_add_leaves_fields_blank_and_keeps_global_as_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.update_config(None, Some("https://g.example"), Some("g-model"), None)
+            .unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        let add = app.add.as_ref().unwrap();
+        assert!(add.base_url.is_empty() && add.model.is_empty());
+        assert_eq!(add.global_base_url.as_deref(), Some("https://g.example"));
+        assert_eq!(add.global_model.as_deref(), Some("g-model"));
+    }
+
+    #[test]
+    fn submit_add_blank_url_without_global_requires_official() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        app.add.as_mut().unwrap().id = "x".into();
+        app.submit_input(&core);
+        assert!(app.is_adding(), "form must stay open so input isn't lost");
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("Base URL required"));
+        assert!(core.list(Some(ToolKind::ClaudeCode)).unwrap().is_empty());
+
+        app.add.as_mut().unwrap().official = true;
+        app.submit_input(&core);
+        assert!(!app.is_adding());
+        assert!(app.providers[0].is_official());
+    }
+
+    #[test]
+    fn submit_add_duplicate_id_keeps_existing_and_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        {
+            let add = app.add.as_mut().unwrap();
+            add.id = "a".into();
+            add.base_url = "http://other".into();
+            add.api_key = "sk-new".into();
+        }
+        app.submit_input(&core);
+        assert!(app.is_adding());
+        assert!(app.message.as_deref().unwrap().contains("already exists"));
+        assert_eq!(app.providers[0].base_url.as_deref(), Some("http://x"));
+        assert_eq!(core.secrets().get("xfade/claude/a").unwrap(), "sk-test");
+    }
+
+    #[test]
+    fn submit_add_selects_the_new_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_add(&core);
+        {
+            let add = app.add.as_mut().unwrap();
+            add.id = "z".into();
+            add.base_url = "http://z".into();
+            add.api_key = "sk".into();
+        }
+        app.submit_input(&core);
+        assert_eq!(app.selected_provider().map(|p| p.id.as_str()), Some("z"));
+    }
+
+    #[test]
+    fn pending_backend_switch_refuses_global_key_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        // test_core injects a store, so "active" falls back to the config value
+        // (keyring). Asking for a different backend therefore models the
+        // pending-switch state: a key must not be written to the old store.
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+        let active = app.config_edit.as_ref().unwrap().active_secrets;
+        assert_eq!(active, SecretsBackend::Keyring);
+        {
+            let c = app.config_edit.as_mut().unwrap();
+            c.secrets = "file".into();
+            c.api_key = "sk-would-go-to-old-store".into();
+        }
+        app.submit_input(&core);
+        assert!(app.is_configuring(), "form must stay open");
+        assert!(app.message.as_deref().unwrap().contains("backend change"));
+        assert!(core.global_api_key().is_none());
+        assert_eq!(core.config().secrets, SecretsBackend::Keyring);
+    }
+
+    #[test]
+    fn delete_clears_stale_probe_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "gone", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.probes.insert("gone".into(), ProbeResult::Ms(5));
+        app.request_delete();
+        app.confirm_delete(&core, true);
+        assert!(!app.probes.contains_key("gone"));
+    }
+
+    #[test]
+    fn submit_global_config_updates_cli_visible_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_config(&core);
+        {
+            let config = app.config_edit.as_mut().unwrap();
+            config.base_url = "https://gateway.example".into();
+            config.model = "model-x".into();
+            config.api = "anthropic-messages".into();
+            config.api_key = "sk-shared".into();
+        }
+        app.submit_input(&core);
+
+        let config = core.config();
+        assert_eq!(config.base_url.as_deref(), Some("https://gateway.example"));
+        assert_eq!(config.model.as_deref(), Some("model-x"));
+        assert_eq!(config.api.as_deref(), Some("anthropic-messages"));
+        assert_eq!(core.global_api_key().as_deref(), Some("sk-shared"));
+    }
+
+    #[test]
+    fn delete_requires_confirmation_and_removes_non_active_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "unused", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+
+        app.request_delete();
+        assert_eq!(app.delete_confirm.as_deref(), Some("unused"));
+        assert!(core
+            .list(Some(ToolKind::ClaudeCode))
+            .unwrap()
+            .iter()
+            .any(|provider| provider.id == "unused"));
+        app.confirm_delete(&core, true);
+        assert!(app.providers.is_empty());
     }
 
     #[test]

@@ -2,6 +2,24 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.12.2 — 2026-11-23
+
+### TUI Provider & Global Defaults Management
+- **feat(tui)**: Provider lifecycle without leaving the TUI — `a` add, `e` edit, `d` remove (with `[y/N]` confirmation; Enter cancels). The empty-list hint now points at `a` instead of sending users to the CLI.
+- **feat(tui)**: `g` opens the global defaults form (secrets backend, base URL, model, API type, global API key), mirroring `xfade config`. Values are creation-time defaults copied into new providers; they are not dynamically inherited by existing ones.
+- **feat(tui)**: Add form shows global defaults as dimmed `(blank = global: …)` placeholders instead of prefilled text, supports `Protocol` and an explicit `Official` toggle, and selects the new provider on success.
+- **fix(tui)**: Forms scroll to keep the focused field visible on short terminals; footer hints fit 80 columns.
+
+### Shared Provider Creation (Core)
+- **refactor(core)**: `Core::add_provider_from_input` / `AddProviderInput` centralize global-default rules (base URL, model, API type, API key) so CLI and TUI create providers identically. `Core::effective_base_url` exposes the resolution for callers that must know whether a key is needed.
+- **fix(core)**: Official providers no longer inherit the global model/API type; base URL and API key input is trimmed, and whitespace-only keys fall back to the global key.
+- **feat(core)**: `AddProviderInput.overwrite` — the TUI rejects an existing `(tool, id)` rather than silently replacing its key and extras; `xfade add` keeps its historical upsert behavior.
+- **fix(security)**: `Core::active_secrets_backend()` reports the backend the process actually resolved. After switching `secrets` in the TUI, entering a global API key is refused until restart so it can't be written to the old store.
+- **fix(cli)**: Interactive `xfade add` again prompts for the API key instead of silently reusing the global key; the global key fallback applies to non-interactive adds only.
+
+### Dependencies
+- **fix(deps)**: Bump `url` 2.5.8 → 2.5.9 (and `form_urlencoded` 1.2.3) for RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).
+
 ## v0.12.1 — 2026-11-22
 
 ### CLI Ergonomics & Command Grouping

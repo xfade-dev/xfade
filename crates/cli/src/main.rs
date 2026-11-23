@@ -5,7 +5,8 @@ use xfade_core::proxy::circuit_breaker::CircuitState;
 use xfade_core::proxy::ProxyService;
 use xfade_core::store::db::StatsGroupBy;
 use xfade_core::{
-    presets::presets_for, Config, Core, CoreError, Provider, ProviderProtocol, ToolKind,
+    presets::presets_for, AddProviderInput, Config, Core, CoreError, Provider, ProviderProtocol,
+    ToolKind,
 };
 
 mod daemon;
@@ -2265,8 +2266,6 @@ fn cmd_add(
     slots: PerSlotModels,
 ) -> Result<(), CoreError> {
     let core = build_core()?;
-    let global = core.config();
-    let global_key = core.global_api_key();
     let interactive = name.is_none();
 
     let tool = match tool {
@@ -2282,7 +2281,7 @@ fn cmd_add(
         }
     };
 
-    let (name, mut base_url, mut extra) = match name {
+    let (name, base_url, mut extra) = match name {
         Some(n) => (n, base_url, serde_json::Value::Null),
         None => {
             let presets = presets_for(tool);
@@ -2313,23 +2312,20 @@ fn cmd_add(
         }
     };
 
-    // Non-interactive global defaults: --official wins, then a missing base_url
-    // falls back to the global base_url.
-    if !interactive {
-        if official {
-            base_url = None;
-        } else if base_url.is_none() {
-            base_url = global.base_url.clone();
-        }
-    }
-
-    let key = if base_url.is_none() {
+    // `--official` (or an interactive pick with no URL, i.e. an official
+    // preset) is explicit and must not be replaced by the global base URL.
+    // Non-interactive adds with no URL fall back to the global default.
+    let force_official = official || (interactive && base_url.is_none());
+    let effective_base_url = core.effective_base_url(base_url.as_deref(), force_official);
+    let key = if effective_base_url.is_none() {
         None
     } else {
         Some(match key {
             Some(k) => k,
             // Non-interactive: fall back to the global API key when --key is omitted.
-            None if !interactive && global_key.is_some() => global_key.clone().unwrap(),
+            None if !interactive && core.global_api_key().is_some() => {
+                core.global_api_key().unwrap_or_default()
+            }
             None => dialoguer::Password::new()
                 .with_prompt("API Key")
                 .interact()
@@ -2345,36 +2341,25 @@ fn cmd_add(
     for (k, v) in slots.entries(tool)? {
         map.insert(k, v);
     }
-    let has_per_slot = map.contains_key("opus_model")
-        || map.contains_key("sonnet_model")
-        || map.contains_key("haiku_model");
-    // Non-interactive: global default model applies when the provider didn't set
-    // one (and isn't in per-slot mode, where the single model is ignored).
-    if !interactive && !map.contains_key("model") && !has_per_slot {
-        if let Some(m) = &global.model {
-            map.insert("model".to_string(), serde_json::Value::String(m.clone()));
-        }
-    }
-    // Non-interactive: global default api type (Pi/OMP) applies when not set.
-    if !interactive && !map.contains_key("api") {
-        if let Some(a) = &global.api {
-            map.insert("api".to_string(), serde_json::Value::String(a.clone()));
-        }
-    }
     if !map.is_empty() {
         extra = serde_json::Value::Object(map);
     }
 
-    let mut p = Provider::new(&name, tool, base_url);
-    if let Some(proto) = protocol {
-        p.protocol = proto;
-    }
-    p.extra = extra;
+    let p = core.add_provider_from_input(AddProviderInput {
+        id: name.clone(),
+        tool,
+        base_url,
+        api_key: key,
+        protocol,
+        extra,
+        official: force_official,
+        // `xfade add` has always upserted; keep that for scripts.
+        overwrite: true,
+    })?;
     let official = p.is_official();
-    core.add_provider(p, key.as_deref())?;
-    println!("added {tool}/{name}");
+    println!("added {tool}/{}", p.id);
     if !official {
-        println!("run `xfade use {name} --tool {tool}` to switch");
+        println!("run `xfade use {} --tool {tool}` to switch", p.id);
     }
     Ok(())
 }

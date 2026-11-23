@@ -18,6 +18,6 @@ pub mod store;
 
 pub use error::{CoreError, Result};
 pub use models::{Provider, ProviderProtocol, ToolKind};
-pub use service::Core;
+pub use service::{AddProviderInput, Core};
 pub use store::config::{Config, SecretsBackend};
 pub use store::secrets::{FileStore, KeyringStore, SecretStore};

@@ -18,8 +18,8 @@ use app::{probe_latency, probe_target, App};
 /// Run the interactive TUI for a given tool.
 ///
 /// Keys (list mode): j/k or arrows to move, Enter to switch, `t` to probe the
-/// selected provider's latency, `e` to edit it, Tab to cycle tools, q or
-/// Ctrl+C to quit.
+/// selected provider's latency, `a`/`e`/`d` to add/edit/remove it, `g` for
+/// global defaults, Tab to cycle tools, q or Ctrl+C to quit.
 ///
 /// Non-TTY degradation: when stdin/stdout is not a terminal (pipes, CI,
 /// redirect), print the plain provider list instead of failing inside
@@ -193,11 +193,23 @@ fn event_loop(
             break;
         }
 
-        if app.is_editing() {
+        if app.delete_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(core, true),
+                // Enter takes the [y/N] default, which is No.
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                    app.confirm_delete(core, false)
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.is_input_mode() {
             match key.code {
                 KeyCode::Esc => app.cancel_edit(),
                 KeyCode::Enter => {
-                    app.submit_edit(core);
+                    app.submit_input(core);
                     stats = load_stats(core, &app.tool);
                 }
                 KeyCode::Tab | KeyCode::Down => app.edit_next_field(),
@@ -226,6 +238,9 @@ fn event_loop(
                 stats = load_stats(core, &app.tool);
             }
             KeyCode::Char('e') => app.start_edit(),
+            KeyCode::Char('a') => app.start_add(core),
+            KeyCode::Char('g') => app.start_config(core),
+            KeyCode::Char('d') => app.request_delete(),
             KeyCode::Char('t') => {
                 if !app.probing.is_empty() {
                     app.message = Some("probe already running…".into());

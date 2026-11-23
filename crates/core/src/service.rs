@@ -1,12 +1,32 @@
 use crate::adapters::{adapter_for, ToolAdapter};
 use crate::backup::{backup_file, list_backups, restore};
 use crate::error::{CoreError, Result};
-use crate::models::{Provider, ToolKind};
+use crate::models::{Provider, ProviderProtocol, ToolKind};
 use crate::store::config::{Config, SecretsBackend, GLOBAL_API_KEY_REF};
 use crate::store::db::Database;
 use crate::store::secrets::{FileStore, KeyringStore, SecretStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Shared input for creating providers from interactive application surfaces.
+///
+/// Missing values use the global configuration as creation-time defaults.
+/// `official` always wins over a global `base_url` and also skips the global
+/// model/api defaults, which only make sense for third-party endpoints.
+#[derive(Debug, Clone)]
+pub struct AddProviderInput {
+    pub id: String,
+    pub tool: ToolKind,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub protocol: Option<ProviderProtocol>,
+    pub extra: serde_json::Value,
+    pub official: bool,
+    /// When false, an existing `(tool, id)` is an error instead of being
+    /// silently replaced (which would drop its key, extras and live config).
+    /// The CLI keeps the historical upsert behavior by passing true.
+    pub overwrite: bool,
+}
 
 /// Resolve the secrets backend: the env var overrides the global config file,
 /// which overrides the default (keyring).
@@ -26,6 +46,10 @@ pub struct Core {
     secrets: Arc<dyn SecretStore>,
     home: PathBuf,
     data_dir: PathBuf,
+    /// Secrets backend this instance actually resolved at construction
+    /// (`XFADE_SECRETS` > `config.json` > default). `None` when the store was
+    /// injected via `with_paths`, where no backend was resolved.
+    active_secrets: Option<SecretsBackend>,
 }
 
 impl Core {
@@ -43,6 +67,7 @@ impl Core {
             secrets,
             home: home.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
+            active_secrets: None,
         };
         #[cfg(unix)]
         {
@@ -142,13 +167,22 @@ impl Core {
         let data = std::env::var_os("XFADE_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config").join("xfade"));
-        let use_file = resolve_secrets_backend(&data)? == SecretsBackend::File;
-        let secrets: Arc<dyn SecretStore> = if use_file {
+        let backend = resolve_secrets_backend(&data)?;
+        let secrets: Arc<dyn SecretStore> = if backend == SecretsBackend::File {
             Arc::new(FileStore::new(data.join("secrets.json")))
         } else {
             Arc::new(KeyringStore::new())
         };
-        Self::with_paths(home, &data, secrets)
+        let mut core = Self::with_paths(home, &data, secrets)?;
+        core.active_secrets = Some(backend);
+        Ok(core)
+    }
+
+    /// The secrets backend this instance is really using, which can differ
+    /// from `config.json` after `xfade config set secrets` (applies on restart)
+    /// or when `XFADE_SECRETS` overrides it. `None` for injected stores.
+    pub fn active_secrets_backend(&self) -> Option<SecretsBackend> {
+        self.active_secrets
     }
 
     pub fn home(&self) -> &Path {
@@ -221,6 +255,96 @@ impl Core {
         }
         provider.is_active = false;
         self.db.upsert(&provider)
+    }
+
+    /// Resolve the base URL a new provider gets: `official` forces `None`,
+    /// otherwise a non-blank requested URL wins over the global default.
+    /// Shared with callers that must know up front whether a key is needed.
+    pub fn effective_base_url(&self, requested: Option<&str>, official: bool) -> Option<String> {
+        if official {
+            return None;
+        }
+        requested
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.config()
+                    .base_url
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty())
+            })
+    }
+
+    /// Create a provider using shared global-default rules.
+    ///
+    /// Global values are copied into the provider at creation time; existing
+    /// providers do not dynamically inherit later global-config changes.
+    pub fn add_provider_from_input(&self, input: AddProviderInput) -> Result<Provider> {
+        let id = input.id.trim();
+        if id.is_empty() {
+            return Err(CoreError::ConfigParse {
+                path: "provider.id".into(),
+                msg: "provider id cannot be empty".into(),
+            });
+        }
+        if !input.overwrite && self.db.get(input.tool, id)?.is_some() {
+            return Err(CoreError::ConfigParse {
+                path: "provider.id".into(),
+                msg: format!(
+                    "{}/{id} already exists; edit it instead of adding it again",
+                    input.tool
+                ),
+            });
+        }
+
+        let config = self.config();
+        let base_url = self.effective_base_url(input.base_url.as_deref(), input.official);
+
+        let mut extra = input.extra.as_object().cloned().unwrap_or_default();
+        // Global model/api only apply to third-party endpoints; an official
+        // login provider must not inherit them.
+        if !input.official {
+            let has_per_slot = extra.contains_key("opus_model")
+                || extra.contains_key("sonnet_model")
+                || extra.contains_key("haiku_model");
+            if !extra.contains_key("model") && !has_per_slot {
+                if let Some(model) = config.model.filter(|m| !m.trim().is_empty()) {
+                    extra.insert("model".into(), serde_json::Value::String(model));
+                }
+            }
+            if !extra.contains_key("api") {
+                if let Some(api) = config.api.filter(|a| !a.trim().is_empty()) {
+                    extra.insert("api".into(), serde_json::Value::String(api));
+                }
+            }
+        }
+
+        let api_key = if base_url.is_none() {
+            None
+        } else {
+            input
+                .api_key
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .or_else(|| self.global_api_key())
+        };
+        if base_url.is_some() && api_key.is_none() {
+            return Err(CoreError::MissingApiKey(format!(
+                "provider '{}/{}' needs an API key; enter one or set the global api_key",
+                input.tool, id
+            )));
+        }
+
+        let mut provider = Provider::new(id, input.tool, base_url);
+        if let Some(protocol) = input.protocol {
+            provider.protocol = protocol;
+        }
+        if !extra.is_empty() {
+            provider.extra = serde_json::Value::Object(extra);
+        }
+        self.add_provider(provider.clone(), api_key.as_deref())?;
+        Ok(provider)
     }
 
     /// Read the global API key (shared default for all tools), if set.
@@ -604,6 +728,129 @@ mod tests {
         let data = dir.path().join("data");
         let core = Core::with_paths(&home, &data, Arc::new(MockStore::default())).unwrap();
         (dir, core)
+    }
+
+    fn input(id: &str) -> AddProviderInput {
+        AddProviderInput {
+            id: id.into(),
+            tool: ToolKind::ClaudeCode,
+            base_url: None,
+            api_key: None,
+            protocol: None,
+            extra: serde_json::Value::Null,
+            official: false,
+            overwrite: false,
+        }
+    }
+
+    #[test]
+    fn add_from_input_applies_global_defaults_and_trims() {
+        let (_dir, core) = setup();
+        core.update_config(None, Some(" https://g.example "), Some("g-model"), None)
+            .unwrap();
+        core.set_global_api_key("sk-global").unwrap();
+
+        let p = core.add_provider_from_input(input("  a  ")).unwrap();
+        assert_eq!(p.id, "a");
+        assert_eq!(p.base_url.as_deref(), Some("https://g.example"));
+        assert_eq!(p.extra["model"], "g-model");
+        assert_eq!(core.secrets().get(&p.key_ref).unwrap(), "sk-global");
+
+        // Explicit values win and are trimmed; whitespace-only key falls back.
+        let mut i = input("b");
+        i.base_url = Some("  https://own.example ".into());
+        i.api_key = Some("   ".into());
+        i.extra = json!({"model": "own-model"});
+        let p = core.add_provider_from_input(i).unwrap();
+        assert_eq!(p.base_url.as_deref(), Some("https://own.example"));
+        assert_eq!(p.extra["model"], "own-model");
+        assert_eq!(core.secrets().get(&p.key_ref).unwrap(), "sk-global");
+    }
+
+    #[test]
+    fn add_from_input_official_skips_global_url_model_and_key() {
+        let (_dir, core) = setup();
+        core.update_config(
+            None,
+            Some("https://g.example"),
+            Some("g-model"),
+            Some("openai-completions"),
+        )
+        .unwrap();
+        core.set_global_api_key("sk-global").unwrap();
+
+        let mut i = input("off");
+        i.official = true;
+        let p = core.add_provider_from_input(i).unwrap();
+        assert!(p.is_official());
+        assert!(p.extra.is_null(), "official must not inherit model/api");
+        assert!(core.secrets().get(&p.key_ref).is_err(), "no key stored");
+    }
+
+    #[test]
+    fn add_from_input_requires_key_for_third_party() {
+        let (_dir, core) = setup();
+        let mut i = input("x");
+        i.base_url = Some("https://x.example".into());
+        let err = core.add_provider_from_input(i).unwrap_err();
+        assert!(matches!(err, CoreError::MissingApiKey(_)), "{err}");
+        assert!(core.list(Some(ToolKind::ClaudeCode)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_from_input_rejects_blank_id() {
+        let (_dir, core) = setup();
+        assert!(core.add_provider_from_input(input("   ")).is_err());
+    }
+
+    #[test]
+    fn add_from_input_duplicate_errors_unless_overwrite() {
+        let (_dir, core) = setup();
+        let mut first = input("dup");
+        first.base_url = Some("https://one.example".into());
+        first.api_key = Some("sk-one".into());
+        core.add_provider_from_input(first).unwrap();
+
+        let mut again = input("dup");
+        again.base_url = Some("https://two.example".into());
+        again.api_key = Some("sk-two".into());
+        let err = core.add_provider_from_input(again.clone()).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let kept = core.list(Some(ToolKind::ClaudeCode)).unwrap();
+        assert_eq!(kept[0].base_url.as_deref(), Some("https://one.example"));
+        assert_eq!(core.secrets().get(&kept[0].key_ref).unwrap(), "sk-one");
+
+        again.overwrite = true;
+        core.add_provider_from_input(again).unwrap();
+        let replaced = core.list(Some(ToolKind::ClaudeCode)).unwrap();
+        assert_eq!(replaced[0].base_url.as_deref(), Some("https://two.example"));
+    }
+
+    #[test]
+    fn effective_base_url_prefers_requested_then_global() {
+        let (_dir, core) = setup();
+        assert_eq!(core.effective_base_url(None, false), None);
+        core.update_config(None, Some("https://g.example"), None, None)
+            .unwrap();
+        assert_eq!(
+            core.effective_base_url(Some("  "), false).as_deref(),
+            Some("https://g.example")
+        );
+        assert_eq!(
+            core.effective_base_url(Some(" https://r.example "), false)
+                .as_deref(),
+            Some("https://r.example")
+        );
+        assert_eq!(
+            core.effective_base_url(Some("https://r.example"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn injected_store_has_no_resolved_backend() {
+        let (_dir, core) = setup();
+        assert_eq!(core.active_secrets_backend(), None);
     }
 
     #[test]
