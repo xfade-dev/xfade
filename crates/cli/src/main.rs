@@ -395,6 +395,8 @@ enum ServeCmd {
     Stop,
     /// Query daemon status
     Status,
+    /// Restart the running daemon (macOS: launchctl kickstart; Linux: systemd --user restart)
+    Restart,
 }
 
 #[derive(Subcommand)]
@@ -985,6 +987,11 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 println!("uninstalled daemon");
                 Ok(())
             }
+            Some(ServeCmd::Restart) => {
+                xfade_core::daemon::restart()?;
+                println!("restarted daemon (label {})", xfade_core::daemon::LABEL);
+                Ok(())
+            }
             Some(ServeCmd::Status) => {
                 let home =
                     std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
@@ -1327,9 +1334,34 @@ fn expected_sha256(sums: &str, asset: &str) -> Option<String> {
     })
 }
 
+/// Whether `exe` is managed by Homebrew rather than a self-updateable install.
+/// Homebrew installs are symlinks into `<prefix>/Cellar/...`; replacing them in
+/// place breaks `brew`'s view of the package, so `self-update` must refuse.
+fn is_homebrew_install(exe: &std::path::Path) -> bool {
+    let raw = exe.to_string_lossy();
+    if raw.starts_with("/opt/homebrew/") || raw.starts_with("/usr/local/") {
+        return true;
+    }
+    // Resolve the symlink target (e.g. /opt/homebrew/bin/xfade -> .../Cellar/...).
+    exe.canonicalize()
+        .map(|c| c.to_string_lossy().contains("/Cellar/"))
+        .unwrap_or(false)
+}
+
 /// Update xfade to the latest GitHub release: query the latest tag, download the
 /// matching platform asset, extract it with system `tar`, and swap the running binary.
 fn self_update() -> Result<(), CoreError> {
+    // A Homebrew-managed binary must be upgraded through brew, not overwritten
+    // in place; doing so breaks the Cellar link and leaves the package stale.
+    if let Ok(exe) = std::env::current_exe() {
+        if is_homebrew_install(&exe) {
+            return Err(CoreError::Proxy(format!(
+                "{} is managed by Homebrew; run `brew update && brew upgrade xfade` instead of self-update",
+                exe.display()
+            )));
+        }
+    }
+
     let target = host_target();
     let asset = format!("xfade-{target}.tar.gz");
     let current = env!("CARGO_PKG_VERSION");
@@ -1694,6 +1726,53 @@ fn cmd_doctor(core: &Core, fix: bool) -> Result<(), CoreError> {
     if report.overall_trust == xfade_core::security::TrustState::Exposed && !fix {
         println!();
         println!("Hint: Run `xfade doctor --security --fix` to automatically remediate permissions and sanitize configs.");
+    }
+
+    println!();
+    println!("Install & Runtime Health:");
+    match std::env::current_exe() {
+        Ok(exe) if is_homebrew_install(&exe) => {
+            println!(
+                "  [WARN] binary {} is Homebrew-managed; use `brew upgrade xfade`, not `xfade self-update`",
+                exe.display()
+            );
+        }
+        Ok(exe) => {
+            println!("  [PASS] binary {} is not Homebrew-managed", exe.display());
+        }
+        Err(_) => {
+            println!("  [WARN] could not resolve the current executable path");
+        }
+    }
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let mut daemon_checked = false;
+    if let Ok(home) = std::env::var("HOME") {
+        let dd = xfade_core::daemon::data_dir(std::path::Path::new(&home));
+        if let Some(cfg) = xfade_core::daemon::read(&dd) {
+            daemon_checked = true;
+            match xfade_core::daemon_spawner::probe_version(
+                cfg.port,
+                std::time::Duration::from_millis(300),
+            ) {
+                Some(v) if v == cli_version => {
+                    println!("  [PASS] daemon v{v} matches CLI v{cli_version}");
+                }
+                Some(v) => {
+                    println!(
+                        "  [WARN] daemon v{v} != CLI v{cli_version}; run `xfade serve restart`"
+                    );
+                }
+                None => {
+                    println!(
+                        "  [WARN] daemon on port {} did not report a version (older build); run `xfade serve restart`",
+                        cfg.port
+                    );
+                }
+            }
+        }
+    }
+    if !daemon_checked {
+        println!("  [INFO] daemon not installed (no daemon.json); nothing to compare");
     }
 
     Ok(())

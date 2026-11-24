@@ -191,6 +191,7 @@ xfade proxy use <p1> <p2> [--model M]     # setup failover cascade
 xfade proxy smart on|off                  # Smart Fader intent routing
 xfade stats [--by provider|model|session] # token and USD cost statistics
 xfade serve install|uninstall             # launchd / systemd background service
+xfade serve restart                        # restart the daemon (pick up a new build)
 ```
 
 ---

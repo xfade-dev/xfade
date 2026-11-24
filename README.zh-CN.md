@@ -192,6 +192,7 @@ xfade proxy use <p1> <p2> [--model M]     # 设置多上游故障转移级联链
 xfade proxy smart on|off                  # Smart Fader 任务意图自适应路由
 xfade stats [--by provider|model|session] # 查看 Token 统计与美元支出
 xfade serve install|uninstall             # 安装/卸载 launchd 或 systemd 开机守护进程
+xfade serve restart                        # 重启守护进程（升级后让新二进制生效）
 ```
 
 ---

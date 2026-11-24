@@ -18,14 +18,57 @@ pub enum ProbeResult {
 /// - `ProbeResult::Conflict` if the port is open but does not return the xfade fingerprint.
 /// - `ProbeResult::Unreachable` if connection was refused or could not be established.
 pub fn probe_health(port: u16, timeout: Duration) -> ProbeResult {
+    match raw_get_health(port, timeout) {
+        RawHealth::Unreachable => ProbeResult::Unreachable,
+        RawHealth::Response(resp)
+            if resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200") =>
+        {
+            if resp.contains("\"app\":\"xfade\"") || resp.contains("\"app\": \"xfade\"") {
+                ProbeResult::Healthy
+            } else {
+                ProbeResult::Conflict
+            }
+        }
+        RawHealth::Response(_) => ProbeResult::Conflict,
+    }
+}
+
+/// Fetch `GET /health` and return the daemon's reported `version`, if the
+/// response is a 200 with a parseable `version` field. Older daemons that
+/// predate the field yield `None` (treated as "unknown/out of date").
+pub fn probe_version(port: u16, timeout: Duration) -> Option<String> {
+    let resp = match raw_get_health(port, timeout) {
+        RawHealth::Response(resp) => resp,
+        RawHealth::Unreachable => return None,
+    };
+    let key = "\"version\"";
+    let idx = resp.find(key)?;
+    let after = &resp[idx + key.len()..];
+    let colon = after.find(':')?;
+    let after_colon = after[colon + 1..].trim_start();
+    let s = after_colon.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(s[..end].to_string())
+}
+
+/// Outcome of a raw `GET /health`: either the port refused the connection
+/// (Unreachable) or we received *some* response text (parse/verify elsewhere).
+enum RawHealth {
+    Unreachable,
+    Response(String),
+}
+
+/// Raw `GET /health` over a blocking TCP socket. Shared by `probe_health` and
+/// `probe_version` so both agree on the exact request shape.
+fn raw_get_health(port: u16, timeout: Duration) -> RawHealth {
     let addr: SocketAddr = match format!("127.0.0.1:{port}").parse() {
         Ok(a) => a,
-        Err(_) => return ProbeResult::Unreachable,
+        Err(_) => return RawHealth::Unreachable,
     };
 
     let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
-        Err(_) => return ProbeResult::Unreachable,
+        Err(_) => return RawHealth::Unreachable,
     };
 
     let _ = stream.set_nonblocking(false);
@@ -35,7 +78,7 @@ pub fn probe_health(port: u16, timeout: Duration) -> ProbeResult {
     let req =
         format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
-        return ProbeResult::Unreachable;
+        return RawHealth::Unreachable;
     }
     let _ = stream.flush();
 
@@ -57,16 +100,7 @@ pub fn probe_health(port: u16, timeout: Duration) -> ProbeResult {
         }
     }
 
-    let resp_str = String::from_utf8_lossy(&buf);
-    if resp_str.starts_with("HTTP/1.1 200") || resp_str.starts_with("HTTP/1.0 200") {
-        if resp_str.contains("\"app\":\"xfade\"") || resp_str.contains("\"app\": \"xfade\"") {
-            ProbeResult::Healthy
-        } else {
-            ProbeResult::Conflict
-        }
-    } else {
-        ProbeResult::Conflict
-    }
+    RawHealth::Response(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Ensure the xfade gateway is running on `port`.
@@ -76,7 +110,17 @@ pub fn probe_health(port: u16, timeout: Duration) -> ProbeResult {
 pub fn ensure_gateway_running(port: u16) -> Result<()> {
     let initial_timeout = Duration::from_millis(200);
     match probe_health(port, initial_timeout) {
-        ProbeResult::Healthy => return Ok(()),
+        ProbeResult::Healthy => {
+            // Version handshake: if the running daemon is a different build than
+            // this CLI (e.g. the binary was replaced but the process wasn't
+            // restarted), kick the daemon so the serving process matches disk.
+            // Skipped under XFADE_TEST_SKIP_SPAWN so tests never touch a real
+            // launchd/systemd daemon that happens to be listening on the port.
+            if std::env::var("XFADE_TEST_SKIP_SPAWN").is_err() {
+                ensure_daemon_version(port);
+            }
+            return Ok(());
+        }
         ProbeResult::Conflict => return Err(CoreError::PortConflict(port)),
         ProbeResult::Unreachable => {}
     }
@@ -110,6 +154,37 @@ pub fn ensure_gateway_running(port: u16) -> Result<()> {
     )))
 }
 
+/// Compare the running daemon's version against this build and restart it in
+/// place on mismatch. Best-effort: a version that can't be read (older daemon)
+/// or a failed restart only logs, never fails the caller.
+fn ensure_daemon_version(port: u16) {
+    let own = env!("CARGO_PKG_VERSION");
+    match probe_version(port, Duration::from_millis(200)) {
+        Some(v) if v == own => {}
+        running => {
+            let shown = running.as_deref().unwrap_or("(unknown)");
+            eprintln!(
+                "xfade: gateway daemon is v{shown} but this CLI is v{own}; restarting the daemon"
+            );
+            if let Err(e) = crate::daemon::restart() {
+                eprintln!("xfade: daemon auto-restart failed ({e}); run `xfade serve restart`");
+                return;
+            }
+            let start = Instant::now();
+            let max_wait = Duration::from_millis(1500);
+            while start.elapsed() < max_wait {
+                std::thread::sleep(Duration::from_millis(50));
+                if probe_health(port, Duration::from_millis(100)) == ProbeResult::Healthy {
+                    return;
+                }
+            }
+            eprintln!(
+                "xfade: daemon did not report healthy after restart; check ~/.config/xfade/serve.log"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +205,19 @@ mod tests {
             .unwrap();
         assert_eq!(resp["app"], "xfade");
         assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probe_version_reads_daemon_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+        let url = spawn_service(ProxyService::new(core)).await;
+        let port: u16 = url.split(':').next_back().unwrap().parse().unwrap();
+        assert_eq!(
+            probe_version(port, Duration::from_millis(200)).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

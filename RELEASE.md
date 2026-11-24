@@ -161,6 +161,18 @@ brew update
 brew upgrade xfade-dev/xfade/xfade
 ```
 
+### Issue D: Daemon Still Running the Old Build After Upgrade
+Upgrading (via `brew upgrade`, `xfade self-update`, or `install.sh`) only replaces the binary on disk. A running `xfade serve` daemon keeps the old build in memory, so fixes in the new release do not take effect until the daemon is restarted. **The daemon does not auto-restart.**
+
+**Fix**:
+```bash
+xfade serve restart
+# equivalent on macOS:
+launchctl kickstart -k gui/$(id -u)/ai.xfade.serve
+```
+
+`xfade doctor` reports a daemon/CLI version mismatch, and `xfade use` (gateway mode) now auto-restarts a stale daemon via the version handshake.
+
 ---
 
 ## 5. Summary Release Checklist

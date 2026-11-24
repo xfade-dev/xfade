@@ -48,6 +48,10 @@ pub struct StatusDto {
     /// `default` keeps this DTO readable against an older daemon's response.
     #[serde(default)]
     pub models_merge: bool,
+    /// Build version of the serving binary. `default` keeps the DTO readable
+    /// against an older daemon's response that predates the field.
+    #[serde(default)]
+    pub version: String,
     pub circuits: Vec<CircuitDto>,
 }
 
@@ -90,6 +94,7 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         model_override,
         target_protocol,
         models_merge: svc.core.db().models_merge_enabled().unwrap_or(false),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         circuits,
     })
 }

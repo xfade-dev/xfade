@@ -68,6 +68,7 @@ xfade serve [--port 24860] [--host 127.0.0.1] [--auth-token T]            # fore
 xfade serve install [--port --host --auth-token]                          # macOS daemon install
 xfade serve uninstall | stop                                              # uninstall
 xfade serve status                                                        # query status
+xfade serve restart                                                       # restart the daemon in place
 
 xfade proxy use a b [--model M] [--route-model <id>=<model>] [--target chat|messages]
 xfade proxy status

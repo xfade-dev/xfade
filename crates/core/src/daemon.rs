@@ -233,6 +233,59 @@ pub fn unload_job(home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Restart the running daemon in place, leaving the plist/systemd unit file
+/// untouched. macOS restarts via `launchctl kickstart -k` (kill + relaunch);
+/// Linux restarts the systemd user unit. Used by `xfade serve restart` and the
+/// version handshake so a replaced binary is actually picked up by the process.
+pub fn restart() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!("gui/{}/{LABEL}", current_uid()?);
+        let status = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+            .map_err(|e| CoreError::Proxy(format!("launchctl kickstart: {e}")))?;
+        if !status.success() {
+            return Err(CoreError::Proxy(format!(
+                "launchctl kickstart {target} exited {status}"
+            )));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "restart", LABEL])
+            .status()
+            .map_err(|e| CoreError::Proxy(format!("systemctl restart: {e}")))?;
+        if !status.success() {
+            return Err(CoreError::Proxy(format!(
+                "systemctl restart {LABEL} exited {status}"
+            )));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        return Err(CoreError::Proxy(
+            "daemon not supported on this platform".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Current user id as a string, for building the launchd `gui/<uid>/<label>` target.
+#[cfg(target_os = "macos")]
+fn current_uid() -> Result<String> {
+    let out = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|e| CoreError::Proxy(format!("id -u: {e}")))?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if uid.is_empty() {
+        return Err(CoreError::Proxy("id -u returned an empty uid".into()));
+    }
+    Ok(uid)
+}
+
 /// Unload the daemon and remove its plist/systemd unit file (uninstall).
 pub fn unload(home: &Path) -> Result<()> {
     unload_job(home)?;

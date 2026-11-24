@@ -298,7 +298,8 @@ impl ProxyService {
                 get(|| async {
                     axum::Json(serde_json::json!({
                         "status": "ok",
-                        "app": "xfade"
+                        "app": "xfade",
+                        "version": env!("CARGO_PKG_VERSION")
                     }))
                 }),
             )

@@ -2,6 +2,16 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Upgrade & Daemon Lifecycle
+- **fix(cli)**: `xfade self-update` refuses to run on a Homebrew-managed install (a binary under `/opt/homebrew/`, `/usr/local/`, or resolving into `.../Cellar/...`), directing users to `brew update && brew upgrade xfade` instead of overwriting the Cellar link in place.
+- **feat(core)**: `/health` and `GET /__xfade/status` now report `version` (from `CARGO_PKG_VERSION`; the status DTO field is `#[serde(default)]` for backward compatibility).
+- **feat(core)**: The CLI version handshake compares the running daemon's version against its own whenever the gateway is already up; on mismatch it restarts the daemon (`launchctl kickstart -k` on macOS, `systemctl --user restart` on Linux), so a replaced binary is actually picked up by the serving process.
+- **feat(cli)**: New `xfade serve restart` subcommand to restart the daemon without hand-writing `launchctl`/`systemctl`.
+- **feat(cli)**: `xfade doctor` gains two checks — whether the current executable is a Homebrew symlink, and whether the daemon version matches the CLI version.
+- **docs**: Homebrew tap caveats and release notes now document the `brew link --overwrite xfade` migration step and that **the daemon does not auto-restart after an upgrade**.
+
 ## v0.12.4 — 2026-11-24
 
 ### Circuit Breaker Reliability
