@@ -2,6 +2,15 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.12.4 — 2026-11-24
+
+### Circuit Breaker Reliability
+- **fix(proxy)**: Prevent a HalfOpen probe-slot leak in the failover loop that could permanently reject a route with `503 no usable provider`. `allow_request` now hands the probe reservation to an RAII guard, so every early `continue`/`return`/drop path (missing provider, missing base URL, conversion failure, client disconnect) releases the slot; explicit outcomes disarm the guard instead.
+- **fix(proxy)**: Deferred streaming success now advances HalfOpen recovery without clobbering a newer probe's reservation (`record_success_streamed`), and a client disconnect mid-stream logs the request and closes the session instead of silently dropping it.
+
+### Dependencies
+- **fix(deps)**: Bump `cookie` to 0.18.3 for RUSTSEC-2026-0594.
+
 ## v0.12.3 — 2026-11-23
 
 ### TUI Forms: Guided Choices

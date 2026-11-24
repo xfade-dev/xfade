@@ -2255,7 +2255,8 @@ impl futures::Stream for TailLogStream {
                     let err = if is_interrupted {
                         Some("upstream stream interrupted".to_string())
                     } else {
-                        this.circuit_breaker.record_success_streamed(&this.provider_id);
+                        this.circuit_breaker
+                            .record_success_streamed(&this.provider_id);
                         None
                     };
                     this.log(err);
