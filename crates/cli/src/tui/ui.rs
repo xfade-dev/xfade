@@ -13,8 +13,8 @@ use xfade_core::store::db::StatsRow;
 use xfade_core::ToolKind;
 
 use crate::tui::app::{
-    AddField, App, ConfigField, EditField, ProbeResult, API_CHOICES, PROTOCOL_CHOICES,
-    SECRETS_CHOICES,
+    AddField, App, ConfigField, EditField, ModelMapField, ModelProbeResult, ProbeResult,
+    API_CHOICES, PROTOCOL_CHOICES, SECRETS_CHOICES, SPINNER,
 };
 
 /// Stats window shown in the header (e.g. `7d`), parsed by `crate::parse_since`.
@@ -512,6 +512,39 @@ fn draw_provider_details(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
+    let catalog_span = if app.model_probing.contains(&p.id) {
+        let spin = SPINNER[app.spinner_tick % SPINNER.len()];
+        Span::styled(
+            format!("{spin} probing /v1/models…"),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        match app.model_probes.get(&p.id) {
+            Some(ModelProbeResult::Models(models)) if models.is_empty() => {
+                Span::styled("0 models returned", Style::default().fg(Color::DarkGray))
+            }
+            Some(ModelProbeResult::Models(models)) => {
+                let preview: Vec<&str> = models.iter().take(3).map(String::as_str).collect();
+                let suffix = if models.len() > 3 { ", …" } else { "" };
+                Span::styled(
+                    format!("{} models ({}{})", models.len(), preview.join(", "), suffix),
+                    Style::default().fg(Color::Green),
+                )
+            }
+            Some(ModelProbeResult::Failed(err)) => {
+                Span::styled(format!("failed ({err})"), Style::default().fg(Color::Red))
+            }
+            None => Span::styled(
+                "(press p to probe /v1/models)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  • Catalog:    ", Style::default().fg(Color::DarkGray)),
+        catalog_span,
+    ]));
+
     // Optional slot overrides (e.g. for Claude Code)
     let opus = p.extra.get("opus_model").and_then(|v| v.as_str());
     let sonnet = p.extra.get("sonnet_model").and_then(|v| v.as_str());
@@ -689,7 +722,7 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
             },
         ])
     };
-    let lines = vec![
+    let mut lines = vec![
         field_line(
             "Base URL:",
             &e.base_url,
@@ -704,6 +737,15 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
+    if e.field == EditField::Model && !e.available_models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "←/→ cycle {} probed models (or type custom)",
+                e.available_models.len()
+            ),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Edit provider: {} ", e.provider_id));
@@ -715,6 +757,10 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         draw_add(f, app, area);
     } else if app.is_configuring() {
         draw_config(f, app, area);
+    } else if app.is_model_mapping() {
+        draw_model_map(f, app, area);
+    } else if app.is_routing() {
+        draw_routes(f, app, area);
     } else {
         draw_edit(f, app, area);
     }
@@ -920,7 +966,11 @@ fn draw_add(f: &mut Frame, app: &App, area: Rect) {
         ),
         AddField::Model => (
             2,
-            "Model sent upstream. Blank = global default, or the tool's own default.",
+            if add.available_models.is_empty() {
+                "Model sent upstream. Blank = global default, or the tool's own default."
+            } else {
+                "←/→ pick from probed models, or type custom. Blank = global default."
+            },
         ),
         AddField::ApiKey => (
             3,
@@ -1026,15 +1076,216 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn draw_model_map(f: &mut Frame, app: &App, area: Rect) {
+    let Some(mm) = app.model_map.as_ref() else {
+        return;
+    };
+
+    if let Some(ed) = mm.editing.as_ref() {
+        let mut lines = vec![
+            input_line(
+                "Alias:",
+                ed.alias.clone(),
+                ed.field == ModelMapField::Alias,
+                false,
+                false,
+            ),
+            input_line(
+                "Provider:",
+                ed.provider_id.clone(),
+                ed.field == ModelMapField::Provider,
+                false,
+                false,
+            ),
+            input_line(
+                "Upstream:",
+                ed.upstream_model.clone(),
+                ed.field == ModelMapField::UpstreamModel,
+                false,
+                false,
+            ),
+        ];
+        let (focus, hint) = match ed.field {
+            ModelMapField::Alias => (
+                0,
+                "Client model alias (e.g. sonnet, haiku, opus, or custom name).",
+            ),
+            ModelMapField::Provider => (
+                1,
+                "←/→ cycle providers or * (wildcard fallback for unmapped providers).",
+            ),
+            ModelMapField::UpstreamModel => (
+                2,
+                if ed.available_models.is_empty() {
+                    "Model ID sent upstream (press p in list view to probe models)."
+                } else {
+                    "←/→ pick from probed models, or type custom upstream model ID."
+                },
+            ),
+        };
+        lines.extend(hint_lines(hint));
+        render_form(
+            f,
+            area,
+            " Model Map · alias -> provider=upstream ".to_string(),
+            lines,
+            focus,
+        );
+        return;
+    }
+
+    let merge_badge = if mm.models_merge {
+        Span::styled(
+            "ON (aggregated /v1/models)",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "OFF (first-success passthrough)",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  models-merge: ", Style::default().fg(Color::DarkGray)),
+            merge_badge,
+        ]),
+        Line::from(""),
+    ];
+    if mm.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no model mappings configured; press [a] to add)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (idx, (alias, prov, upstream)) in mm.rows.iter().enumerate() {
+            let selected = idx == mm.selected_row;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let prefix = if selected { "▸ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{alias}  ->  {prov}={upstream}"),
+                style,
+            )));
+        }
+    }
+    let rule_count = mm.rows.len();
+    let rule_label = if rule_count == 1 { "rule" } else { "rules" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Model Map ({rule_count} {rule_label}) "));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_routes(f: &mut Frame, app: &App, area: Rect) {
+    let Some(r) = app.routes_edit.as_ref() else {
+        return;
+    };
+
+    if r.editing_model {
+        if let Some(entry) = r.entries.get(r.selected_row) {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::raw(format!("{:<12}", "Route:")),
+                    Span::styled(
+                        entry.provider_id.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                input_line("Model:", entry.model.clone(), true, false, false),
+            ];
+            let hint = if entry.available_models.is_empty() {
+                "Fixed upstream model for this route (blank = use provider/mapping default)."
+            } else {
+                "←/→ pick from probed models, or type custom. Blank = default."
+            };
+            lines.extend(hint_lines(hint));
+            render_form(
+                f,
+                area,
+                format!(" Route Model: {} ", entry.provider_id),
+                lines,
+                1,
+            );
+            return;
+        }
+    }
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "  protocol: {}   (Space toggle · +/- reorder · e model)",
+                r.target_protocol
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    if r.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no providers configured for this tool)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (idx, entry) in r.entries.iter().enumerate() {
+            let selected = idx == r.selected_row;
+            let mark = if entry.enabled { "[x]" } else { "[ ]" };
+            let model_suffix = if entry.model.trim().is_empty() {
+                "(default)".to_string()
+            } else {
+                entry.model.clone()
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else if entry.enabled {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let prefix = if selected { "▸ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{mark} {}  ->  {model_suffix}", entry.provider_id),
+                style,
+            )));
+        }
+    }
+    let enabled_count = r.entries.iter().filter(|e| e.enabled).count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Proxy Routes ({enabled_count} active) "));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = if app.delete_confirm.is_some() {
         "confirm removal: [y] yes   [n/Esc] cancel"
+    } else if let Some(mm) = app.model_map.as_ref() {
+        if mm.editing.is_some() {
+            "Tab next field  ←/→ choose  Enter save  Esc back"
+        } else {
+            "j/k move  a add  e edit  d del  Space merge  Esc close"
+        }
+    } else if let Some(r) = app.routes_edit.as_ref() {
+        if r.editing_model {
+            "←/→ pick probed model  type custom  Enter/Esc done"
+        } else {
+            "j/k move  Space toggle  +/- order  e model  Enter save  Esc cancel"
+        }
     } else if app.is_adding() || app.is_configuring() {
         "Tab next field  ←/→ or Space choose  Enter save  Esc cancel"
     } else if app.is_input_mode() {
         "editing: [Tab/BackTab] field   [Enter] save   [Esc] cancel"
     } else {
-        "j/k move  Enter use  a add  e edit  d del  g global  t test  Tab tool  q quit"
+        "j/k  Enter use  a/e/d  g cfg  t net  p probe  m map  r routes  Tab  q quit"
     };
     let mut lines = vec![Line::from(Span::styled(
         hints,
@@ -1737,5 +1988,84 @@ mod tests {
             reversed > 0,
             "selected row must render reverse-video; no REVERSED cell found"
         );
+    }
+
+    #[test]
+    fn provider_details_shows_probed_model_catalog_and_spinner() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "glm".into(),
+            ModelProbeResult::Models(vec!["glm-4".into(), "glm-4-air".into()]),
+        );
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("2 models (glm-4, glm-4-air)"));
+
+        app.model_probing.insert("glm".into());
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("probing /v1/models"));
+    }
+
+    #[test]
+    fn model_map_view_renders_rules_and_merge_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        core.db()
+            .set_model_mappings_batch("sonnet", &[("glm".into(), "glm-4".into())])
+            .unwrap();
+        core.db().set_models_merge_enabled(true).unwrap();
+
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_model_map(&core);
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Model Map (1 rule)"));
+        assert!(text.contains("ON (aggregated /v1/models)"));
+        assert!(text.contains("sonnet  ->  glm=glm-4"));
+    }
+
+    #[test]
+    fn routes_view_renders_active_routes_and_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let mut rm = std::collections::BTreeMap::new();
+        rm.insert("glm".to_string(), "glm-4-plus".to_string());
+        core.db()
+            .set_routes_with_models(&["glm".to_string()], None, "chat", &rm)
+            .unwrap();
+
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.start_routes(&core);
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Proxy Routes (1 active)"));
+        assert!(text.contains("[x] glm  ->  glm-4-plus"));
     }
 }

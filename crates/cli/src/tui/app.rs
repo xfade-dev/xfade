@@ -56,6 +56,33 @@ pub enum ProbeResult {
     Failed,
 }
 
+/// Outcome of a `/v1/models` catalog probe against one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelProbeResult {
+    Models(Vec<String>),
+    Failed(String),
+}
+
+/// Cycle through discovered model candidates when the user presses Left/Right on
+/// a model field. Returns `None` when no candidates are available.
+pub fn cycle_model_candidate(
+    candidates: &[String],
+    current: &str,
+    forward: bool,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let n = candidates.len();
+    let next = match candidates.iter().position(|m| m == current) {
+        Some(i) if forward => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None if forward => 0,
+        None => n - 1,
+    };
+    Some(candidates[next].clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
     BaseUrl,
@@ -70,6 +97,7 @@ pub struct EditState {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    pub available_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +124,7 @@ pub struct AddState {
     /// an editable value that silently comes back.
     pub global_base_url: Option<String>,
     pub global_model: Option<String>,
+    pub available_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +150,48 @@ pub struct ConfigState {
     pub api_key_is_set: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelMapField {
+    Alias,
+    Provider,
+    UpstreamModel,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelMapEdit {
+    pub field: ModelMapField,
+    pub alias: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+    pub available_models: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelMapState {
+    pub models_merge: bool,
+    pub selected_row: usize,
+    pub rows: Vec<(String, String, String)>,
+    pub editing: Option<ModelMapEdit>,
+    pub provider_choices: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    pub provider_id: String,
+    pub enabled: bool,
+    pub model: String,
+    pub available_models: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutesState {
+    pub entries: Vec<RouteEntry>,
+    pub selected_row: usize,
+    pub editing_model: bool,
+    pub target_protocol: String,
+    pub model_override: Option<String>,
+}
+
 pub struct App {
     pub tool: ToolKind,
     pub providers: Vec<Provider>,
@@ -129,6 +200,8 @@ pub struct App {
     pub edit: Option<EditState>,
     pub add: Option<AddState>,
     pub config_edit: Option<ConfigState>,
+    pub model_map: Option<ModelMapState>,
+    pub routes_edit: Option<RoutesState>,
     pub delete_confirm: Option<String>,
     /// provider id -> outcome of the latest `t` probe.
     pub probes: HashMap<String, ProbeResult>,
@@ -137,6 +210,10 @@ pub struct App {
     /// provider ids with in-flight probes (the `t` key probes all probeable
     /// providers of the current tool in parallel).
     pub probing: HashSet<String>,
+    /// provider id -> outcome of the latest `p` (`/v1/models`) probe.
+    pub model_probes: HashMap<String, ModelProbeResult>,
+    /// provider ids with in-flight `/v1/models` probes.
+    pub model_probing: HashSet<String>,
     /// Frame counter driving the braille spinner.
     pub spinner_tick: usize,
     /// Trust status of the environment
@@ -164,10 +241,14 @@ impl App {
             edit: None,
             add: None,
             config_edit: None,
+            model_map: None,
+            routes_edit: None,
             delete_confirm: None,
             probes: HashMap::new(),
             fader_pos: 0.5,
             probing: HashSet::new(),
+            model_probes: HashMap::new(),
+            model_probing: HashSet::new(),
             spinner_tick: 0,
             trust: core
                 .trust_state()
@@ -231,6 +312,8 @@ impl App {
         self.providers.clear();
         self.probes.clear();
         self.probing.clear();
+        self.model_probes.clear();
+        self.model_probing.clear();
         self.message = None;
         self.selected = 0;
         self.reload(core);
@@ -246,6 +329,8 @@ impl App {
         self.providers.clear();
         self.probes.clear();
         self.probing.clear();
+        self.model_probes.clear();
+        self.model_probing.clear();
         self.message = None;
         self.selected = 0;
         self.reload(core);
@@ -275,6 +360,7 @@ impl App {
     pub fn is_animating(&self) -> bool {
         (self.fader_pos - self.fader_target()).abs() > 0.005
             || !self.probing.is_empty()
+            || !self.model_probing.is_empty()
             || self.intro_until.is_some()
             || self.flash_until.is_some()
     }
@@ -340,8 +426,20 @@ impl App {
         self.config_edit.is_some()
     }
 
+    pub fn is_model_mapping(&self) -> bool {
+        self.model_map.is_some()
+    }
+
+    pub fn is_routing(&self) -> bool {
+        self.routes_edit.is_some()
+    }
+
     pub fn is_input_mode(&self) -> bool {
-        self.is_editing() || self.is_adding() || self.is_configuring()
+        self.is_editing()
+            || self.is_adding()
+            || self.is_configuring()
+            || self.is_model_mapping()
+            || self.is_routing()
     }
 
     pub fn switch_selected(&mut self, core: &Core) {
@@ -362,17 +460,33 @@ impl App {
         let Some(p) = self.selected_provider() else {
             return;
         };
+        let available_models = match self.model_probes.get(&p.id) {
+            Some(ModelProbeResult::Models(ms)) => ms.clone(),
+            _ => Vec::new(),
+        };
         self.edit = Some(EditState {
             provider_id: p.id.clone(),
             field: EditField::BaseUrl,
             base_url: p.base_url.clone().unwrap_or_default(),
             model: p.extra["model"].as_str().unwrap_or("").to_string(),
             api_key: String::new(),
+            available_models,
         });
     }
 
     pub fn start_add(&mut self, core: &Core) {
         let config = core.config();
+        let mut seen = HashSet::new();
+        let mut available_models = Vec::new();
+        for res in self.model_probes.values() {
+            if let ModelProbeResult::Models(ms) = res {
+                for m in ms {
+                    if seen.insert(m.clone()) {
+                        available_models.push(m.clone());
+                    }
+                }
+            }
+        }
         self.add = Some(AddState {
             field: AddField::Id,
             id: String::new(),
@@ -383,6 +497,7 @@ impl App {
             official: false,
             global_base_url: config.base_url.filter(|u| !u.trim().is_empty()),
             global_model: config.model.filter(|m| !m.trim().is_empty()),
+            available_models,
         });
         self.message = None;
     }
@@ -401,6 +516,262 @@ impl App {
             api_key_is_set,
         });
         self.message = None;
+    }
+
+    fn models_for_provider_choice(
+        model_probes: &HashMap<String, ModelProbeResult>,
+        provider_id: &str,
+    ) -> Vec<String> {
+        if provider_id != "*" {
+            if let Some(ModelProbeResult::Models(ms)) = model_probes.get(provider_id) {
+                return ms.clone();
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for res in model_probes.values() {
+            if let ModelProbeResult::Models(ms) = res {
+                for m in ms {
+                    if seen.insert(m.clone()) {
+                        out.push(m.clone());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn load_model_map_rows(core: &Core) -> (Vec<(String, String, String)>, bool) {
+        let mappings = core.db().get_model_mappings().unwrap_or_default();
+        let mut rows = Vec::new();
+        for (alias, prov_map) in mappings {
+            for (prov, upstream) in prov_map {
+                rows.push((alias.clone(), prov, upstream));
+            }
+        }
+        let merge = core.db().models_merge_enabled().unwrap_or(false);
+        (rows, merge)
+    }
+
+    pub fn start_model_map(&mut self, core: &Core) {
+        let (rows, models_merge) = Self::load_model_map_rows(core);
+        let mut provider_choices = vec!["*".to_string()];
+        for p in &self.providers {
+            if !provider_choices.contains(&p.id) {
+                provider_choices.push(p.id.clone());
+            }
+        }
+        self.model_map = Some(ModelMapState {
+            models_merge,
+            selected_row: 0,
+            rows,
+            editing: None,
+            provider_choices,
+        });
+        self.message = None;
+    }
+
+    pub fn model_map_next(&mut self) {
+        if let Some(mm) = self.model_map.as_mut() {
+            if !mm.rows.is_empty() {
+                mm.selected_row = (mm.selected_row + 1) % mm.rows.len();
+            }
+        }
+    }
+
+    pub fn model_map_prev(&mut self) {
+        if let Some(mm) = self.model_map.as_mut() {
+            if !mm.rows.is_empty() {
+                mm.selected_row = (mm.selected_row + mm.rows.len() - 1) % mm.rows.len();
+            }
+        }
+    }
+
+    pub fn model_map_start_add(&mut self) {
+        let default_provider = self
+            .selected_provider()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "*".to_string());
+        let available_models =
+            Self::models_for_provider_choice(&self.model_probes, &default_provider);
+        if let Some(mm) = self.model_map.as_mut() {
+            mm.editing = Some(ModelMapEdit {
+                field: ModelMapField::Alias,
+                alias: String::new(),
+                provider_id: default_provider,
+                upstream_model: String::new(),
+                available_models,
+            });
+        }
+    }
+
+    pub fn model_map_start_edit(&mut self) {
+        let Some((alias, provider_id, upstream_model)) = self
+            .model_map
+            .as_ref()
+            .and_then(|mm| mm.rows.get(mm.selected_row).cloned())
+        else {
+            return;
+        };
+        let available_models = Self::models_for_provider_choice(&self.model_probes, &provider_id);
+        if let Some(mm) = self.model_map.as_mut() {
+            mm.editing = Some(ModelMapEdit {
+                field: ModelMapField::UpstreamModel,
+                alias,
+                provider_id,
+                upstream_model,
+                available_models,
+            });
+        }
+    }
+
+    pub fn model_map_delete(&mut self, core: &Core) {
+        let Some((alias, provider_id, _)) = self
+            .model_map
+            .as_ref()
+            .and_then(|mm| mm.rows.get(mm.selected_row).cloned())
+        else {
+            return;
+        };
+        match core.db().remove_model_mapping(&alias, Some(&provider_id)) {
+            Ok(true) => {
+                let (rows, models_merge) = Self::load_model_map_rows(core);
+                if let Some(mm) = self.model_map.as_mut() {
+                    mm.rows = rows;
+                    mm.models_merge = models_merge;
+                    if mm.selected_row >= mm.rows.len() {
+                        mm.selected_row = mm.rows.len().saturating_sub(1);
+                    }
+                }
+                self.message = Some(format!("Removed mapping {alias} ({provider_id})"));
+            }
+            Ok(false) => {
+                self.message = Some("Mapping not found".into());
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    pub fn model_map_toggle_merge(&mut self, core: &Core) {
+        let Some(mm) = self.model_map.as_mut() else {
+            return;
+        };
+        let next = !mm.models_merge;
+        match core.db().set_models_merge_enabled(next) {
+            Ok(()) => {
+                mm.models_merge = next;
+                self.message = Some(if next {
+                    "models-merge: ON (aggregated /v1/models)".into()
+                } else {
+                    "models-merge: OFF (first-success passthrough)".into()
+                });
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    pub fn start_routes(&mut self, core: &Core) {
+        let (existing_routes, model_override, target_protocol) = core
+            .db()
+            .get_routes()
+            .ok()
+            .flatten()
+            // Default to "chat" when no route config exists yet; subsequent saves preserve DB value.
+            .unwrap_or_else(|| (Vec::new(), None, "chat".to_string()));
+        let route_models = core.db().get_route_models().unwrap_or_default();
+
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        for rid in &existing_routes {
+            if seen.insert(rid.clone()) {
+                entries.push(RouteEntry {
+                    provider_id: rid.clone(),
+                    enabled: true,
+                    model: route_models.get(rid).cloned().unwrap_or_default(),
+                    available_models: Self::models_for_provider_choice(&self.model_probes, rid),
+                });
+            }
+        }
+        for p in &self.providers {
+            if seen.insert(p.id.clone()) {
+                entries.push(RouteEntry {
+                    provider_id: p.id.clone(),
+                    enabled: false,
+                    model: route_models.get(&p.id).cloned().unwrap_or_default(),
+                    available_models: Self::models_for_provider_choice(&self.model_probes, &p.id),
+                });
+            }
+        }
+
+        self.routes_edit = Some(RoutesState {
+            entries,
+            selected_row: 0,
+            editing_model: false,
+            target_protocol,
+            model_override,
+        });
+        self.message = None;
+    }
+
+    pub fn routes_next(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if !r.entries.is_empty() {
+                r.selected_row = (r.selected_row + 1) % r.entries.len();
+            }
+        }
+    }
+
+    pub fn routes_prev(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if !r.entries.is_empty() {
+                r.selected_row = (r.selected_row + r.entries.len() - 1) % r.entries.len();
+            }
+        }
+    }
+
+    pub fn routes_toggle_selected(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if let Some(entry) = r.entries.get_mut(r.selected_row) {
+                entry.enabled = !entry.enabled;
+            }
+        }
+    }
+
+    pub fn routes_move_up(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if r.selected_row > 0 && r.selected_row < r.entries.len() {
+                r.entries.swap(r.selected_row, r.selected_row - 1);
+                r.selected_row -= 1;
+            }
+        }
+    }
+
+    pub fn routes_move_down(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if r.selected_row + 1 < r.entries.len() {
+                r.entries.swap(r.selected_row, r.selected_row + 1);
+                r.selected_row += 1;
+            }
+        }
+    }
+
+    pub fn routes_start_edit_model(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            if !r.entries.is_empty() {
+                r.editing_model = true;
+            }
+        }
+    }
+
+    pub fn routes_finish_edit_model(&mut self) {
+        if let Some(r) = self.routes_edit.as_mut() {
+            r.editing_model = false;
+        }
     }
 
     pub fn edit_char(&mut self, c: char) {
@@ -432,14 +803,43 @@ impl App {
                 ConfigField::Model => config.model.push(c),
                 ConfigField::ApiKey => config.api_key.push(c),
             }
+        } else if let Some(mm) = self.model_map.as_mut() {
+            if let Some(ed) = mm.editing.as_mut() {
+                match ed.field {
+                    ModelMapField::Alias => ed.alias.push(c),
+                    // Choice field: cycled via ←/→ so only valid providers (or "*") are selected.
+                    ModelMapField::Provider => {}
+                    ModelMapField::UpstreamModel => ed.upstream_model.push(c),
+                }
+            }
+        } else if let Some(r) = self.routes_edit.as_mut() {
+            if r.editing_model {
+                if let Some(entry) = r.entries.get_mut(r.selected_row) {
+                    entry.model.push(c);
+                }
+            }
         }
     }
 
-    /// Left/Right on a choice field steps through its options (no-op on text
-    /// fields). Space does the same going forward.
+    /// Left/Right on a choice field (or a model field with probed candidates)
+    /// steps through its options (no-op on plain text fields). Space does the
+    /// same going forward on choice fields.
     pub fn edit_cycle(&mut self, forward: bool) {
-        if let Some(a) = self.add.as_mut() {
+        if let Some(e) = self.edit.as_mut() {
+            if e.field == EditField::Model {
+                if let Some(next) = cycle_model_candidate(&e.available_models, &e.model, forward) {
+                    e.model = next;
+                }
+            }
+        } else if let Some(a) = self.add.as_mut() {
             match a.field {
+                AddField::Model => {
+                    if let Some(next) =
+                        cycle_model_candidate(&a.available_models, &a.model, forward)
+                    {
+                        a.model = next;
+                    }
+                }
                 AddField::Protocol => {
                     a.protocol = cycle_choice(&PROTOCOL_CHOICES, &a.protocol, forward)
                 }
@@ -453,6 +853,44 @@ impl App {
                 }
                 ConfigField::Api => config.api = cycle_choice(&API_CHOICES, &config.api, forward),
                 _ => {}
+            }
+        } else if let Some(mm) = self.model_map.as_mut() {
+            let choices = mm.provider_choices.clone();
+            if let Some(ed) = mm.editing.as_mut() {
+                match ed.field {
+                    ModelMapField::Provider if !choices.is_empty() => {
+                        let n = choices.len();
+                        let next = match choices.iter().position(|p| p == &ed.provider_id) {
+                            Some(i) if forward => (i + 1) % n,
+                            Some(i) => (i + n - 1) % n,
+                            None if forward => 0,
+                            None => n - 1,
+                        };
+                        ed.provider_id = choices[next].clone();
+                        let pid = ed.provider_id.clone();
+                        // Refresh candidate models for the newly selected provider.
+                        ed.available_models =
+                            Self::models_for_provider_choice(&self.model_probes, &pid);
+                    }
+                    ModelMapField::UpstreamModel => {
+                        if let Some(next) =
+                            cycle_model_candidate(&ed.available_models, &ed.upstream_model, forward)
+                        {
+                            ed.upstream_model = next;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if let Some(r) = self.routes_edit.as_mut() {
+            if r.editing_model {
+                if let Some(entry) = r.entries.get_mut(r.selected_row) {
+                    if let Some(next) =
+                        cycle_model_candidate(&entry.available_models, &entry.model, forward)
+                    {
+                        entry.model = next;
+                    }
+                }
             }
         }
     }
@@ -493,6 +931,25 @@ impl App {
                     config.api_key.pop();
                 }
             }
+        } else if let Some(mm) = self.model_map.as_mut() {
+            if let Some(ed) = mm.editing.as_mut() {
+                match ed.field {
+                    ModelMapField::Alias => {
+                        ed.alias.pop();
+                    }
+                    // Choice field: disallow Backspace so provider_id stays a valid choice.
+                    ModelMapField::Provider => {}
+                    ModelMapField::UpstreamModel => {
+                        ed.upstream_model.pop();
+                    }
+                }
+            }
+        } else if let Some(r) = self.routes_edit.as_mut() {
+            if r.editing_model {
+                if let Some(entry) = r.entries.get_mut(r.selected_row) {
+                    entry.model.pop();
+                }
+            }
         }
     }
 
@@ -520,6 +977,14 @@ impl App {
                 ConfigField::Api => ConfigField::ApiKey,
                 ConfigField::ApiKey => ConfigField::Secrets,
             };
+        } else if let Some(mm) = self.model_map.as_mut() {
+            if let Some(ed) = mm.editing.as_mut() {
+                ed.field = match ed.field {
+                    ModelMapField::Alias => ModelMapField::Provider,
+                    ModelMapField::Provider => ModelMapField::UpstreamModel,
+                    ModelMapField::UpstreamModel => ModelMapField::Alias,
+                };
+            }
         }
     }
 
@@ -547,13 +1012,35 @@ impl App {
                 ConfigField::Api => ConfigField::Model,
                 ConfigField::ApiKey => ConfigField::Api,
             };
+        } else if let Some(mm) = self.model_map.as_mut() {
+            if let Some(ed) = mm.editing.as_mut() {
+                ed.field = match ed.field {
+                    ModelMapField::Alias => ModelMapField::UpstreamModel,
+                    ModelMapField::Provider => ModelMapField::Alias,
+                    ModelMapField::UpstreamModel => ModelMapField::Provider,
+                };
+            }
         }
     }
 
     pub fn cancel_edit(&mut self) {
+        if let Some(mm) = self.model_map.as_mut() {
+            if mm.editing.is_some() {
+                mm.editing = None;
+                return;
+            }
+        }
+        if let Some(r) = self.routes_edit.as_mut() {
+            if r.editing_model {
+                r.editing_model = false;
+                return;
+            }
+        }
         self.edit = None;
         self.add = None;
         self.config_edit = None;
+        self.model_map = None;
+        self.routes_edit = None;
     }
 
     pub fn submit_input(&mut self, core: &Core) {
@@ -563,6 +1050,96 @@ impl App {
             self.submit_add(core);
         } else if self.config_edit.is_some() {
             self.submit_config(core);
+        } else if self.model_map.is_some() {
+            self.submit_model_map(core);
+        } else if self.routes_edit.is_some() {
+            self.submit_routes(core);
+        }
+    }
+
+    fn submit_routes(&mut self, core: &Core) {
+        let Some(r) = self.routes_edit.take() else {
+            return;
+        };
+        let enabled: Vec<String> = r
+            .entries
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.provider_id.clone())
+            .collect();
+        let mut route_models = std::collections::BTreeMap::new();
+        for e in &r.entries {
+            let m = e.model.trim();
+            if e.enabled && !m.is_empty() {
+                route_models.insert(e.provider_id.clone(), m.to_string());
+            }
+        }
+        let res = if enabled.is_empty() {
+            core.db()
+                .clear_routes()
+                .map(|()| "Cleared proxy routes".to_string())
+        } else {
+            core.db()
+                .set_routes_with_models(
+                    &enabled,
+                    r.model_override.as_deref(),
+                    &r.target_protocol,
+                    &route_models,
+                )
+                .map(|()| {
+                    format!(
+                        "Saved {} routes ({} with fixed models)",
+                        enabled.len(),
+                        route_models.len()
+                    )
+                })
+        };
+        match res {
+            Ok(msg) => self.message = Some(msg),
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+                self.routes_edit = Some(r);
+            }
+        }
+    }
+
+    fn submit_model_map(&mut self, core: &Core) {
+        let Some(ed) = self.model_map.as_mut().and_then(|mm| mm.editing.take()) else {
+            return;
+        };
+        let alias = ed.alias.trim().to_string();
+        let provider = ed.provider_id.trim().to_string();
+        let upstream = ed.upstream_model.trim().to_string();
+        if alias.is_empty() || provider.is_empty() || upstream.is_empty() {
+            self.message =
+                Some("Error: alias, provider, and upstream model are all required".into());
+            if let Some(mm) = self.model_map.as_mut() {
+                mm.editing = Some(ed);
+            }
+            return;
+        }
+        match core
+            .db()
+            .set_model_mappings_batch(&alias, &[(provider.clone(), upstream.clone())])
+        {
+            Ok(()) => {
+                let (rows, models_merge) = Self::load_model_map_rows(core);
+                if let Some(mm) = self.model_map.as_mut() {
+                    mm.selected_row = rows
+                        .iter()
+                        .position(|(a, p, _)| a == &alias && p == &provider)
+                        .unwrap_or(0);
+                    mm.rows = rows;
+                    mm.models_merge = models_merge;
+                }
+                self.message = Some(format!("Saved mapping: {alias} -> {provider}={upstream}"));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+                if let Some(mm) = self.model_map.as_mut() {
+                    mm.editing = Some(ed);
+                }
+            }
         }
     }
 
@@ -690,6 +1267,8 @@ impl App {
                     // old latency badge.
                     self.probes.remove(&id);
                     self.probing.remove(&id);
+                    self.model_probes.remove(&id);
+                    self.model_probing.remove(&id);
                     format!("Removed {id}")
                 }
                 Err(error) => format!("Error: {error}"),
@@ -1645,5 +2224,223 @@ mod tests {
             .unwrap()
             .port();
         assert!(probe_latency("127.0.0.1", port, std::time::Duration::from_millis(200)).is_none());
+    }
+
+    #[test]
+    fn cycle_model_candidate_wraps_and_handles_empty() {
+        assert_eq!(cycle_model_candidate(&[], "x", true), None);
+        let models = vec!["m1".into(), "m2".into(), "m3".into()];
+        assert_eq!(cycle_model_candidate(&models, "", true), Some("m1".into()));
+        assert_eq!(cycle_model_candidate(&models, "", false), Some("m3".into()));
+        assert_eq!(
+            cycle_model_candidate(&models, "m1", true),
+            Some("m2".into())
+        );
+        assert_eq!(
+            cycle_model_candidate(&models, "m1", false),
+            Some("m3".into())
+        );
+    }
+
+    #[test]
+    fn start_edit_and_cycle_use_probed_models_and_tool_switch_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk"),
+        )
+        .unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "glm".into(),
+            ModelProbeResult::Models(vec!["glm-4".into(), "glm-4-plus".into()]),
+        );
+        app.model_probing.insert("glm".into());
+        assert!(app.is_animating());
+
+        app.start_edit();
+        app.edit_next_field(); // -> EditField::Model
+        app.edit_cycle(true);
+        assert_eq!(app.edit.as_ref().unwrap().model, "glm-4");
+        app.edit_cycle(true);
+        assert_eq!(app.edit.as_ref().unwrap().model, "glm-4-plus");
+        app.cancel_edit();
+
+        app.next_tool(&core);
+        assert!(app.model_probes.is_empty());
+        assert!(app.model_probing.is_empty());
+    }
+
+    #[test]
+    fn model_map_add_edit_delete_and_toggle_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk"),
+        )
+        .unwrap();
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "glm".into(),
+            ModelProbeResult::Models(vec!["glm-4".into(), "glm-4-plus".into()]),
+        );
+
+        app.start_model_map(&core);
+        assert!(app.is_model_mapping());
+        assert!(!app.model_map.as_ref().unwrap().models_merge);
+
+        app.model_map_toggle_merge(&core);
+        assert!(app.model_map.as_ref().unwrap().models_merge);
+        assert!(core.db().models_merge_enabled().unwrap());
+
+        app.model_map_start_add();
+        for c in "sonnet".chars() {
+            app.edit_char(c);
+        }
+        app.edit_next_field(); // Provider (defaults to "glm")
+        app.edit_next_field(); // UpstreamModel
+        app.edit_cycle(true); // picks "glm-4"
+        app.submit_input(&core);
+
+        let mm = app.model_map.as_ref().unwrap();
+        assert!(mm.editing.is_none());
+        assert_eq!(
+            mm.rows,
+            vec![("sonnet".into(), "glm".into(), "glm-4".into())]
+        );
+        assert_eq!(
+            core.db()
+                .get_model_mappings()
+                .unwrap()
+                .get("sonnet")
+                .and_then(|m| m.get("glm"))
+                .map(String::as_str),
+            Some("glm-4")
+        );
+
+        app.model_map_delete(&core);
+        assert!(app.model_map.as_ref().unwrap().rows.is_empty());
+        app.cancel_edit();
+        assert!(!app.is_model_mapping());
+    }
+
+    #[test]
+    fn routes_toggle_reorder_edit_model_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new("glm", ToolKind::ClaudeCode, Some("http://gw:3000".into())),
+            Some("sk1"),
+        )
+        .unwrap();
+        core.add_provider(
+            Provider::new("ds", ToolKind::ClaudeCode, Some("http://ds:3000".into())),
+            Some("sk2"),
+        )
+        .unwrap();
+
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "ds".into(),
+            ModelProbeResult::Models(vec!["deepseek-chat".into(), "deepseek-reasoner".into()]),
+        );
+
+        app.start_routes(&core);
+        assert!(app.is_routing());
+
+        // Enable first route ("ds" or "glm" depending on list order)
+        let first_id = app.routes_edit.as_ref().unwrap().entries[0]
+            .provider_id
+            .clone();
+        app.routes_toggle_selected();
+        app.routes_next();
+        let second_id = app.routes_edit.as_ref().unwrap().entries[1]
+            .provider_id
+            .clone();
+        app.routes_toggle_selected();
+
+        // Swap second into first place
+        app.routes_move_up();
+        assert_eq!(
+            app.routes_edit.as_ref().unwrap().entries[0].provider_id,
+            second_id
+        );
+
+        // Set model on whichever is "ds"
+        if second_id == "ds" {
+            app.routes_start_edit_model();
+            app.edit_cycle(true);
+            app.routes_finish_edit_model();
+        } else {
+            app.routes_next();
+            app.routes_start_edit_model();
+            app.edit_cycle(true);
+            app.routes_finish_edit_model();
+        }
+
+        app.submit_input(&core);
+        assert!(!app.is_routing());
+
+        let (routes, _, _) = core.db().get_routes().unwrap().unwrap();
+        assert_eq!(routes, vec![second_id, first_id]);
+        let rm = core.db().get_route_models().unwrap();
+        assert_eq!(rm.get("ds").map(String::as_str), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn delete_clears_stale_model_probe_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "gone", Some("http://x"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes
+            .insert("gone".into(), ModelProbeResult::Models(vec!["m1".into()]));
+        app.model_probing.insert("gone".into());
+        app.request_delete();
+        app.confirm_delete(&core, true);
+        assert!(!app.model_probes.contains_key("gone"));
+        assert!(!app.model_probing.contains("gone"));
+    }
+
+    #[test]
+    fn model_map_provider_field_is_cycle_only_and_wildcard_models_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "glm", Some("http://gw:3000"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "glm".into(),
+            ModelProbeResult::Models(vec!["z-model".into(), "a-model".into()]),
+        );
+
+        let sorted = App::models_for_provider_choice(&app.model_probes, "*");
+        assert_eq!(sorted, vec!["a-model", "z-model"]);
+
+        app.start_model_map(&core);
+        app.model_map_start_add();
+        app.edit_next_field(); // move to Provider
+        let initial = app
+            .model_map
+            .as_ref()
+            .unwrap()
+            .editing
+            .as_ref()
+            .unwrap()
+            .provider_id
+            .clone();
+        app.edit_char('x');
+        app.edit_backspace();
+        assert_eq!(
+            app.model_map
+                .as_ref()
+                .unwrap()
+                .editing
+                .as_ref()
+                .unwrap()
+                .provider_id,
+            initial
+        );
     }
 }

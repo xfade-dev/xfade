@@ -2,7 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v0.13.0 — 2026-11-24
+
+### TUI Model Probing, Model Mapping & Multi-Route Configuration
+- **feat(tui,core)**: Press `p` in `xfade tui` to probe `/v1/models` from every custom provider (`Core::resolve_probe_params`, `probe_models_http`, `parse_models_response`), showing a live `Catalog` row in provider details and allowing `←/→` cycling of probed models in Add/Edit model fields.
+- **feat(tui)**: Press `m` to open the **Model Map** panel for managing alias → `provider=upstream_model` rules (`a` add, `e`/`Enter` edit, `d` delete) and toggling `models-merge` (`Space`). Provider selection cycles valid configured providers (or `*`), with deterministic sorted candidate lists.
+- **feat(tui)**: Press `r` to open the **Proxy Routes** panel to enable/disable routes (`Space`), reorder priority (`K`/`J` or `+`/`-`), bind per-route upstream models (`e`/`m`), and save (`Enter`).
+- **refactor(cli)**: Consolidate `xfade status` daemon circuit lookup into a single async block.
 
 ### Upgrade & Daemon Lifecycle
 - **fix(cli)**: `xfade self-update` refuses to run on a Homebrew-managed install (a binary under `/opt/homebrew/`, `/usr/local/`, or resolving into `.../Cellar/...`), directing users to `brew update && brew upgrade xfade` instead of overwriting the Cellar link in place.

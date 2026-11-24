@@ -83,6 +83,7 @@ export default function ProvidersPage() {
     base_url: string | null;
     key: string | null;
     extra: unknown;
+    official?: boolean;
   }) => {
     if (editing) {
       await updateProvider({ ...input });

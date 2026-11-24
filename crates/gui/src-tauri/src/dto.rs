@@ -13,6 +13,9 @@ pub struct AddProviderInput {
     pub key: Option<String>,
     #[serde(default)]
     pub extra: serde_json::Value,
+    /// Official login provider; when false, blank base_url/model use global defaults.
+    #[serde(default)]
+    pub official: bool,
 }
 
 #[derive(Serialize, Deserialize)]

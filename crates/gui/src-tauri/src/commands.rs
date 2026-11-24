@@ -37,9 +37,33 @@ pub async fn list_providers(
 pub async fn add_provider(state: State<'_, AppState>, input: AddProviderInput) -> CmdResult<()> {
     let core = state.core.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut p = Provider::new(&input.id, input.tool, input.base_url);
-        p.extra = input.extra;
-        core.add_provider(p, input.key.as_deref())
+        let requested = input
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty());
+        if !input.official && requested.is_none() && core.effective_base_url(None, false).is_none()
+        {
+            return Err(
+                "Base URL required (set global default in Settings or enable Official)".into(),
+            );
+        }
+        let extra = if input.extra.is_null() {
+            serde_json::Value::Null
+        } else {
+            input.extra
+        };
+        core.add_provider_from_input(xfade_core::AddProviderInput {
+            id: input.id.trim().to_string(),
+            tool: input.tool,
+            base_url: requested.map(|u| u.to_string()),
+            api_key: input.key,
+            protocol: None,
+            extra,
+            official: input.official,
+            overwrite: false,
+        })
+        .map(|_| ())
     })
     .await
     .map_err(err)?

@@ -13,7 +13,7 @@ use std::time::Duration;
 use xfade_core::store::db::{StatsGroupBy, StatsRow};
 use xfade_core::{Core, CoreError, Result, ToolKind};
 
-use app::{probe_latency, probe_target, App};
+use app::{probe_latency, probe_target, App, ModelProbeResult};
 
 /// Run the interactive TUI for a given tool.
 ///
@@ -101,6 +101,11 @@ fn event_loop(
     // Accumulators for the end-of-round summary message.
     let (mut probe_ok, mut probe_fail, mut probe_worst) = (0u32, 0u32, 0u128);
 
+    // `/v1/models` catalog probes run in worker threads; results arrive here.
+    let (model_probe_tx, model_probe_rx) =
+        mpsc::channel::<(ToolKind, String, std::result::Result<Vec<String>, String>)>();
+    let (mut mprobe_ok, mut mprobe_fail, mut mprobe_total) = (0u32, 0u32, 0usize);
+
     // Redraw only when state changed or an animation is in flight, so an idle
     // terminal doesn't repaint at the poll cadence.
     let mut dirty = true;
@@ -141,6 +146,45 @@ fn event_loop(
                 probe_ok = 0;
                 probe_fail = 0;
                 probe_worst = 0;
+            }
+        }
+
+        let mut model_drained = false;
+        while let Ok((t, id, res)) = model_probe_rx.try_recv() {
+            if t != app.tool {
+                continue;
+            }
+            app.model_probing.remove(&id);
+            match res {
+                Ok(models) => {
+                    mprobe_ok += 1;
+                    mprobe_total += models.len();
+                    app.model_probes
+                        .insert(id, ModelProbeResult::Models(models));
+                }
+                Err(err) => {
+                    mprobe_fail += 1;
+                    app.model_probes.insert(id, ModelProbeResult::Failed(err));
+                }
+            }
+            model_drained = true;
+        }
+        if model_drained {
+            dirty = true;
+            if app.model_probing.is_empty() {
+                let n = mprobe_ok + mprobe_fail;
+                app.message = Some(if mprobe_fail == 0 {
+                    format!("models: {mprobe_ok}/{n} ok · {mprobe_total} models")
+                } else if mprobe_ok == 0 {
+                    format!("models: all {n} failed")
+                } else {
+                    format!(
+                        "models: {mprobe_ok}/{n} ok · {mprobe_fail} failed · {mprobe_total} models"
+                    )
+                });
+                mprobe_ok = 0;
+                mprobe_fail = 0;
+                mprobe_total = 0;
             }
         }
 
@@ -205,6 +249,65 @@ fn event_loop(
             continue;
         }
 
+        if app.is_model_mapping() {
+            let is_editing = app
+                .model_map
+                .as_ref()
+                .is_some_and(|mm| mm.editing.is_some());
+            if is_editing {
+                match key.code {
+                    KeyCode::Esc => app.cancel_edit(),
+                    KeyCode::Enter => app.submit_input(core),
+                    KeyCode::Tab | KeyCode::Down => app.edit_next_field(),
+                    KeyCode::BackTab | KeyCode::Up => app.edit_prev_field(),
+                    KeyCode::Left => app.edit_cycle(false),
+                    KeyCode::Right => app.edit_cycle(true),
+                    KeyCode::Backspace => app.edit_backspace(),
+                    KeyCode::Char(c) => app.edit_char(c),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.cancel_edit(),
+                    KeyCode::Char('j') | KeyCode::Down => app.model_map_next(),
+                    KeyCode::Char('k') | KeyCode::Up => app.model_map_prev(),
+                    KeyCode::Char('a') => app.model_map_start_add(),
+                    KeyCode::Char('e') | KeyCode::Enter => app.model_map_start_edit(),
+                    KeyCode::Char('d') => app.model_map_delete(core),
+                    KeyCode::Char(' ') => app.model_map_toggle_merge(core),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if app.is_routing() {
+            let editing_model = app.routes_edit.as_ref().is_some_and(|r| r.editing_model);
+            if editing_model {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => app.routes_finish_edit_model(),
+                    KeyCode::Left => app.edit_cycle(false),
+                    KeyCode::Right => app.edit_cycle(true),
+                    KeyCode::Backspace => app.edit_backspace(),
+                    KeyCode::Char(c) => app.edit_char(c),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.cancel_edit(),
+                    KeyCode::Enter => app.submit_input(core),
+                    KeyCode::Char('j') | KeyCode::Down => app.routes_next(),
+                    KeyCode::Char('k') | KeyCode::Up => app.routes_prev(),
+                    KeyCode::Char(' ') => app.routes_toggle_selected(),
+                    KeyCode::Char('K') | KeyCode::Char('+') => app.routes_move_up(),
+                    KeyCode::Char('J') | KeyCode::Char('-') => app.routes_move_down(),
+                    KeyCode::Char('e') | KeyCode::Char('m') => app.routes_start_edit_model(),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         if app.is_input_mode() {
             match key.code {
                 KeyCode::Esc => app.cancel_edit(),
@@ -242,6 +345,8 @@ fn event_loop(
             KeyCode::Char('e') => app.start_edit(),
             KeyCode::Char('a') => app.start_add(core),
             KeyCode::Char('g') => app.start_config(core),
+            KeyCode::Char('m') => app.start_model_map(core),
+            KeyCode::Char('r') => app.start_routes(core),
             KeyCode::Char('d') => app.request_delete(),
             KeyCode::Char('t') => {
                 if !app.probing.is_empty() {
@@ -277,6 +382,44 @@ fn event_loop(
                             });
                         }
                         app.message = Some(format!("probing {n} providers…"));
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                if !app.model_probing.is_empty() {
+                    app.message = Some("model probe already running…".into());
+                } else {
+                    let mut targets = Vec::new();
+                    for p in &app.providers {
+                        if let Ok((base_url, protocol, auth_key)) = core.resolve_probe_params(p) {
+                            targets.push((p.id.clone(), base_url, protocol, auth_key));
+                        }
+                    }
+                    if targets.is_empty() {
+                        app.message = Some("no probeable provider for /v1/models".into());
+                    } else {
+                        let n = targets.len();
+                        let current_tool = app.tool;
+                        for (id, base_url, protocol, auth_key) in targets {
+                            let tx = model_probe_tx.clone();
+                            app.model_probing.insert(id.clone());
+                            std::thread::spawn(move || {
+                                let res = match tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                {
+                                    Ok(rt) => rt.block_on(xfade_core::service::probe_models_http(
+                                        &base_url,
+                                        protocol,
+                                        auth_key.as_deref(),
+                                        Duration::from_secs(5),
+                                    )),
+                                    Err(e) => Err(format!("runtime: {e}")),
+                                };
+                                let _ = tx.send((current_tool, id, res));
+                            });
+                        }
+                        app.message = Some(format!("probing models on {n} providers…"));
                     }
                 }
             }

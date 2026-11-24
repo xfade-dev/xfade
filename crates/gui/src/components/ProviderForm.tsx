@@ -12,6 +12,7 @@ export interface ProviderFormProps {
     base_url: string | null;
     key: string | null;
     extra: unknown;
+    official?: boolean;
   }) => Promise<void>;
 }
 
@@ -24,6 +25,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
       ? JSON.stringify(editing.extra, null, 2)
       : ""
   );
+  const [official, setOfficial] = useState(false);
   const [presets, setPresets] = useState<PresetDto[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -36,6 +38,7 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
     if (!p) return;
     setId(p.id);
     setBaseUrl(p.base_url ?? "");
+    setOfficial(p.is_official);
     setExtraText(
       p.extra && typeof p.extra === "object" ? JSON.stringify(p.extra, null, 2) : ""
     );
@@ -56,13 +59,13 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
         return;
       }
     }
-    const isOfficial = !baseUrl.trim();
     setBusy(true);
     try {
       await onSave({
         id: id.trim(),
         tool,
-        base_url: isOfficial ? null : baseUrl.trim(),
+        base_url: official ? null : baseUrl.trim() || null,
+        official,
         key: key.trim() || null,
         extra,
       });
@@ -109,14 +112,25 @@ export default function ProviderForm({ tool, editing, onClose, onSave }: Provide
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Base URL (empty = official)</label>
+            <label className="block text-xs text-gray-500 mb-1">
+              Base URL (empty uses global default from Settings)
+            </label>
             <input
               className="w-full border rounded px-2 py-1.5 text-sm"
               value={baseUrl}
+              disabled={official}
               onChange={(e) => setBaseUrl(e.target.value)}
               placeholder="https://..."
             />
           </div>
+          <label className="flex items-center gap-2 text-sm text-gray-600">
+            <input
+              type="checkbox"
+              checked={official}
+              onChange={(e) => setOfficial(e.target.checked)}
+            />
+            Official login (OAuth / first-party; ignores global URL &amp; model)
+          </label>
           <div>
             <label className="block text-xs text-gray-500 mb-1">
               API Key{editing ? " (empty = unchanged)" : ""}

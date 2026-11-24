@@ -669,6 +669,90 @@ impl Core {
             })?;
         restore(backup, &target)
     }
+
+    /// Resolve the upstream endpoint, protocol, and optional credential needed to
+    /// probe a provider's `/v1/models` catalog out-of-band (e.g. from the TUI).
+    pub fn resolve_probe_params(
+        &self,
+        provider: &Provider,
+    ) -> std::result::Result<(String, ProviderProtocol, Option<String>), String> {
+        let base_url = provider
+            .base_url
+            .clone()
+            .ok_or_else(|| "official provider has no base_url".to_string())?;
+        if let Ok(false) = self.is_domain_allowed(&base_url) {
+            return Err("blocked by egress policy".to_string());
+        }
+        let auth_key = self
+            .secrets()
+            .get(&provider.key_ref)
+            .ok()
+            .or_else(|| self.global_api_key());
+        Ok((base_url, provider.protocol, auth_key))
+    }
+}
+
+/// Probe a provider's `/v1/models` endpoint and return the discovered model IDs.
+pub async fn probe_models_http(
+    base_url: &str,
+    protocol: ProviderProtocol,
+    auth_key: Option<&str>,
+    timeout: std::time::Duration,
+) -> std::result::Result<Vec<String>, String> {
+    let base = crate::adapters::with_v1_if_bare_host(base_url);
+    let url = format!("{base}/models");
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+
+    let mut req = client.get(&url);
+    if let Some(key) = auth_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+        if protocol == ProviderProtocol::Messages {
+            req = req
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01");
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    parse_models_response(&bytes)
+}
+
+/// Parse model IDs from a `/v1/models` JSON payload (`{data:[{id}]}`,
+/// `{models:[...]}`, or a top-level array), preserving order and deduplicating.
+pub fn parse_models_response(bytes: &[u8]) -> std::result::Result<Vec<String>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+
+    let items = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("models").and_then(|v| v.as_array()))
+        .or_else(|| value.as_array())
+        .ok_or_else(|| "missing models array in response".to_string())?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for item in items {
+        let id = item
+            .as_str()
+            .or_else(|| item.get("id").and_then(|v| v.as_str()))
+            .or_else(|| item.get("name").and_then(|v| v.as_str()));
+        if let Some(id) = id.map(str::trim).filter(|s| !s.is_empty()) {
+            if seen.insert(id.to_string()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 /// Extract every `_original_*` key from a provider's `extra` (or a
@@ -1347,5 +1431,57 @@ mod tests {
             .unwrap();
         assert_eq!(stored.key_ref, "xfade/codex/kimi");
         assert_eq!(core.secrets().get("xfade/codex/kimi").unwrap(), "sk-new");
+    }
+
+    #[test]
+    fn parse_models_response_supports_data_models_and_array_shapes() {
+        let openai =
+            br#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},{"id":"gpt-4o"}]}"#;
+        assert_eq!(
+            parse_models_response(openai).unwrap(),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+
+        let wrapped = br#"{"models":[{"name":"claude-sonnet-5.5"},"claude-haiku-5.5"]}"#;
+        assert_eq!(
+            parse_models_response(wrapped).unwrap(),
+            vec![
+                "claude-sonnet-5.5".to_string(),
+                "claude-haiku-5.5".to_string()
+            ]
+        );
+
+        let arr = br#"[{"id":"deepseek-chat"}]"#;
+        assert_eq!(
+            parse_models_response(arr).unwrap(),
+            vec!["deepseek-chat".to_string()]
+        );
+
+        assert!(parse_models_response(br#"{"ok":true}"#).is_err());
+    }
+
+    #[test]
+    fn resolve_probe_params_rejects_official_and_returns_key_for_custom() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::with_paths(
+            &dir.path().join("home"),
+            &dir.path().join("data"),
+            Arc::new(MockStore::default()),
+        )
+        .unwrap();
+
+        let official = Provider::new("anthropic", ToolKind::ClaudeCode, None);
+        assert!(core.resolve_probe_params(&official).is_err());
+
+        let custom = Provider::new(
+            "ds",
+            ToolKind::ClaudeCode,
+            Some("https://api.deepseek.com".into()),
+        );
+        core.add_provider(custom.clone(), Some("sk-ds")).unwrap();
+        let (url, proto, key) = core.resolve_probe_params(&custom).unwrap();
+        assert_eq!(url, "https://api.deepseek.com");
+        assert_eq!(proto, ProviderProtocol::Chat);
+        assert_eq!(key.as_deref(), Some("sk-ds"));
     }
 }

@@ -76,6 +76,8 @@ export interface AddProviderInput {
   base_url: string | null;
   key: string | null;
   extra?: unknown;
+  /** Official login; when false, empty base URL / model inherit global defaults. */
+  official?: boolean;
 }
 
 export interface UpdateProviderInput {

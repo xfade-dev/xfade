@@ -2243,28 +2243,30 @@ fn cmd_status(core: &Core) -> Result<(), CoreError> {
         let dd = xfade_core::daemon::data_dir(std::path::Path::new(&home));
         if let Some(cfg) = xfade_core::daemon::read(&dd) {
             let url = format!("http://{}:{}/__xfade/status", cfg.host, cfg.port);
-            if let Ok(client) = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(500))
+            let auth = cfg.auth_token.clone();
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
             {
-                let mut req = client.get(&url);
-                if let Some(t) = &cfg.auth_token {
-                    req = req.header("Authorization", format!("Bearer {t}"));
-                }
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    if let Ok(resp) = rt.block_on(req.send()) {
-                        if resp.status().is_success() {
-                            if let Ok(dto) =
-                                rt.block_on(resp.json::<xfade_core::proxy::status::StatusDto>())
-                            {
-                                daemon_circuits = Some(dto.circuits);
-                            }
-                        }
+                daemon_circuits = rt.block_on(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_millis(500))
+                        .build()
+                        .ok()?;
+                    let mut req = client.get(url);
+                    if let Some(t) = auth {
+                        req = req.header("Authorization", format!("Bearer {t}"));
                     }
-                }
+                    let resp = req.send().await.ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let dto = resp
+                        .json::<xfade_core::proxy::status::StatusDto>()
+                        .await
+                        .ok()?;
+                    Some(dto.circuits)
+                });
             }
         }
     }
