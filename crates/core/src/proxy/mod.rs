@@ -2580,6 +2580,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_half_open_probe_slot_released_on_missing_base_url() {
+        use crate::models::{Provider, ToolKind};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A single route entry whose provider has no base_url (official): the
+        // failover loop skips it immediately after admitting the probe, which
+        // used to leak the HalfOpen probe slot and permanently reject the route
+        // with `503 no usable provider`.
+        let core = test_core(&dir, &[]);
+        core.add_provider(Provider::new("p", ToolKind::Pi, None), None)
+            .unwrap();
+        core.db()
+            .set_tool_routes("pi", &["p".into()], None, "chat")
+            .unwrap();
+
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 3,
+            success_threshold: 2,
+            timeout_seconds: 0, // instant cooldown for probe testing
+            error_rate_threshold: 0.5,
+            min_requests: 1,
+        }));
+        cb.record_failure("p");
+        cb.record_failure("p");
+        cb.record_failure("p");
+        assert_eq!(cb.state("p"), CircuitState::Open);
+
+        let svc = ProxyService::new(core).with_circuit_breaker(cb.clone());
+        let token_pi = svc.token_manager.get_or_create(ToolKind::Pi).unwrap();
+        let url = spawn_service(svc).await;
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &format!("Bearer {token_pi}"),
+        )
+        .await;
+        assert_eq!(status, 503);
+        assert_eq!(body, "no usable provider");
+
+        // The probe slot must have been released (not leaked): a subsequent
+        // request can admit a probe instead of being rejected forever.
+        assert!(
+            cb.allow_request("p"),
+            "HalfOpen probe slot must be released after a missing-base-url skip"
+        );
+    }
+
+    #[tokio::test]
     async fn test_restoring_expired_cooldown_circuit_starts_in_closed_state() {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir, &[("expired_provider", "http://127.0.0.1:9999", "k1")]);

@@ -183,6 +183,18 @@ impl ProviderCircuit {
     }
 
     fn record_success(&self, config: &CircuitBreakerConfig) {
+        self.record_success_with(config, true);
+    }
+
+    /// Record a success while optionally leaving the in-flight probe slot held.
+    ///
+    /// The streaming path releases the slot at the commit point (via the RAII
+    /// guard in `forward.rs`), then reports success asynchronously when the
+    /// stream completes. That deferred success must still advance HalfOpen
+    /// recovery, but it must NOT release the slot again — a newer probe may
+    /// have claimed it in the meantime. `release_slot = false` skips only that
+    /// release; a full recovery to `Closed` still resets everything.
+    fn record_success_with(&self, config: &CircuitBreakerConfig, release_slot: bool) {
         let current_state = self.state.load(Ordering::Acquire);
         match current_state {
             STATE_HALF_OPEN => {
@@ -195,7 +207,7 @@ impl ProviderCircuit {
                     self.total_failures.store(0, Ordering::Release);
                     self.consecutive_successes.store(0, Ordering::Release);
                     self.probe_in_flight.store(false, Ordering::Release);
-                } else {
+                } else if release_slot {
                     // Still in HalfOpen, need further successful probes: release slot for next probe
                     self.probe_in_flight.store(false, Ordering::Release);
                 }
@@ -300,6 +312,15 @@ impl CircuitBreaker {
     pub fn record_success(&self, provider_id: &str) {
         let p = self.get_or_create(provider_id);
         p.record_success(&self.config);
+    }
+
+    /// Record a successful *stream completion* for `provider_id` without
+    /// releasing the in-flight probe slot. The streaming path releases the
+    /// slot at the commit point; the deferred success here only advances
+    /// HalfOpen recovery and must not clobber a newer probe's reservation.
+    pub fn record_success_streamed(&self, provider_id: &str) {
+        let p = self.get_or_create(provider_id);
+        p.record_success_with(&self.config, false);
     }
 
     /// Record a failed request outcome for `provider_id`.
@@ -715,5 +736,39 @@ mod tests {
 
         // Next probe is now admitted
         assert!(cb.allow_request("p-probe"));
+    }
+
+    #[test]
+    fn test_record_success_streamed_advances_recovery_without_releasing_slot() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_seconds: 0,
+            error_rate_threshold: 0.5,
+            min_requests: 1,
+        });
+
+        cb.record_failure("p-streamed");
+        assert_eq!(cb.state("p-streamed"), CircuitState::Open);
+
+        // Probe admitted -> HalfOpen, slot held.
+        assert!(cb.allow_request("p-streamed"));
+        assert_eq!(cb.state("p-streamed"), CircuitState::HalfOpen);
+
+        // A deferred streamed success advances the recovery counter but must
+        // NOT release the slot (a newer probe may have claimed it).
+        cb.record_success_streamed("p-streamed");
+        assert_eq!(cb.state("p-streamed"), CircuitState::HalfOpen);
+        assert!(
+            !cb.allow_request("p-streamed"),
+            "streamed success must not release the in-flight probe slot"
+        );
+
+        // The slot is still owned; release it explicitly to simulate the next
+        // probe being handed off, then a second streamed success hits the
+        // threshold and recovers to Closed.
+        cb.release_probe("p-streamed");
+        cb.record_success_streamed("p-streamed");
+        assert_eq!(cb.state("p-streamed"), CircuitState::Closed);
     }
 }

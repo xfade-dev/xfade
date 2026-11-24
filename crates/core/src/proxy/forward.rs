@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::auth::ClientIdentity;
+use super::circuit_breaker::CircuitBreaker;
 use super::robustness;
 use super::usage::Usage;
 use super::ProxyService;
@@ -1054,6 +1055,46 @@ fn session_failed(svc: &ProxyService, session_id: Option<&str>) {
 type BodiesCache =
     std::collections::HashMap<(ProviderProtocol, Option<String>), (&'static str, Vec<u8>)>;
 
+/// RAII guard for a circuit-breaker probe reservation.
+///
+/// `CircuitBreaker::allow_request` is a *stateful* admission gate: in `Open`
+/// (cooldown elapsed) or `HalfOpen` it claims the single `probe_in_flight`
+/// slot. If the request is then skipped (missing provider, missing base URL,
+/// client disconnect) without an explicit `record_success` / `record_failure`
+/// / `release_probe`, the slot leaks and the route is permanently rejected
+/// with `503 no usable provider`. The guard returns the slot on every early
+/// `continue` / `return` / future-drop path; call `disarm()` right before the
+/// explicit release points that already free the slot.
+struct ProbeGuard<'a> {
+    cb: &'a CircuitBreaker,
+    provider_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> ProbeGuard<'a> {
+    fn new(cb: &'a CircuitBreaker, provider_id: &'a str) -> Self {
+        Self {
+            cb,
+            provider_id,
+            armed: true,
+        }
+    }
+
+    /// The caller has already released the probe slot (via `record_success`,
+    /// `record_failure`, or `release_probe`); don't release it again on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cb.release_probe(self.provider_id);
+        }
+    }
+}
+
 /// Execute the failover loop: try each route in order, skipping open circuits.
 /// Returns the final response (success or last error).
 async fn failover_loop(
@@ -1083,6 +1124,11 @@ async fn failover_loop(
         if !svc.circuit_breaker.allow_request(route_id) {
             continue;
         }
+
+        // Hold the probe reservation (if any) until an explicit outcome records
+        // or the request is skipped/dropped, so a HalfOpen probe slot can never
+        // leak and permanently reject the route with `503 no usable provider`.
+        let mut probe_guard = ProbeGuard::new(svc.circuit_breaker.as_ref(), route_id);
 
         let provider = match provider_map.get(route_id) {
             Some(p) => *p,
@@ -1137,6 +1183,7 @@ async fn failover_loop(
                     Some(&target_domain),
                     None,
                 );
+                probe_guard.disarm();
                 svc.record_failure(route_id);
                 last_err = Some((
                     StatusCode::FORBIDDEN,
@@ -1235,6 +1282,7 @@ async fn failover_loop(
                     duration_ms,
                     Some(e.clone()),
                 );
+                probe_guard.disarm();
                 svc.record_failure(route_id);
                 last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                 continue;
@@ -1258,6 +1306,7 @@ async fn failover_loop(
                     duration_ms,
                     Some("ttft_timeout".to_string()),
                 );
+                probe_guard.disarm();
                 svc.record_failure(route_id);
                 last_err = Some((
                     StatusCode::GATEWAY_TIMEOUT,
@@ -1347,6 +1396,7 @@ async fn failover_loop(
                             duration_ms,
                             Some(e.clone()),
                         );
+                        probe_guard.disarm();
                         svc.record_failure(route_id);
                         last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                         continue;
@@ -1376,6 +1426,7 @@ async fn failover_loop(
                         "status": 400,
                         "error": "model_rejection"
                     }));
+                    probe_guard.disarm();
                     svc.record_failure(route_id);
                     let transcoded = super::convert::transcode_error_body(
                         &err_bytes,
@@ -1387,6 +1438,7 @@ async fn failover_loop(
                     continue;
                 }
                 // Release in-flight probe reservation so HalfOpen is not permanently blocked
+                probe_guard.disarm();
                 svc.circuit_breaker.release_probe(route_id);
                 let out_bytes = if inbound_proto != provider.protocol {
                     super::convert::transcode_error_body(
@@ -1435,6 +1487,7 @@ async fn failover_loop(
                                 duration_ms,
                                 Some(format!("read body: {e}")),
                             );
+                            probe_guard.disarm();
                             svc.record_failure(route_id);
                             failover_trajectory.push(serde_json::json!({
                                 "provider": route_id,
@@ -1458,6 +1511,7 @@ async fn failover_loop(
                                 duration_ms,
                                 Some("read body timeout".to_string()),
                             );
+                            probe_guard.disarm();
                             svc.record_failure(route_id);
                             failover_trajectory.push(serde_json::json!({
                                 "provider": route_id,
@@ -1495,6 +1549,7 @@ async fn failover_loop(
                         duration_ms,
                         Some(msg.clone()),
                     );
+                    probe_guard.disarm();
                     svc.record_failure(route_id);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
@@ -1519,6 +1574,7 @@ async fn failover_loop(
                         duration_ms,
                         Some(format!("upstream 200 error payload: {err_msg}")),
                     );
+                    probe_guard.disarm();
                     svc.record_failure(route_id);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
@@ -1546,6 +1602,7 @@ async fn failover_loop(
                 }
 
                 // Verified non-streaming response: commit!
+                probe_guard.disarm();
                 svc.record_success(route_id);
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
@@ -1648,6 +1705,7 @@ async fn failover_loop(
                         duration_ms,
                         Some(err_str.clone()),
                     );
+                    probe_guard.disarm();
                     svc.record_failure(route_id);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
@@ -1715,6 +1773,10 @@ async fn failover_loop(
             failover_4xx,
         )
         .await;
+        // `handle_upstream_error` records the failure (and releases the probe)
+        // on the continue path; the non-qualifying 4xx branch below releases it
+        // too. Either way the guard must not release again on drop.
+        probe_guard.disarm();
         if should_continue {
             failover_trajectory.push(serde_json::json!({
                 "provider": route_id,
@@ -2154,6 +2216,20 @@ impl TailLogStream {
     }
 }
 
+impl Drop for TailLogStream {
+    fn drop(&mut self) {
+        // The client disconnected (or the response was dropped) before the
+        // stream completed: record the request and close the session so the
+        // outcome isn't silently lost. The circuit breaker is intentionally
+        // left untouched — the upstream already committed at the pre-commit
+        // gate, so a client-side abort must not penalize it.
+        if !self.done_logged {
+            self.done_logged = true;
+            self.log(Some("stream dropped before completion".to_string()));
+        }
+    }
+}
+
 impl futures::Stream for TailLogStream {
     type Item = std::io::Result<Bytes>;
 
@@ -2179,7 +2255,7 @@ impl futures::Stream for TailLogStream {
                     let err = if is_interrupted {
                         Some("upstream stream interrupted".to_string())
                     } else {
-                        this.circuit_breaker.record_success(&this.provider_id);
+                        this.circuit_breaker.record_success_streamed(&this.provider_id);
                         None
                     };
                     this.log(err);
