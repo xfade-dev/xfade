@@ -82,7 +82,9 @@ async fn status_with_managed(
 /// (reported as `managed: false`) when `daemon.json` is absent.
 pub async fn status_from_config() -> ProxyStatus {
     match config() {
-        Some(cfg) => status_with_managed(&cfg.host, cfg.port, cfg.auth_token.as_deref(), true).await,
+        Some(cfg) => {
+            status_with_managed(&cfg.host, cfg.port, cfg.auth_token.as_deref(), true).await
+        }
         None => {
             let fallback = status_with_managed("127.0.0.1", 24860, None, false).await;
             if fallback.running {

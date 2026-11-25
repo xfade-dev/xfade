@@ -322,7 +322,7 @@ export default function ProvidersPage({ onTrustChange }: { onTrustChange?: () =>
         </table>
       )}
 
-      <BackupsPanel tool={tool} onRestored={refresh} />
+      <BackupsPanel tool={tool} />
 
       {formOpen && (
         <ProviderForm

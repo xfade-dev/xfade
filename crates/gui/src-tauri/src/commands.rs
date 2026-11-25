@@ -1,6 +1,6 @@
 use crate::dto::{
-    AddProviderInput, ConfigDto, ConfigInput, ModelMapDto, ModelMappingDto, PresetDto,
-    ProxyStatus, RoutesDto, UpdateProviderInput,
+    AddProviderInput, ConfigDto, ConfigInput, ModelMapDto, ModelMappingDto, PresetDto, ProxyStatus,
+    RoutesDto, UpdateProviderInput,
 };
 use crate::state::AppState;
 use std::collections::BTreeMap;

@@ -103,8 +103,7 @@ fn raw_get_health(port: u16, timeout: Duration) -> RawHealth {
     RawHealth::Response(String::from_utf8_lossy(&buf).into_owned())
 }
 
-static DAEMON_EXE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
-    std::sync::OnceLock::new();
+static DAEMON_EXE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 /// Register an explicit `xfade` CLI executable path for background daemon
 /// spawning (used by GUI hosts where `std::env::current_exe()` is `xfade-gui`).
