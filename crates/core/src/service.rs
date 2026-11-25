@@ -4,7 +4,7 @@ use crate::error::{CoreError, Result};
 use crate::models::{Provider, ProviderProtocol, ToolKind};
 use crate::store::config::{Config, SecretsBackend, GLOBAL_API_KEY_REF};
 use crate::store::db::Database;
-use crate::store::secrets::{FileStore, KeyringStore, SecretStore};
+use crate::store::secrets::{FileStore, KeyringStore, SecretStore, VaultStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -152,12 +152,17 @@ impl Core {
     }
 
     /// Production entry: `home` = user home dir, `data_dir` = `~/.config/xfade`,
-    /// system keyring.
+    /// single-master-key encrypted vault backed by the system keyring.
     pub fn for_current_user() -> Result<Self> {
         let home =
             dirs::home_dir().ok_or_else(|| CoreError::Keyring("cannot locate home dir".into()))?;
         let data = home.join(".config").join("xfade");
-        Self::with_paths(&home, &data, Arc::new(KeyringStore::new()))
+        let keyring = Arc::new(KeyringStore::new());
+        Self::with_paths(
+            &home,
+            &data,
+            Arc::new(VaultStore::new(data.join("vault.enc"), keyring)),
+        )
     }
 
     /// Build a `Core` from environment variables, shared by CLI and GUI.
@@ -166,7 +171,7 @@ impl Core {
     /// - Secret backend resolution (highest to lowest priority):
     ///   1. `XFADE_SECRETS` env (`file` | `keyring`),
     ///   2. `<data_dir>/config.json` `secrets` field (see `xfade config`),
-    ///   3. default: system keyring.
+    ///   3. default: system keyring (single master key + encrypted `vault.enc`).
     pub fn from_env() -> Result<Self> {
         let home = std::env::var("HOME").map_err(|_| CoreError::Keyring("HOME not set".into()))?;
         let home = Path::new(&home);
@@ -178,7 +183,8 @@ impl Core {
             Arc::new(FileStore::new(data.join("secrets.json")))
         } else {
             let cfg = Config::load(&data);
-            Arc::new(KeyringStore::with_allow_all_acl(cfg.keychain_allow_all))
+            let keyring = Arc::new(KeyringStore::with_allow_all_acl(cfg.keychain_allow_all));
+            Arc::new(VaultStore::new(data.join("vault.enc"), keyring))
         };
         let mut core = Self::with_paths(home, &data, secrets)?;
         core.active_secrets = Some(backend);

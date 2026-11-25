@@ -6599,7 +6599,7 @@ dependencies = [
 
 [[package]]
 name = "xfade"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -6622,7 +6622,7 @@ dependencies = [
 
 [[package]]
 name = "xfade-core"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "axum",
  "criterion",
@@ -6632,6 +6632,7 @@ dependencies = [
  "keyring",
  "rand 0.8.8",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6647,7 +6648,7 @@ dependencies = [
 
 [[package]]
 name = "xfade-gui"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "log",
  "reqwest 0.12.28",

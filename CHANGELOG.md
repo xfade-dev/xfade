@@ -2,6 +2,12 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.13.3 — 2026-11-25
+
+### Single-Master-Key Encrypted Vault
+- **feat(secrets,core)**: Replace per-provider OS keyring storage with `VaultStore`, storing **only one** 256-bit master key (`xfade/master_key`) in the OS keyring and encrypting all provider API keys at rest in `<data_dir>/vault.enc` (`0600` permissions) using AES-256-GCM (`ring`).
+- **feat(migration,doctor)**: Lazily migrate existing per-provider keyring entries into `vault.enc` on first read (and clean up the old per-provider entries), and update `xfade doctor --security --fix` to normalize the single `xfade/master_key` ACL and migrate legacy entries.
+
 ## v0.13.2 — 2026-11-25
 
 ### macOS Keychain Prompt & ACL Fixes

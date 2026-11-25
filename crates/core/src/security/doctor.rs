@@ -505,11 +505,23 @@ fn is_loopback_url(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
 }
 
-/// Re-write each `key_ref` in place so its macOS Keychain ACL allows all
-/// applications. Stops immediately on any keyring error (e.g. user canceled or
-/// denied authorization) instead of popping up a dialog for every remaining key.
+/// Refresh the single master key ACL (if any) and migrate/normalize each
+/// `key_ref` into the encrypted vault with allow-all ACLs. Stops immediately
+/// on any keyring error (e.g. user canceled or denied authorization).
 fn normalize_keychain_acls(secrets: &dyn SecretStore, key_refs: &[String]) -> Vec<String> {
     let mut actions = Vec::new();
+    match secrets.normalize_master_key() {
+        Ok(true) => {
+            actions.push("Updated macOS Keychain ACL (allow-all) for xfade/master_key".into())
+        }
+        Ok(false) => {}
+        Err(e) => {
+            actions.push(format!(
+                "Stopped macOS Keychain ACL fix at xfade/master_key: {e}"
+            ));
+            return actions;
+        }
+    }
     for key_ref in key_refs {
         match secrets.get(key_ref) {
             Ok(secret) => match secrets.set(key_ref, &secret) {

@@ -25,6 +25,7 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true }
 sha2 = { workspace = true }
+ring = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]

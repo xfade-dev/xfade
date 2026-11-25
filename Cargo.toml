@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/cli", "crates/gui/src-tauri"]
 
 [workspace.package]
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xfade-dev/xfade"
@@ -28,4 +28,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 sha2 = "0.10"
+ring = "0.17"
 rand = "0.8"
