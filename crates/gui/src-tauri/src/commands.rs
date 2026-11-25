@@ -55,9 +55,10 @@ pub async fn add_provider(state: State<'_, AppState>, input: AddProviderInput) -
             .filter(|u| !u.is_empty());
         if !input.official && requested.is_none() && core.effective_base_url(None, false).is_none()
         {
-            return Err(
-                "Base URL required (set global default in Settings or enable Official)".into(),
-            );
+            return Err(xfade_core::CoreError::ConfigParse {
+                path: "base_url".into(),
+                msg: "Base URL required (set global default in Settings or enable Official)".into(),
+            });
         }
         let extra = if input.extra.is_null() {
             serde_json::Value::Null
@@ -95,13 +96,19 @@ pub async fn update_provider(
             .ok_or_else(|| {
                 xfade_core::CoreError::ProviderNotFound(format!("{}/{}", input.tool, input.id))
             })?;
+        let was_active = p.is_active;
+        let direct = was_active && core.is_direct(p.tool).unwrap_or(false);
         p.base_url = input.base_url;
         p.protocol = match input.protocol {
             Some(proto) => proto,
             None => Provider::new(&p.id, p.tool, p.base_url.clone()).protocol,
         };
         p.extra = input.extra;
-        core.update_provider(&p, input.key.as_deref())
+        core.update_provider(&p, input.key.as_deref())?;
+        if was_active {
+            core.use_provider(p.tool, &p.id, direct)?;
+        }
+        Ok(())
     })
     .await
     .map_err(err)?

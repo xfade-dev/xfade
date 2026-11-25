@@ -60,10 +60,11 @@ export default function ProviderForm({
   }, [tool]);
 
   const applyPreset = (p: PresetDto | null) => {
-    if (!p) return;
+    if (!p || editing) return;
     setId(p.id);
     setBaseUrl(p.base_url ?? "");
     setOfficial(p.is_official);
+    setProtocol("");
     const ex = readExtraObject(p.extra);
     setModel(typeof ex.model === "string" ? ex.model : "");
     setExtraText(
@@ -97,6 +98,12 @@ export default function ProviderForm({
     setErr(null);
     if (!id.trim()) {
       setErr("Name is required");
+      return;
+    }
+    // In edit mode: non-official providers must have a base URL (empty would
+    // silently promote them to Official via base_url=null in the backend).
+    if (editing && !official && !baseUrl.trim()) {
+      setErr("Base URL is required (or check Official login)");
       return;
     }
     let extraObj: Record<string, unknown> = {};
@@ -146,6 +153,7 @@ export default function ProviderForm({
           {editing ? `Edit ${editing.id}` : "Add Provider"}
         </h3>
         <div className="space-y-3">
+          {!editing && (
           <div>
             <label className="block text-xs text-gray-500 mb-1">Preset</label>
             <select
@@ -164,6 +172,7 @@ export default function ProviderForm({
               ))}
             </select>
           </div>
+          )}
           <div>
             <label className="block text-xs text-gray-500 mb-1">Name</label>
             <input

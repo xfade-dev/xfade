@@ -67,6 +67,11 @@ export default function ProvidersPage({ onTrustChange }: { onTrustChange?: () =>
   }, [refresh]);
 
   const probeOne = async (id: string) => {
+    // Official providers have no base_url — latency probe returns null and
+    // model listing uses OAuth tokens. Skip silently to avoid a false "✖ down".
+    const provider = list.find((p) => p.id === id);
+    if (provider && provider.base_url === null) return;
+
     setLatencies((prev) => ({ ...prev, [id]: { status: "probing" } }));
     setProbingModels((prev) => ({ ...prev, [id]: true }));
     const [latRes, modRes] = await Promise.allSettled([
@@ -82,6 +87,8 @@ export default function ProvidersPage({ onTrustChange }: { onTrustChange?: () =>
     }));
     if (modRes.status === "fulfilled") {
       setModelCache((prev) => ({ ...prev, [id]: modRes.value }));
+    } else {
+      setToast({ message: `Model probe failed for ${id}: ${modRes.reason}`, kind: "error" });
     }
     setProbingModels((prev) => ({ ...prev, [id]: false }));
   };
