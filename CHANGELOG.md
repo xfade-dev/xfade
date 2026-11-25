@@ -2,6 +2,17 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.0 — 2026-11-25
+
+### GUI TUI Parity & Hardening
+- **feat(gui)**: Add latency & `/v1/models` catalog probing (`Probe` / `Probe All`), ad-hoc form probing with unsaved field overrides, protocol selector (`chat` / `messages` / `responses`), and model field with probed autocomplete in `ProviderForm`.
+- **feat(gui)**: Add `Direct` switch mode with confirmation warning, `RoutesEditor` per-route upstream model & checkbox ordering, `ModelMapEditor` (`alias → provider=upstream_model` + `models-merge`), and `SecurityDoctorPanel` with one-click fixes.
+- **feat(gui)**: Add sidebar proxy status indicator, restart action, TrustState badge, external/unmanaged proxy detection, `keychain_allow_all` toggle, and global `api` selector in `SettingsPage`.
+- **fix(gui,daemon)**: Separate daemon stop from uninstall so `Stop` preserves `daemon.json`, add `systemctl --user daemon-reload` on Linux `load`/`unload`, and prevent missing sidecar fallback from spawning `xfade-gui`.
+- **security(gui)**: Enforce Tauri CSP (`default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; ...`), remove `shell:allow-execute` capability, and fix Windows sidecar `.exe` extension in `build-sidecar.sh`.
+- **refactor(core)**: Share `probe_target`/`probe_latency`, add `SecretStore::normalize_key_acl` so `VaultStore` only migrates legacy keyring entries, and make `KeyringStore.allow_all_acl` live-updatable via `AtomicBool`.
+- **chore(ci)**: Upgrade GitHub Actions (`checkout`, `setup-node`, `upload-artifact`, `download-artifact`) to Node 24-compatible versions.
+
 ## v0.13.5 — 2026-11-25
 
 ### Proxy Upstream Compression Fix
