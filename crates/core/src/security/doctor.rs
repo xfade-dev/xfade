@@ -1,5 +1,5 @@
 use crate::adapters::adapter_for;
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::models::ToolKind;
 use crate::service::Core;
 use crate::store::config::{SecretsBackend, GLOBAL_API_KEY_REF};
@@ -523,19 +523,13 @@ fn normalize_keychain_acls(secrets: &dyn SecretStore, key_refs: &[String]) -> Ve
         }
     }
     for key_ref in key_refs {
-        match secrets.get(key_ref) {
-            Ok(secret) => match secrets.set(key_ref, &secret) {
-                Ok(()) => {
-                    actions.push(format!(
-                        "Updated macOS Keychain ACL (allow-all) for {key_ref}"
-                    ));
-                }
-                Err(e) => {
-                    actions.push(format!("Stopped macOS Keychain ACL fix at {key_ref}: {e}"));
-                    break;
-                }
-            },
-            Err(CoreError::SecretNotFound(_)) => continue,
+        match secrets.normalize_key_acl(key_ref) {
+            Ok(true) => {
+                actions.push(format!(
+                    "Updated macOS Keychain ACL (allow-all) for {key_ref}"
+                ));
+            }
+            Ok(false) => continue,
             Err(e) => {
                 actions.push(format!("Stopped macOS Keychain ACL fix at {key_ref}: {e}"));
                 break;
@@ -548,6 +542,7 @@ fn normalize_keychain_acls(secrets: &dyn SecretStore, key_refs: &[String]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CoreError;
     use crate::models::Provider;
     use std::sync::Arc;
 

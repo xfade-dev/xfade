@@ -241,7 +241,12 @@ pub async fn set_config(state: State<'_, AppState>, input: ConfigInput) -> CmdRe
             if let Some(allow) = input.keychain_allow_all {
                 core.set_keychain_allow_all(allow)?;
             }
-            if let Some(k) = input.api_key.as_deref().filter(|k| !k.is_empty()) {
+            if let Some(k) = input
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            {
                 core.set_global_api_key(k)?;
             }
             let cfg = core.config();
@@ -413,20 +418,47 @@ pub async fn probe_provider_models(
     state: State<'_, AppState>,
     tool: ToolKind,
     id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    protocol: Option<ProviderProtocol>,
 ) -> CmdResult<Vec<String>> {
     let core = state.core.clone();
-    let (base_url, protocol, key) = tauri::async_runtime::spawn_blocking(move || {
-        let p = core
-            .list(Some(tool))
-            .map_err(err)?
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| format!("provider not found: {tool}/{id}"))?;
-        core.resolve_probe_params(&p).map_err(err)
-    })
+    let key_override = api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let url_override = base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let (resolved_url, resolved_proto, stored_key) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut p = core
+                .list(Some(tool))
+                .map_err(err)?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| format!("provider not found: {tool}/{id}"))?;
+            if let Some(u) = url_override {
+                p.base_url = Some(u);
+            }
+            if let Some(proto) = protocol {
+                p.protocol = proto;
+            }
+            core.resolve_probe_params(&p).map_err(err)
+        })
+        .await
+        .map_err(err)??;
+    let effective_key = key_override.or(stored_key);
+    probe_models_http(
+        &resolved_url,
+        resolved_proto,
+        effective_key.as_deref(),
+        Duration::from_secs(5),
+    )
     .await
-    .map_err(err)??;
-    probe_models_http(&base_url, protocol, key.as_deref(), Duration::from_secs(5)).await
 }
 
 #[tauri::command]

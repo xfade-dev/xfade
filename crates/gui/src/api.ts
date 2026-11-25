@@ -90,8 +90,27 @@ export const recentLogs = (limit: number) =>
 export const probeProviderLatency = (tool: ToolKind, id: string) =>
   invoke<number | null>("probe_provider_latency", { tool, id });
 
-export const probeProviderModels = (tool: ToolKind, id: string) =>
-  invoke<string[]>("probe_provider_models", { tool, id });
+export const probeProviderModels = (
+  tool: ToolKind,
+  id: string,
+  overrides?: {
+    baseUrl?: string | null;
+    apiKey?: string | null;
+    protocol?: ProviderProtocol | null;
+  }
+) =>
+  invoke<string[]>(
+    "probe_provider_models",
+    overrides
+      ? {
+          tool,
+          id,
+          baseUrl: overrides.baseUrl ?? null,
+          apiKey: overrides.apiKey ?? null,
+          protocol: overrides.protocol ?? null,
+        }
+      : { tool, id }
+  );
 
 export const probeModelsAdhoc = (
   baseUrl: string,

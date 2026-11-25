@@ -117,6 +117,9 @@ export default function ModelMapEditor() {
               {id}
             </option>
           ))}
+          {providerId !== "*" && !providerIds.includes(providerId) && (
+            <option value={providerId}>{providerId}</option>
+          )}
         </select>
         <input
           className="border rounded px-2 py-1.5 text-sm font-mono flex-1 min-w-[140px]"

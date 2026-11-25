@@ -188,7 +188,10 @@ pub fn load(home: &Path) -> Result<()> {
                 "daemon not installed; run `xfade serve install` first".into(),
             ));
         }
-        // systemctl --user enable + start
+        // systemctl --user daemon-reload + enable + start
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "enable", "--now", LABEL])
             .status();
@@ -299,6 +302,9 @@ pub fn unload(home: &Path) -> Result<()> {
             .args(["--user", "disable", LABEL])
             .status();
         let _ = std::fs::remove_file(systemd_unit_path());
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
     }
     Ok(())
 }

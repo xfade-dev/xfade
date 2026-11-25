@@ -36,6 +36,21 @@ pub trait SecretStore: Send + Sync {
         Ok(false)
     }
 
+    /// Migrate a legacy per-entry secret for `key_ref` into the vault (or
+    /// refresh its ACL in-place when stored directly in the OS keyring).
+    /// Returns `Ok(true)` if an entry was updated/migrated, `Ok(false)` if
+    /// already vaulted or absent.
+    fn normalize_key_acl(&self, key_ref: &str) -> Result<bool> {
+        match self.get(key_ref) {
+            Ok(secret) => {
+                self.set(key_ref, &secret)?;
+                Ok(true)
+            }
+            Err(CoreError::SecretNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Update the macOS "allow all applications" ACL setting in-place for stores
     /// backed by the OS keychain.
     fn set_allow_all_acl(&self, _allow: bool) {}
@@ -147,14 +162,19 @@ fn set_password_macos_allow_all(service: &str, key_ref: &str, secret: &str) -> R
         .map_err(|e| CoreError::Keyring(format!("spawn security: {e}")))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(cmd_line.as_bytes())
-            .map_err(|e| CoreError::Keyring(format!("write security stdin: {e}")))?;
+        if let Err(e) = stdin.write_all(cmd_line.as_bytes()) {
+            let _ = entry.set_password(secret);
+            return Err(CoreError::Keyring(format!("write security stdin: {e}")));
+        }
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| CoreError::Keyring(format!("wait security: {e}")))?;
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = entry.set_password(secret);
+            return Err(CoreError::Keyring(format!("wait security: {e}")));
+        }
+    };
     if !output.status.success() {
         // Restore via keyring if `security` failed after we deleted the old item.
         let _ = entry.set_password(secret);
@@ -212,10 +232,8 @@ impl SecretStore for KeyringStore {
         #[cfg(target_os = "macos")]
         {
             if self.allow_all_acl()
-                && !secret.contains('\n')
-                && !secret.contains('\r')
-                && !key_ref.contains('\n')
-                && !key_ref.contains('\r')
+                && !secret.contains(['\n', '\r', '\0'])
+                && !key_ref.contains(['\n', '\r', '\0'])
             {
                 set_password_macos_allow_all(&self.service, key_ref, secret)?;
                 self.cache
@@ -604,6 +622,22 @@ impl SecretStore for VaultStore {
         match self.master_keyring.get(MASTER_KEY_REF) {
             Ok(hex_str) => {
                 self.master_keyring.set(MASTER_KEY_REF, &hex_str)?;
+                Ok(true)
+            }
+            Err(CoreError::SecretNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn normalize_key_acl(&self, key_ref: &str) -> Result<bool> {
+        if key_ref == MASTER_KEY_REF {
+            return self.normalize_master_key();
+        }
+        // Only migrate entries still stored in the legacy OS keyring;
+        // secrets already inside `vault.enc` do not need re-encryption.
+        match self.master_keyring.get(key_ref) {
+            Ok(secret) => {
+                self.set(key_ref, &secret)?;
                 Ok(true)
             }
             Err(CoreError::SecretNotFound(_)) => Ok(false),

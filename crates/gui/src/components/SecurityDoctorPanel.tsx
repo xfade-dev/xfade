@@ -18,7 +18,7 @@ const CHECK_ICON: Record<CheckStatus, { icon: string; cls: string }> = {
 export default function SecurityDoctorPanel({
   onTrustChange,
 }: {
-  onTrustChange?: () => void;
+  onTrustChange?: (trust?: TrustState) => void;
 }) {
   const [report, setReport] = useState<SecurityDoctorReport | null>(null);
   const [loading, setLoading] = useState(true);
@@ -31,7 +31,7 @@ export default function SecurityDoctorPanel({
     securityDoctor()
       .then((r) => {
         setReport(r);
-        onTrustChange?.();
+        onTrustChange?.(r.overall_trust);
       })
       .catch((e) => setToast({ message: String(e), kind: "error" }))
       .finally(() => setLoading(false));

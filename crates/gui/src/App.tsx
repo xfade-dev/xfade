@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { proxyRestart, proxyStatus as fetchProxyStatus, securityDoctor } from "./api";
 import Layout, { type Page } from "./components/Layout";
+import Toast from "./components/Toast";
 import ProvidersPage from "./pages/ProvidersPage";
 import ProxyPage from "./pages/ProxyPage";
 import StatsPage from "./pages/StatsPage";
@@ -14,27 +15,46 @@ export default function App() {
   const [proxyStatus, setProxyStatus] = useState<ProxyStatus | null>(null);
   const [trustState, setTrustState] = useState<TrustState | null>(null);
   const [restartingProxy, setRestartingProxy] = useState(false);
+  const [toast, setToast] = useState<{ message: string; kind: "error" | "success" } | null>(null);
 
-  const refreshGlobalStatus = useCallback(() => {
+  const refreshProxy = useCallback(() => {
     fetchProxyStatus()
       .then(setProxyStatus)
       .catch(() => {});
+  }, []);
+
+  const refreshTrust = useCallback(() => {
     securityDoctor()
       .then((r) => setTrustState(r.overall_trust))
       .catch(() => {});
   }, []);
 
+  const refreshGlobalStatus = useCallback(() => {
+    refreshProxy();
+    refreshTrust();
+  }, [refreshProxy, refreshTrust]);
+
   useEffect(() => {
     refreshGlobalStatus();
-    const timer = setInterval(refreshGlobalStatus, 5000);
-    return () => clearInterval(timer);
-  }, [refreshGlobalStatus]);
+    const proxyTimer = setInterval(() => {
+      if (!document.hidden) refreshProxy();
+    }, 5000);
+    const trustTimer = setInterval(() => {
+      if (!document.hidden) refreshTrust();
+    }, 30000);
+    return () => {
+      clearInterval(proxyTimer);
+      clearInterval(trustTimer);
+    };
+  }, [refreshGlobalStatus, refreshProxy, refreshTrust]);
 
   const handleRestartProxy = async () => {
     setRestartingProxy(true);
     try {
       const s = await proxyRestart();
       setProxyStatus(s);
+    } catch (e) {
+      setToast({ message: `Proxy restart failed: ${e}`, kind: "error" });
     } finally {
       setRestartingProxy(false);
     }
@@ -65,7 +85,17 @@ export default function App() {
       {page === "settings" && (
         <SettingsPage
           initialTab={settingsTab}
-          onTrustChange={refreshGlobalStatus}
+          onTrustChange={(trust) => {
+            if (trust) setTrustState(trust);
+            else refreshTrust();
+          }}
+        />
+      )}
+      {toast && (
+        <Toast
+          message={toast.message}
+          kind={toast.kind}
+          onClose={() => setToast(null)}
         />
       )}
     </Layout>

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getConfig, setConfig } from "../api";
-import type { ConfigDto } from "../types";
+import type { ConfigDto, TrustState } from "../types";
 import SecurityDoctorPanel from "../components/SecurityDoctorPanel";
 import Toast from "../components/Toast";
 
@@ -44,7 +44,7 @@ export default function SettingsPage({
   onTrustChange,
 }: {
   initialTab?: SettingsTab;
-  onTrustChange?: () => void;
+  onTrustChange?: (trust?: TrustState) => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [cfg, setCfg] = useState<ConfigDto>(EMPTY);
@@ -75,7 +75,7 @@ export default function SettingsPage({
         base_url: cfg.base_url ?? "",
         model: cfg.model ?? "",
         api: cfg.api ?? "",
-        api_key: apiKey ? apiKey : null,
+        api_key: apiKey.trim() || null,
         keychain_allow_all: cfg.keychain_allow_all,
       });
       setCfg(updated);

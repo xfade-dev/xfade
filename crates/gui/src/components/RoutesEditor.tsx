@@ -64,6 +64,14 @@ export default function RoutesEditor() {
 
   const save = async () => {
     try {
+      if (routes.length === 0) {
+        await clearRoutes();
+        setRouteModels({});
+        setModelOverride("");
+        setTargetProtocol("chat");
+        setToast({ message: "Routes cleared", kind: "success" });
+        return;
+      }
       const cleanedModels: Record<string, string> = {};
       for (const id of routes) {
         const m = routeModels[id]?.trim();

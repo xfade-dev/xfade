@@ -74,10 +74,18 @@ export default function ProviderForm({
 
   const probeModels = async () => {
     setErr(null);
+    if (!official && !baseUrl.trim()) {
+      setErr("Base URL is required");
+      return;
+    }
     setProbing(true);
     try {
       const models = editing
-        ? await probeProviderModels(tool, editing.id)
+        ? await probeProviderModels(tool, editing.id, {
+            baseUrl: official ? null : baseUrl.trim() || null,
+            apiKey: key.trim() || null,
+            protocol: protocol || null,
+          })
         : await probeModelsAdhoc(
             baseUrl,
             key.trim() || null,
