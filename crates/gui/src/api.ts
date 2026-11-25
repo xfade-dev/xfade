@@ -3,11 +3,14 @@ import type {
   AddProviderInput,
   ConfigDto,
   ConfigInput,
+  ModelMapDto,
   PresetDto,
   Provider,
+  ProviderProtocol,
   ProxyStatus,
   RequestLog,
   RoutesDto,
+  SecurityDoctorReport,
   StatsGroupBy,
   StatsRow,
   ToolKind,
@@ -26,8 +29,11 @@ export const updateProvider = (input: UpdateProviderInput) =>
 export const removeProvider = (tool: ToolKind, id: string) =>
   invoke<void>("remove_provider", { tool, id });
 
-export const useProvider = (tool: ToolKind, id: string) =>
-  invoke<void>("use_provider", { tool, id });
+export const useProvider = (tool: ToolKind, id: string, direct = false) =>
+  invoke<void>("use_provider", { tool, id, direct });
+
+export const isToolDirect = (tool: ToolKind) =>
+  invoke<boolean>("is_tool_direct", { tool });
 
 export const currentProvider = (tool: ToolKind) =>
   invoke<Provider | null>("current_provider", { tool });
@@ -54,6 +60,8 @@ export const proxyStart = (host: string, port: number, authToken: string | null)
 
 export const proxyStop = () => invoke<ProxyStatus>("proxy_stop");
 
+export const proxyRestart = () => invoke<ProxyStatus>("proxy_restart");
+
 export const proxyStatus = () => invoke<ProxyStatus>("proxy_status");
 
 export const getRoutes = () => invoke<RoutesDto | null>("get_routes");
@@ -61,12 +69,14 @@ export const getRoutes = () => invoke<RoutesDto | null>("get_routes");
 export const setRoutes = (
   routes: string[],
   modelOverride: string | null,
-  targetProtocol: string
+  targetProtocol: string,
+  routeModels?: Record<string, string>
 ) =>
   invoke<void>("set_routes", {
     routes,
     modelOverride,
     targetProtocol,
+    routeModels: routeModels ?? null,
   });
 
 export const clearRoutes = () => invoke<void>("clear_routes");
@@ -76,3 +86,30 @@ export const stats = (since: string, by: StatsGroupBy) =>
 
 export const recentLogs = (limit: number) =>
   invoke<RequestLog[]>("recent_logs", { limit });
+
+export const probeProviderLatency = (tool: ToolKind, id: string) =>
+  invoke<number | null>("probe_provider_latency", { tool, id });
+
+export const probeProviderModels = (tool: ToolKind, id: string) =>
+  invoke<string[]>("probe_provider_models", { tool, id });
+
+export const probeModelsAdhoc = (
+  baseUrl: string,
+  apiKey: string | null,
+  protocol: ProviderProtocol | null
+) => invoke<string[]>("probe_models_adhoc", { baseUrl, apiKey, protocol });
+
+export const getModelMap = () => invoke<ModelMapDto>("get_model_map");
+
+export const setModelMapping = (alias: string, providerId: string, upstreamModel: string) =>
+  invoke<void>("set_model_mapping", { alias, providerId, upstreamModel });
+
+export const removeModelMapping = (alias: string, providerId?: string) =>
+  invoke<void>("remove_model_mapping", { alias, providerId: providerId ?? null });
+
+export const setModelsMerge = (enabled: boolean) =>
+  invoke<void>("set_models_merge", { enabled });
+
+export const securityDoctor = () => invoke<SecurityDoctorReport>("security_doctor");
+
+export const securityDoctorFix = () => invoke<string[]>("security_doctor_fix");
