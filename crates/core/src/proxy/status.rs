@@ -67,7 +67,10 @@ pub async fn handle(State(svc): State<Arc<ProxyService>>) -> impl IntoResponse {
         .unwrap_or((vec![], None, "chat".to_string()));
     let mut provider_ids: Vec<String> = svc.circuit_breaker.providers();
     for r in &routes {
-        if !provider_ids.contains(r) {
+        let already_tracked = provider_ids
+            .iter()
+            .any(|k| k == r || k.ends_with(&format!("/{r}")));
+        if !already_tracked {
             provider_ids.push(r.clone());
         }
     }

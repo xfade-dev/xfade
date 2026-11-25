@@ -261,7 +261,7 @@ async fn test_scenario_1_pre_commit_upstream_200_error_body_fails_over() {
         "failover header must track trajectory"
     );
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "candidate 1 failure must be recorded on circuit breaker"
     );
@@ -331,7 +331,7 @@ async fn test_scenario_2_pre_commit_ttft_timeout_fails_over() {
         "expected fast response from candidate 2, got: {body}"
     );
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "TTFT timeout must record failure on candidate 1"
     );
@@ -418,7 +418,7 @@ async fn test_scenario_3_post_commit_mid_stream_connection_drop_synthesizes_erro
     );
     // 4. Candidate 1 marked failed on circuit breaker
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "interrupted stream must record failure on circuit breaker"
     );
@@ -503,7 +503,7 @@ async fn test_scenario_4_post_commit_tool_call_interruption_non_retryable() {
     );
     // 4. Candidate 1 marked failed on circuit breaker
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "interrupted tool-call stream must record failure on circuit breaker"
     );
@@ -580,7 +580,7 @@ async fn test_scenario_5_intra_upstream_retry_with_retry_after() {
     );
     // Candidate 1 circuit breaker did not trip
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         0,
         "successful retry must not record circuit breaker failure"
     );
@@ -668,7 +668,7 @@ async fn test_scenario_6_heterogeneous_protocol_post_commit_interruption_synthes
     );
     // 4. Candidate 1 circuit breaker marked failed
     assert_eq!(
-        cb.failure_count("p1"),
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "interrupted upstream must record circuit breaker failure"
     );

@@ -2,6 +2,12 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.13.1 — 2026-11-25
+
+### Circuit Isolation & Keychain Upgrade Ergonomics
+- **fix(proxy,router)**: Scope circuit-breaker keys by `(tool, provider_id)` (`circuit_key(tool, id)`) and pass `&Provider` to router circuit checks so tools sharing the same provider ID never share circuit state or mix credentials.
+- **feat(secrets,cli)**: Add `keychain_allow_all` config option (default `true`) and in-memory `KeyringStore` cache so macOS Keychain entries survive Homebrew binary cdhash changes without repeated authorization prompts; `xfade doctor --fix` can refresh active credential ACLs.
+
 ## v0.13.0 — 2026-11-24
 
 ### TUI Model Probing, Model Mapping & Multi-Route Configuration

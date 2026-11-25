@@ -2,7 +2,9 @@ use crate::adapters::adapter_for;
 use crate::error::Result;
 use crate::models::ToolKind;
 use crate::service::Core;
+use crate::store::config::{SecretsBackend, GLOBAL_API_KEY_REF};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrustState {
@@ -294,7 +296,62 @@ impl<'a> SecurityDoctor<'a> {
             }
         }
 
+        // 3. On macOS with Keyring + keychain_allow_all, normalize ACLs for active/routed
+        //    keychain entries so Homebrew upgrades do not re-trigger authorization prompts.
+        actions.extend(self.fix_keychain_acls());
+
         Ok(actions)
+    }
+
+    /// Re-write keychain entries for active and routed providers (plus global API key)
+    /// so macOS Keychain items receive the allow-all ACL (`-T ""`).
+    /// Only touches in-use entries to avoid prompting for unused legacy keys.
+    fn fix_keychain_acls(&self) -> Vec<String> {
+        let mut actions = Vec::new();
+        if !cfg!(target_os = "macos")
+            || self.core.active_secrets_backend() != Some(SecretsBackend::Keyring)
+            || !self.core.config().keychain_allow_all
+        {
+            return actions;
+        }
+
+        let mut route_ids: HashSet<String> = HashSet::new();
+        if let Ok(Some((routes, _, _))) = self.core.db().get_routes() {
+            route_ids.extend(routes);
+        }
+        for tool in ToolKind::ALL {
+            if let Ok(Some((routes, _, _))) = self.core.db().get_tool_routes(tool.as_str()) {
+                route_ids.extend(routes);
+            }
+        }
+
+        let mut key_refs: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Ok(providers) = self.core.list(None) {
+            for p in providers {
+                if !p.is_official()
+                    && (p.is_active || route_ids.contains(&p.id))
+                    && seen.insert(p.key_ref.clone())
+                {
+                    key_refs.push(p.key_ref);
+                }
+            }
+        }
+        if seen.insert(GLOBAL_API_KEY_REF.to_string()) {
+            key_refs.push(GLOBAL_API_KEY_REF.to_string());
+        }
+
+        for key_ref in key_refs {
+            if let Ok(secret) = self.core.secrets().get(&key_ref) {
+                if self.core.secrets().set(&key_ref, &secret).is_ok() {
+                    actions.push(format!(
+                        "Updated macOS Keychain ACL (allow-all) for {key_ref}"
+                    ));
+                }
+            }
+        }
+
+        actions
     }
 
     fn audit_file_permissions(&self) -> Vec<SecurityCheckItem> {

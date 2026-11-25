@@ -1,6 +1,6 @@
 use crate::error::{CoreError, Result};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 pub trait SecretStore: Send + Sync {
     fn set(&self, key_ref: &str, secret: &str) -> Result<()>;
@@ -26,8 +26,14 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// System keyring implementation (macOS Keychain / Windows Credential Manager / Linux Secret Service).
+///
+/// Caches retrieved secrets in memory for the lifetime of the store so a
+/// long-running daemon reads each key from the OS keychain at most once.
 pub struct KeyringStore {
     service: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    allow_all_acl: bool,
+    cache: RwLock<HashMap<String, String>>,
 }
 
 /// Current keyring service name.
@@ -37,14 +43,75 @@ pub const LEGACY_SERVICE: &str = "agent-switch";
 
 impl KeyringStore {
     pub fn new() -> Self {
+        Self::with_allow_all_acl(true)
+    }
+
+    pub fn with_allow_all_acl(allow_all_acl: bool) -> Self {
         Self {
             service: SERVICE.into(),
+            allow_all_acl,
+            cache: RwLock::new(HashMap::new()),
         }
     }
 
     fn entry(&self, key_ref: &str) -> Result<keyring::Entry> {
         keyring::Entry::new(&self.service, key_ref).map_err(|e| CoreError::Keyring(e.to_string()))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn quote_security_arg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn set_password_macos_allow_all(service: &str, key_ref: &str, secret: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cmd_line = format!(
+        "add-generic-password -s {} -a {} -w {} -U -T \"\"\n",
+        quote_security_arg(service),
+        quote_security_arg(key_ref),
+        quote_security_arg(secret),
+    );
+    let mut child = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CoreError::Keyring(format!("spawn security: {e}")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(cmd_line.as_bytes())
+            .map_err(|e| CoreError::Keyring(format!("write security stdin: {e}")))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CoreError::Keyring(format!("wait security: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CoreError::Keyring(format!(
+            "security add-generic-password failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Read a password on a worker thread so a slow keychain read (macOS waiting
@@ -83,19 +150,58 @@ impl Default for KeyringStore {
 
 impl SecretStore for KeyringStore {
     fn set(&self, key_ref: &str, secret: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.allow_all_acl
+                && !secret.contains('\n')
+                && !secret.contains('\r')
+                && !key_ref.contains('\n')
+                && !key_ref.contains('\r')
+            {
+                set_password_macos_allow_all(&self.service, key_ref, secret)?;
+                self.cache
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key_ref.to_string(), secret.to_string());
+                return Ok(());
+            }
+        }
         self.entry(key_ref)?
             .set_password(secret)
-            .map_err(|e| CoreError::Keyring(e.to_string()))
+            .map_err(|e| CoreError::Keyring(e.to_string()))?;
+        self.cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key_ref.to_string(), secret.to_string());
+        Ok(())
     }
 
     fn get(&self, key_ref: &str) -> Result<String> {
-        get_password_with_hint(self.entry(key_ref)?, key_ref)
+        if let Some(cached) = self
+            .cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key_ref)
+        {
+            return Ok(cached.clone());
+        }
+        let secret = get_password_with_hint(self.entry(key_ref)?, key_ref)?;
+        self.cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key_ref.to_string(), secret.clone());
+        Ok(secret)
     }
 
     fn delete(&self, key_ref: &str) -> Result<()> {
         match self.entry(key_ref)?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring::Error::NoEntry) => {
+                self.cache
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key_ref);
+                Ok(())
+            }
             Err(e) => Err(CoreError::Keyring(e.to_string())),
         }
     }
@@ -239,5 +345,16 @@ mod tests {
         s.set("a/b", "sk-123").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secrets file must be owner-only");
+    }
+
+    #[test]
+    fn keyring_store_serves_from_in_memory_cache() {
+        let store = KeyringStore::new();
+        store
+            .cache
+            .write()
+            .unwrap()
+            .insert("xfade/claude/devops".into(), "sk-cached-123".into());
+        assert_eq!(store.get("xfade/claude/devops").unwrap(), "sk-cached-123");
     }
 }

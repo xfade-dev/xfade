@@ -32,6 +32,13 @@ use time::OffsetDateTime;
 pub const FAIL_THRESHOLD: u32 = 3;
 pub const COOLDOWN_SECS: u64 = 60;
 
+/// Canonical circuit-breaker key scoped by `(tool, provider_id)` so two tools
+/// sharing the same provider name (e.g. `claude/devops` and `pi/devops`) do
+/// not share circuit state.
+pub fn circuit_key(tool: crate::models::ToolKind, id: &str) -> String {
+    format!("{}/{id}", tool.as_str())
+}
+
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -727,11 +734,12 @@ mod tests {
         core.db().set_smart_enabled(true).unwrap();
 
         let svc = ProxyService::new(core);
+        let local_key = super::circuit_key(crate::models::ToolKind::Codex, "local");
         // Blow the circuit: FAIL_THRESHOLD (3) consecutive failures.
         for _ in 0..super::FAIL_THRESHOLD {
-            svc.record_failure("local");
+            svc.record_failure(&local_key);
         }
-        assert!(svc.circuit_open("local"));
+        assert!(svc.circuit_open(&local_key));
 
         let url = spawn_service(svc).await;
         cloud.respond_with(200, "{}");
@@ -2305,8 +2313,9 @@ mod tests {
             .unwrap();
         core.db().set_models_merge_enabled(true).unwrap();
         let svc = ProxyService::new(core);
+        let freebuff_key = super::circuit_key(crate::models::ToolKind::Codex, "freebuff");
         for _ in 0..super::FAIL_THRESHOLD {
-            svc.record_failure("freebuff");
+            svc.record_failure(&freebuff_key);
         }
         let url = spawn_service(svc).await;
         up.respond_with(200, &models_catalog(&["a-model"]));
@@ -2555,21 +2564,22 @@ mod tests {
         ]);
         up_backup.respond_with(200, r#"{"choices":[]}"#);
 
+        let pri_key = super::circuit_key(crate::models::ToolKind::Codex, "pri");
         let (s1, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(s1, 200);
-        assert_eq!(cb.state("pri"), CircuitState::Open);
+        assert_eq!(cb.state(&pri_key), CircuitState::Open);
 
         // 2. Next request probes in HalfOpen: primary returns unrectified 400
         let (s2, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(s2, 400);
 
         // Verify probe slot was released and did not hang HalfOpen:
-        assert_eq!(cb.state("pri"), CircuitState::HalfOpen);
+        assert_eq!(cb.state(&pri_key), CircuitState::HalfOpen);
         assert!(
-            cb.allow_request("pri"),
+            cb.allow_request(&pri_key),
             "probe in flight must be released on unrectified 400"
         );
-        cb.release_probe("pri"); // release probe slot claimed in assertion
+        cb.release_probe(&pri_key); // release probe slot claimed in assertion
 
         // 3. Next probe returns 404:
         let (s3, _) = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
@@ -2604,10 +2614,11 @@ mod tests {
             error_rate_threshold: 0.5,
             min_requests: 1,
         }));
-        cb.record_failure("p");
-        cb.record_failure("p");
-        cb.record_failure("p");
-        assert_eq!(cb.state("p"), CircuitState::Open);
+        let p_key = super::circuit_key(ToolKind::Pi, "p");
+        cb.record_failure(&p_key);
+        cb.record_failure(&p_key);
+        cb.record_failure(&p_key);
+        assert_eq!(cb.state(&p_key), CircuitState::Open);
 
         let svc = ProxyService::new(core).with_circuit_breaker(cb.clone());
         let token_pi = svc.token_manager.get_or_create(ToolKind::Pi).unwrap();
@@ -2626,7 +2637,7 @@ mod tests {
         // The probe slot must have been released (not leaked): a subsequent
         // request can admit a probe instead of being rejected forever.
         assert!(
-            cb.allow_request("p"),
+            cb.allow_request(&p_key),
             "HalfOpen probe slot must be released after a missing-base-url skip"
         );
     }
@@ -2635,6 +2646,7 @@ mod tests {
     async fn test_restoring_expired_cooldown_circuit_starts_in_closed_state() {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core(&dir, &[("expired_provider", "http://127.0.0.1:9999", "k1")]);
+        let expired_key = super::circuit_key(crate::models::ToolKind::Codex, "expired_provider");
 
         // Save a circuit whose cooldown expired 100 seconds ago
         let past = now_secs() - 100;
@@ -2642,24 +2654,22 @@ mod tests {
             fails: 3,
             cooldown_until_secs: past,
         };
-        core.db()
-            .save_circuit("expired_provider", &circuit)
-            .unwrap();
+        core.db().save_circuit(&expired_key, &circuit).unwrap();
 
         // Start ProxyService with this core DB
         let svc = ProxyService::new(core.clone());
 
         // Verify provider is in Closed state, not Open!
         assert_eq!(
-            svc.circuit_breaker.state("expired_provider"),
+            svc.circuit_breaker.state(&expired_key),
             CircuitState::Closed
         );
-        assert!(svc.circuit_breaker.allow_request("expired_provider"));
-        assert!(!svc.circuit_open("expired_provider"));
+        assert!(svc.circuit_breaker.allow_request(&expired_key));
+        assert!(!svc.circuit_open(&expired_key));
 
         // Verify the expired circuit was cleaned from the database
         let loaded = core.db().load_circuits().unwrap();
-        assert!(!loaded.contains_key("expired_provider"));
+        assert!(!loaded.contains_key(&expired_key));
     }
 
     #[tokio::test]
@@ -2724,6 +2734,63 @@ mod tests {
         assert!(
             b2.contains("codex"),
             "expected response from codex, got {b2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_provider_id_across_tools_uses_isolated_keys_and_circuits() {
+        use crate::models::{Provider, ToolKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let up_claude = MockUpstream::spawn().await;
+        let up_pi = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[]);
+
+        core.add_provider(
+            Provider::new("devops", ToolKind::ClaudeCode, Some(up_claude.url())),
+            Some("sk-claude-devops"),
+        )
+        .unwrap();
+        core.add_provider(
+            Provider::new("devops", ToolKind::Pi, Some(up_pi.url())),
+            Some("sk-pi-devops"),
+        )
+        .unwrap();
+        core.db()
+            .set_tool_routes("claude", &["devops".into()], None, "chat")
+            .unwrap();
+        core.db()
+            .set_tool_routes("pi", &["devops".into()], None, "chat")
+            .unwrap();
+
+        let svc = ProxyService::new(core);
+        // Trip circuit for pi/devops only; claude/devops must remain usable.
+        let pi_key = super::circuit_key(ToolKind::Pi, "devops");
+        for _ in 0..super::FAIL_THRESHOLD {
+            svc.record_failure(&pi_key);
+        }
+        assert!(svc.circuit_open(&pi_key));
+        assert!(!svc.circuit_open(&super::circuit_key(ToolKind::ClaudeCode, "devops")));
+
+        let token_claude = svc
+            .token_manager
+            .get_or_create(ToolKind::ClaudeCode)
+            .unwrap();
+        let url = spawn_service(svc).await;
+        up_claude.respond_with(200, r#"{"ok":"claude"}"#);
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &format!("Bearer {token_claude}"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.contains("claude"));
+        assert_eq!(
+            up_claude.last_request().await.authorization,
+            "Bearer sk-claude-devops"
         );
     }
 
@@ -2972,7 +3039,7 @@ mod tests {
             "expected synthesized xfade_stream_interrupted frame, got: {body}"
         );
         assert_eq!(
-            cb.failure_count("p1"),
+            cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
             1,
             "failure must be recorded on circuit breaker"
         );
@@ -3016,7 +3083,7 @@ mod tests {
             "expected failover to p2, got: {body}"
         );
         assert_eq!(
-            cb.failure_count("p1"),
+            cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
             1,
             "pre-commit failure must trip circuit on p1"
         );

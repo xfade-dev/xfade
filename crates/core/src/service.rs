@@ -171,7 +171,8 @@ impl Core {
         let secrets: Arc<dyn SecretStore> = if backend == SecretsBackend::File {
             Arc::new(FileStore::new(data.join("secrets.json")))
         } else {
-            Arc::new(KeyringStore::new())
+            let cfg = Config::load(&data);
+            Arc::new(KeyringStore::with_allow_all_acl(cfg.keychain_allow_all))
         };
         let mut core = Self::with_paths(home, &data, secrets)?;
         core.active_secrets = Some(backend);
@@ -402,6 +403,15 @@ impl Core {
                 Some(a.to_string())
             };
         }
+        cfg.save(&self.data_dir)?;
+        Ok(cfg)
+    }
+
+    /// Enable or disable the macOS "allow all applications" ACL for newly written
+    /// Keychain entries.
+    pub fn set_keychain_allow_all(&self, allow_all: bool) -> Result<Config> {
+        let mut cfg = self.config();
+        cfg.keychain_allow_all = allow_all;
         cfg.save(&self.data_dir)?;
         Ok(cfg)
     }

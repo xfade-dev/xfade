@@ -413,12 +413,31 @@ struct ResolvedRoutes<'a> {
     routes: Vec<String>,
     model_override: Option<String>,
     target_protocol: String,
-    provider_map: std::collections::HashMap<String, &'a crate::models::Provider>,
+    provider_map: std::collections::HashMap<(ToolKind, String), &'a crate::models::Provider>,
     /// Per-provider model overrides (`--route-model id=model`); empty when
     /// only the global `--model` fallback is configured.
     route_models: std::collections::BTreeMap<String, String>,
     /// Whether qualifying 4xx responses should trigger failover.
     failover_4xx: bool,
+}
+
+/// Resolve a route ID to its `Provider`, preferring `(client_tool, id)` so
+/// two tools sharing the same provider ID (e.g. `claude/devops` and
+/// `pi/devops`) never cross-read each other's keys or config. Falls back to
+/// any provider with matching `id` when `client_tool` is `None` or the route
+/// intentionally references another tool's provider.
+fn resolve_provider<'a>(
+    provider_map: &std::collections::HashMap<(ToolKind, String), &'a crate::models::Provider>,
+    providers: &'a [crate::models::Provider],
+    client_tool: Option<ToolKind>,
+    id: &str,
+) -> Option<&'a crate::models::Provider> {
+    if let Some(tool) = client_tool {
+        if let Some(p) = provider_map.get(&(tool, id.to_string())) {
+            return Some(*p);
+        }
+    }
+    providers.iter().find(|p| p.id == id)
 }
 
 #[cfg(test)]
@@ -453,8 +472,11 @@ fn resolve_routes<'a>(
             }
         },
     };
-    let provider_map: std::collections::HashMap<String, &crate::models::Provider> =
-        providers.iter().map(|p| (p.id.clone(), p)).collect();
+    let provider_map: std::collections::HashMap<(ToolKind, String), &crate::models::Provider> =
+        providers
+            .iter()
+            .map(|p| ((p.tool, p.id.clone()), p))
+            .collect();
     // These two are independent config toggles read per request (same
     // pattern as `smart_enabled()` via `active_router()`), so CLI changes
     // take effect on a running daemon immediately.
@@ -802,13 +824,14 @@ where
 
     let interrupted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let cb_key = format!("{tool}/{route_id}");
     let robust = make_robust_stream(
         proto_stream,
         svc.timeouts.idle_timeout,
         inbound_proto,
         req_id,
         has_tool_call,
-        provider_id_owned.clone(),
+        cb_key.clone(),
         cb.clone(),
         db.clone(),
         interrupted_flag.clone(),
@@ -822,6 +845,7 @@ where
         endpoint_owned,
         model_owned,
         provider_id_owned,
+        cb_key,
         tool_owned,
         session_owned,
         status,
@@ -1034,7 +1058,7 @@ async fn handle_upstream_error(
         || (failover_4xx && qualifies_for_4xx_failover(status, &bytes));
 
     if should_continue {
-        svc.record_failure(route_id);
+        svc.record_failure(&format!("{tool}/{route_id}"));
     }
 
     let response = Response::builder()
@@ -1102,7 +1126,7 @@ async fn failover_loop(
     session_id: Option<&str>,
     method: &str,
     entries: &[crate::router::decision::RouteEntry],
-    provider_map: &std::collections::HashMap<String, &crate::models::Provider>,
+    provider_map: &std::collections::HashMap<(ToolKind, String), &crate::models::Provider>,
     endpoint: &str,
     _target_protocol: &str,
     model: Option<String>,
@@ -1121,16 +1145,17 @@ async fn failover_loop(
 
     for entry in entries {
         let route_id = entry.route_id.as_str();
-        if !svc.circuit_breaker.allow_request(route_id) {
+        let cb_key = super::circuit_key(entry.tool, route_id);
+        if !svc.circuit_breaker.allow_request(&cb_key) {
             continue;
         }
 
         // Hold the probe reservation (if any) until an explicit outcome records
         // or the request is skipped/dropped, so a HalfOpen probe slot can never
         // leak and permanently reject the route with `503 no usable provider`.
-        let mut probe_guard = ProbeGuard::new(svc.circuit_breaker.as_ref(), route_id);
+        let mut probe_guard = ProbeGuard::new(svc.circuit_breaker.as_ref(), &cb_key);
 
-        let provider = match provider_map.get(route_id) {
+        let provider = match provider_map.get(&(entry.tool, route_id.to_string())) {
             Some(p) => *p,
             None => continue,
         };
@@ -1184,7 +1209,7 @@ async fn failover_loop(
                     None,
                 );
                 probe_guard.disarm();
-                svc.record_failure(route_id);
+                svc.record_failure(&cb_key);
                 last_err = Some((
                     StatusCode::FORBIDDEN,
                     format!(
@@ -1283,7 +1308,7 @@ async fn failover_loop(
                     Some(e.clone()),
                 );
                 probe_guard.disarm();
-                svc.record_failure(route_id);
+                svc.record_failure(&cb_key);
                 last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                 continue;
             }
@@ -1307,7 +1332,7 @@ async fn failover_loop(
                     Some("ttft_timeout".to_string()),
                 );
                 probe_guard.disarm();
-                svc.record_failure(route_id);
+                svc.record_failure(&cb_key);
                 last_err = Some((
                     StatusCode::GATEWAY_TIMEOUT,
                     "ttft_timeout".to_string(),
@@ -1397,7 +1422,7 @@ async fn failover_loop(
                             Some(e.clone()),
                         );
                         probe_guard.disarm();
-                        svc.record_failure(route_id);
+                        svc.record_failure(&cb_key);
                         last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                         continue;
                     }
@@ -1427,7 +1452,7 @@ async fn failover_loop(
                         "error": "model_rejection"
                     }));
                     probe_guard.disarm();
-                    svc.record_failure(route_id);
+                    svc.record_failure(&cb_key);
                     let transcoded = super::convert::transcode_error_body(
                         &err_bytes,
                         provider.protocol,
@@ -1439,7 +1464,7 @@ async fn failover_loop(
                 }
                 // Release in-flight probe reservation so HalfOpen is not permanently blocked
                 probe_guard.disarm();
-                svc.circuit_breaker.release_probe(route_id);
+                svc.circuit_breaker.release_probe(&cb_key);
                 let out_bytes = if inbound_proto != provider.protocol {
                     super::convert::transcode_error_body(
                         &err_bytes,
@@ -1488,7 +1513,7 @@ async fn failover_loop(
                                 Some(format!("read body: {e}")),
                             );
                             probe_guard.disarm();
-                            svc.record_failure(route_id);
+                            svc.record_failure(&cb_key);
                             failover_trajectory.push(serde_json::json!({
                                 "provider": route_id,
                                 "status": 502,
@@ -1512,7 +1537,7 @@ async fn failover_loop(
                                 Some("read body timeout".to_string()),
                             );
                             probe_guard.disarm();
-                            svc.record_failure(route_id);
+                            svc.record_failure(&cb_key);
                             failover_trajectory.push(serde_json::json!({
                                 "provider": route_id,
                                 "status": 504,
@@ -1550,7 +1575,7 @@ async fn failover_loop(
                         Some(msg.clone()),
                     );
                     probe_guard.disarm();
-                    svc.record_failure(route_id);
+                    svc.record_failure(&cb_key);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
                         "status": 502,
@@ -1575,7 +1600,7 @@ async fn failover_loop(
                         Some(format!("upstream 200 error payload: {err_msg}")),
                     );
                     probe_guard.disarm();
-                    svc.record_failure(route_id);
+                    svc.record_failure(&cb_key);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
                         "status": 200,
@@ -1603,7 +1628,7 @@ async fn failover_loop(
 
                 // Verified non-streaming response: commit!
                 probe_guard.disarm();
-                svc.record_success(route_id);
+                svc.record_success(&cb_key);
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
                     "status": status.as_u16(),
@@ -1706,7 +1731,7 @@ async fn failover_loop(
                         Some(err_str.clone()),
                     );
                     probe_guard.disarm();
-                    svc.record_failure(route_id);
+                    svc.record_failure(&cb_key);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
                         "status": 502,
@@ -1796,9 +1821,9 @@ async fn failover_loop(
         }
         // Non-qualifying 4xx: passthrough, stop failover.
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            svc.record_failure(route_id);
+            svc.record_failure(&cb_key);
         } else {
-            svc.circuit_breaker.release_probe(route_id);
+            svc.circuit_breaker.release_probe(&cb_key);
         }
         if inbound_proto != provider.protocol {
             let (parts, body) = err_resp.into_parts();
@@ -1877,7 +1902,7 @@ async fn forward_with_failover(
     // are dropped here, same as the old in-loop skip.
     let route_providers: Vec<&crate::models::Provider> = routes
         .iter()
-        .filter_map(|id| provider_map.get(id).copied())
+        .filter_map(|id| resolve_provider(&provider_map, &providers, client_tool, id))
         .collect();
     let router = svc.active_router();
     // Prompt extraction (parse + 4KB copy of the last user turn) only pays
@@ -1896,7 +1921,7 @@ async fn forward_with_failover(
         &classify_ctx,
         &route_providers,
         model_override.as_deref(),
-        &|id: &str| svc.circuit_open(id),
+        &|p: &crate::models::Provider| svc.circuit_open(&super::circuit_key(p.tool, &p.id)),
         &|id: &str| svc.health_signal(id),
     );
     if plan.entries.is_empty() {
@@ -2093,6 +2118,7 @@ fn make_tapped_streaming_body_with_flag<S>(
     endpoint: String,
     model: Option<String>,
     provider_id: String,
+    circuit_key: String,
     tool: String,
     session_id: Option<String>,
     status: StatusCode,
@@ -2113,6 +2139,7 @@ where
         endpoint,
         model,
         provider_id,
+        circuit_key,
         tool,
         session_id,
         db,
@@ -2138,6 +2165,7 @@ struct TailLogStream {
     endpoint: String,
     model: Option<String>,
     provider_id: String,
+    circuit_key: String,
     tool: String,
     session_id: Option<String>,
     db: crate::store::db::Database,
@@ -2256,7 +2284,7 @@ impl futures::Stream for TailLogStream {
                         Some("upstream stream interrupted".to_string())
                     } else {
                         this.circuit_breaker
-                            .record_success_streamed(&this.provider_id);
+                            .record_success_streamed(&this.circuit_key);
                         None
                     };
                     this.log(err);
@@ -2399,12 +2427,13 @@ async fn aggregate_models(
 
     let mut probes = Vec::new();
     for route_id in &routes {
-        if svc.circuit_open(route_id) {
-            continue;
-        }
-        let Some(provider) = provider_map.get(route_id).copied() else {
+        let Some(provider) = resolve_provider(&provider_map, &providers, client_tool, route_id)
+        else {
             continue;
         };
+        if svc.circuit_open(&super::circuit_key(provider.tool, &provider.id)) {
+            continue;
+        }
         let Some(base_url) = provider.base_url.clone() else {
             continue;
         };
@@ -2859,11 +2888,12 @@ data: [DONE]\n\n";
         let svc = ProxyService::new(core);
         let entries = vec![crate::router::decision::RouteEntry {
             route_id: "evil".into(),
+            tool: ToolKind::ClaudeCode,
             model_override: None,
             tier: crate::router::decision::Tier::Cloud,
         }];
         let mut provider_map = std::collections::HashMap::new();
-        provider_map.insert("evil".to_string(), &p);
+        provider_map.insert((ToolKind::ClaudeCode, "evil".to_string()), &p);
         let headers = HeaderMap::new();
 
         let resp = failover_loop(
@@ -2933,18 +2963,20 @@ data: [DONE]\n\n";
         let entries = vec![
             crate::router::decision::RouteEntry {
                 route_id: "evil".into(),
+                tool: ToolKind::ClaudeCode,
                 model_override: None,
                 tier: crate::router::decision::Tier::Cloud,
             },
             crate::router::decision::RouteEntry {
                 route_id: "local".into(),
+                tool: ToolKind::ClaudeCode,
                 model_override: None,
                 tier: crate::router::decision::Tier::Local,
             },
         ];
         let mut provider_map = std::collections::HashMap::new();
-        provider_map.insert("evil".to_string(), &p1);
-        provider_map.insert("local".to_string(), &p2);
+        provider_map.insert((ToolKind::ClaudeCode, "evil".to_string()), &p1);
+        provider_map.insert((ToolKind::ClaudeCode, "local".to_string()), &p2);
         let headers = HeaderMap::new();
 
         let resp = failover_loop(

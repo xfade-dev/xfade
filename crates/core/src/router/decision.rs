@@ -1,6 +1,6 @@
 //! Route planning and tiered routing decisions (Smart Fader).
 
-use crate::models::Provider;
+use crate::models::{Provider, ToolKind};
 use crate::router::classifier::{ClassifyCtx, Intent, IntentClassifier, KeywordClassifier};
 
 /// Provider tier: local model (cheap/fast) vs cloud (stronger), plus the
@@ -28,6 +28,7 @@ pub struct HealthSignal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteEntry {
     pub route_id: String,
+    pub tool: ToolKind,
     pub model_override: Option<String>,
     pub tier: Tier,
 }
@@ -59,7 +60,7 @@ pub trait Router: Send + Sync {
         ctx: &ClassifyCtx<'_>,
         routes: &[&Provider],
         model_override: Option<&str>,
-        open: &dyn Fn(&str) -> bool,
+        open: &dyn Fn(&Provider) -> bool,
         health: &dyn Fn(&str) -> Option<HealthSignal>,
     ) -> RoutePlan;
 }
@@ -73,14 +74,15 @@ impl Router for DefaultRouter {
         _ctx: &ClassifyCtx<'_>,
         routes: &[&Provider],
         model_override: Option<&str>,
-        open: &dyn Fn(&str) -> bool,
+        open: &dyn Fn(&Provider) -> bool,
         _health: &dyn Fn(&str) -> Option<HealthSignal>,
     ) -> RoutePlan {
         let entries = routes
             .iter()
-            .filter(|p| !open(&p.id))
+            .filter(|p| !open(p))
             .map(|p| RouteEntry {
                 route_id: p.id.clone(),
+                tool: p.tool,
                 model_override: model_override.map(String::from),
                 tier: provider_tier(p),
             })
@@ -175,12 +177,13 @@ pub fn plan_for_intent(
     intent: Intent,
     routes: &[&Provider],
     model_override: Option<&str>,
-    open: &dyn Fn(&str) -> bool,
+    open: &dyn Fn(&Provider) -> bool,
     health: &dyn Fn(&str) -> Option<HealthSignal>,
 ) -> RoutePlan {
-    let usable: Vec<&Provider> = routes.iter().copied().filter(|p| !open(&p.id)).collect();
+    let usable: Vec<&Provider> = routes.iter().copied().filter(|p| !open(p)).collect();
     let entry_for = |p: &Provider| RouteEntry {
         route_id: p.id.clone(),
+        tool: p.tool,
         model_override: model_override.map(String::from),
         tier: provider_tier(p),
     };
@@ -262,7 +265,7 @@ pub fn plan_routes(
     ctx: &ClassifyCtx<'_>,
     routes: &[&Provider],
     model_override: Option<&str>,
-    open: &dyn Fn(&str) -> bool,
+    open: &dyn Fn(&Provider) -> bool,
     health: &dyn Fn(&str) -> Option<HealthSignal>,
 ) -> RoutePlan {
     let intent = KeywordClassifier.classify(ctx);
@@ -292,7 +295,7 @@ impl Router for SmartRouter {
         ctx: &ClassifyCtx<'_>,
         routes: &[&Provider],
         model_override: Option<&str>,
-        open: &dyn Fn(&str) -> bool,
+        open: &dyn Fn(&Provider) -> bool,
         health: &dyn Fn(&str) -> Option<HealthSignal>,
     ) -> RoutePlan {
         let intent = self.classifier.classify(ctx);
@@ -335,7 +338,7 @@ mod tests {
         plan.entries.iter().map(|e| e.route_id.clone()).collect()
     }
 
-    fn none_open(_: &str) -> bool {
+    fn none_open(_: &Provider) -> bool {
         false
     }
 
@@ -640,7 +643,7 @@ mod tests {
     #[test]
     fn default_router_carries_model_override_and_skips_open_circuits() {
         let routes = vec![cloud("a"), cloud("b")];
-        let open = |id: &str| id == "a";
+        let open = |p: &Provider| p.id == "a";
         let plan = DefaultRouter.plan(&ctx("hi"), &refs(&routes), Some("m-x"), &open, &no_health);
         assert_eq!(ids(&plan), vec!["b"]);
         assert_eq!(plan.entries[0].model_override.as_deref(), Some("m-x"));
@@ -687,7 +690,7 @@ mod tests {
     #[test]
     fn open_circuits_are_skipped_before_bucketing() {
         let routes = vec![local("l1"), local("l2"), cloud("c1")];
-        let open = |id: &str| id == "l1";
+        let open = |p: &Provider| p.id == "l1";
         let plan = plan_routes(&ctx(LIGHT), &refs(&routes), None, &open, &no_health);
         assert_eq!(ids(&plan), vec!["l2", "c1"]);
     }

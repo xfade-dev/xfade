@@ -40,12 +40,16 @@ impl FromStr for SecretsBackend {
 /// `config.json`, so it stays under the secret backend's protection).
 pub const GLOBAL_API_KEY_REF: &str = "xfade/global/api_key";
 
+fn default_true() -> bool {
+    true
+}
+
 /// Global config, persisted at `<data_dir>/config.json`.
 ///
 /// `base_url` and `model` act as shared defaults for every tool (like CC Switch's
 /// "general" config): a provider that doesn't specify its own value falls back to
 /// these. The global API key lives in the secret store under [`GLOBAL_API_KEY_REF`].
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Secret storage backend for all tools.
     #[serde(default)]
@@ -60,6 +64,23 @@ pub struct Config {
     /// Ignored by tools that don't support multiple wire protocols (claude/codex/opencode).
     #[serde(default)]
     pub api: Option<String>,
+    /// On macOS, grant "allow all applications" ACL when creating/updating Keychain
+    /// entries so Homebrew upgrades (which change ad-hoc binary cdhash) don't
+    /// re-trigger authorization prompts. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub keychain_allow_all: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            secrets: SecretsBackend::default(),
+            base_url: None,
+            model: None,
+            api: None,
+            keychain_allow_all: true,
+        }
+    }
 }
 
 impl Config {
@@ -90,6 +111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Config::load(dir.path());
         assert_eq!(c.secrets, SecretsBackend::Keyring);
+        assert!(c.keychain_allow_all);
     }
 
     #[test]
@@ -100,6 +122,7 @@ mod tests {
             base_url: Some("https://x".into()),
             model: Some("glm-5".into()),
             api: Some("anthropic-messages".into()),
+            keychain_allow_all: false,
         };
         c.save(dir.path()).unwrap();
         let loaded = Config::load(dir.path());
@@ -107,6 +130,7 @@ mod tests {
         assert_eq!(loaded.base_url.as_deref(), Some("https://x"));
         assert_eq!(loaded.model.as_deref(), Some("glm-5"));
         assert_eq!(loaded.api.as_deref(), Some("anthropic-messages"));
+        assert!(!loaded.keychain_allow_all);
     }
 
     #[test]

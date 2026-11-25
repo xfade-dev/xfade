@@ -804,52 +804,59 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             Ok(())
         }
-        Cmd::Config { cmd } => {
-            match cmd {
-                None => {
-                    let dir = data_dir()?;
-                    let cfg = Config::load(&dir);
-                    println!("secrets: {}", cfg.secrets);
-                    println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
-                    println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
-                    println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
-                    let api_key = build_core()?.global_api_key();
-                    match api_key {
-                        Some(_) => println!("api_key: (set)"),
-                        None => println!("api_key: (unset)"),
-                    }
-                    Ok(())
+        Cmd::Config { cmd } => match cmd {
+            None => {
+                let dir = data_dir()?;
+                let cfg = Config::load(&dir);
+                println!("secrets: {}", cfg.secrets);
+                println!("keychain_allow_all: {}", cfg.keychain_allow_all);
+                println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
+                println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
+                println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
+                let api_key = build_core()?.global_api_key();
+                match api_key {
+                    Some(_) => println!("api_key: (set)"),
+                    None => println!("api_key: (unset)"),
                 }
-                Some(ConfigCmd::Set { key, value }) => {
-                    let core = build_core()?;
-                    match key.as_str() {
-                        "secrets" => {
-                            core.update_config(Some(&value), None, None, None)?;
-                        }
-                        "base_url" => {
-                            core.update_config(None, Some(&value), None, None)?;
-                        }
-                        "model" => {
-                            core.update_config(None, None, Some(&value), None)?;
-                        }
-                        "api" => {
-                            core.update_config(None, None, None, Some(&value))?;
-                        }
-                        "api_key" => {
-                            core.set_global_api_key(&value)?;
-                        }
-                        other => {
-                            return Err(CoreError::ConfigParse {
-                            path: other.to_string(),
-                            msg: "unknown config key (expected: secrets|base_url|model|api|api_key)".into(),
-                        });
-                        }
-                    }
-                    println!("set {key} = {value}");
-                    Ok(())
-                }
+                Ok(())
             }
-        }
+            Some(ConfigCmd::Set { key, value }) => {
+                let core = build_core()?;
+                match key.as_str() {
+                    "secrets" => {
+                        core.update_config(Some(&value), None, None, None)?;
+                    }
+                    "base_url" => {
+                        core.update_config(None, Some(&value), None, None)?;
+                    }
+                    "model" => {
+                        core.update_config(None, None, Some(&value), None)?;
+                    }
+                    "api" => {
+                        core.update_config(None, None, None, Some(&value))?;
+                    }
+                    "api_key" => {
+                        core.set_global_api_key(&value)?;
+                    }
+                    "keychain_allow_all" => {
+                        let allow_all =
+                            value.parse::<bool>().map_err(|_| CoreError::ConfigParse {
+                                path: "keychain_allow_all".into(),
+                                msg: format!("invalid boolean '{value}' (expected true|false)"),
+                            })?;
+                        core.set_keychain_allow_all(allow_all)?;
+                    }
+                    other => {
+                        return Err(CoreError::ConfigParse {
+                            path: other.to_string(),
+                            msg: "unknown config key (expected: secrets|keychain_allow_all|base_url|model|api|api_key)".into(),
+                        });
+                    }
+                }
+                println!("set {key} = {value}");
+                Ok(())
+            }
+        },
         Cmd::Edit {
             name,
             tool,
@@ -1773,6 +1780,21 @@ fn cmd_doctor(core: &Core, fix: bool) -> Result<(), CoreError> {
     }
     if !daemon_checked {
         println!("  [INFO] daemon not installed (no daemon.json); nothing to compare");
+    }
+
+    if core.active_secrets_backend() == Some(xfade_core::store::config::SecretsBackend::Keyring) {
+        let log_path = core.data_dir().join("serve.log");
+        if let Ok(log_content) = std::fs::read_to_string(&log_path) {
+            let wait_count = log_content
+                .lines()
+                .filter(|l| l.contains("waiting on the OS keychain"))
+                .count();
+            if wait_count > 0 {
+                println!(
+                    "  [WARN] serve.log recorded {wait_count} OS keychain wait(s); run `xfade doctor --fix` then `xfade serve restart`"
+                );
+            }
+        }
     }
 
     Ok(())
