@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.13.4 — 2026-11-25
+
+### Circuit Breaker & Upstream Jitter Resilience
+- **fix(proxy,circuit-breaker)**: Relax default circuit-breaker thresholds (`failure_threshold: 5`, `success_threshold: 1`, `timeout_seconds: 15`, `error_rate_threshold: 0.9`, `min_requests: 20`) and align `FAIL_THRESHOLD` / `COOLDOWN_SECS` constants in `proxy/mod.rs` so brief upstream jitter does not prematurely lock out routes for 60s.
+- **fix(proxy,forward)**: Add a 150ms same-route retry before recording failure on pre-commit streaming drops (`stream_ended_before_commit` and `upstream_read_error`) and single-route transport errors.
+- **fix(proxy,forward)**: Exclude `403 Forbidden` passthrough responses from tripping the circuit breaker, return structured JSON `503 circuit_open` with `Retry-After` when all routes are cooling down, and log those 503s to `request_logs`.
+
 ## v0.13.3 — 2026-11-25
 
 ### Single-Master-Key Encrypted Vault

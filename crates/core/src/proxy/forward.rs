@@ -466,7 +466,11 @@ fn resolve_routes<'a>(
                 return Err(Box::new(
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body("no routes configured; use `xfade proxy use <name>`".into())
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(
+                            r#"{"error":{"code":"no_routes_configured","message":"no routes configured; use `xfade proxy use <name>`"}}"#
+                                .into(),
+                        )
                         .unwrap(),
                 ));
             }
@@ -1057,7 +1061,7 @@ async fn handle_upstream_error(
         || status.is_server_error()
         || (failover_4xx && qualifies_for_4xx_failover(status, &bytes));
 
-    if should_continue {
+    if should_continue && status != StatusCode::FORBIDDEN {
         svc.record_failure(&format!("{tool}/{route_id}"));
     }
 
@@ -1119,8 +1123,150 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+fn build_unavailable_503_response(
+    svc: &ProxyService,
+    session_id: Option<&str>,
+    endpoint: &str,
+    model: &Option<String>,
+    client_tool: Option<ToolKind>,
+    cb_keys: &[String],
+    start: Instant,
+) -> Response {
+    let all_circuit_blocked = !cb_keys.is_empty()
+        && cb_keys.iter().all(|k| {
+            matches!(
+                svc.circuit_breaker.state(k),
+                crate::proxy::CircuitState::Open | crate::proxy::CircuitState::HalfOpen
+            )
+        });
+    let min_cooldown = if all_circuit_blocked {
+        cb_keys
+            .iter()
+            .filter_map(|k| svc.circuit_breaker.remaining_cooldown_secs(k))
+            .filter(|&s| s > 0)
+            .min()
+    } else {
+        None
+    };
+    let tool_str = client_tool.map(|t| t.as_str()).unwrap_or("-");
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let (reason, body, retry_after) = match min_cooldown {
+        Some(secs) => {
+            let msg = format!("all providers cooling down (retry in {secs}s)");
+            let body = serde_json::json!({
+                "error": {
+                    "code": "circuit_open",
+                    "message": msg,
+                    "retry_after": secs,
+                }
+            })
+            .to_string();
+            ("circuit_open", body, Some(secs))
+        }
+        None => {
+            let body = serde_json::json!({
+                "error": {
+                    "code": "no_usable_provider",
+                    "message": "no usable provider",
+                }
+            })
+            .to_string();
+            ("no_usable_provider", body, None)
+        }
+    };
+    // Insert directly into request_logs without calling sessions::record_outcome,
+    // because the caller already invoked session_failed() and must not record
+    // a synthetic "-" provider/tool on the session.
+    let _ = svc.core.db().insert_request_log(&RequestLog {
+        ts: now_rfc3339(),
+        endpoint: endpoint.to_string(),
+        model: model.clone(),
+        provider_id: "-".to_string(),
+        tool: tool_str.to_string(),
+        status: StatusCode::SERVICE_UNAVAILABLE.as_u16() as i64,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        duration_ms,
+        error: Some(reason.to_string()),
+        session_id: session_id.map(|s| s.to_string()),
+        cost_usd_micros: 0,
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(secs) = retry_after {
+        builder = builder.header(axum::http::header::RETRY_AFTER, secs.to_string());
+    }
+    builder.body(body.into()).unwrap()
+}
+
+enum PreCommitOutcome<S> {
+    Committed {
+        buffered_chunks: Vec<Bytes>,
+        has_tool_call: bool,
+        raw_stream: S,
+    },
+    Failed(String),
+}
+
+async fn run_streaming_pre_commit(
+    resp: reqwest::Response,
+    protocol: ProviderProtocol,
+    ttft_deadline: tokio::time::Instant,
+) -> PreCommitOutcome<impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>
+{
+    const MAX_PRE_COMMIT_BUFFER_BYTES: usize = 2 * 1024 * 1024; // 2MB
+    let mut raw_stream = resp.bytes_stream();
+    let mut buffered_chunks: Vec<Bytes> = Vec::new();
+    let mut buffered_bytes: usize = 0;
+    let mut accumulated_buf: Vec<u8> = Vec::new();
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= ttft_deadline {
+            return PreCommitOutcome::Failed("ttft_timeout".to_string());
+        }
+        let remaining = ttft_deadline - now;
+        match tokio::time::timeout(remaining, raw_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                buffered_bytes += chunk.len();
+                if buffered_bytes > MAX_PRE_COMMIT_BUFFER_BYTES {
+                    return PreCommitOutcome::Failed("pre_commit_buffer_overflow".to_string());
+                }
+                accumulated_buf.extend_from_slice(&chunk);
+                match robustness::SemanticDetector::inspect_chunk(&accumulated_buf, protocol) {
+                    robustness::CommitDecision::Error(e) => {
+                        return PreCommitOutcome::Failed(format!("upstream_stream_error: {e}"));
+                    }
+                    robustness::CommitDecision::Commit { has_tool_call } => {
+                        buffered_chunks.push(chunk);
+                        return PreCommitOutcome::Committed {
+                            buffered_chunks,
+                            has_tool_call,
+                            raw_stream,
+                        };
+                    }
+                    robustness::CommitDecision::Buffering => {
+                        buffered_chunks.push(chunk);
+                    }
+                }
+            }
+            Ok(Some(Err(e))) => {
+                return PreCommitOutcome::Failed(format!("upstream_read_error: {e}"));
+            }
+            Ok(None) => {
+                return PreCommitOutcome::Failed("stream_ended_before_commit".to_string());
+            }
+            Err(_timeout) => {
+                return PreCommitOutcome::Failed("ttft_timeout".to_string());
+            }
+        }
+    }
+}
+
 /// Execute the failover loop: try each route in order, skipping open circuits.
 /// Returns the final response (success or last error).
+#[allow(clippy::too_many_arguments)]
 async fn failover_loop(
     svc: &ProxyService,
     session_id: Option<&str>,
@@ -1135,6 +1281,7 @@ async fn failover_loop(
     req_model: &str,
     start: Instant,
     failover_4xx: bool,
+    client_tool: Option<ToolKind>,
 ) -> Response {
     let inbound_proto = endpoint_to_inbound_protocol(endpoint);
     let mut last_err: Option<(StatusCode, String, Option<axum::http::HeaderValue>)> = None;
@@ -1143,7 +1290,7 @@ async fn failover_loop(
     // entries sharing protocol and override do not re-run full conversion.
     let mut bodies_cache: BodiesCache = std::collections::HashMap::new();
 
-    for entry in entries {
+    'routes: for entry in entries {
         let route_id = entry.route_id.as_str();
         let cb_key = super::circuit_key(entry.tool, route_id);
         if !svc.circuit_breaker.allow_request(&cb_key) {
@@ -1270,6 +1417,10 @@ async fn failover_loop(
         }
         let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(sending_body_ref);
 
+        let single_route = entries.len() == 1;
+        let mut retried_stream_end = false;
+        let mut retried_transport = false;
+        'attempt: loop {
         let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
         let time_for_headers = ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
 
@@ -1289,6 +1440,11 @@ async fn failover_loop(
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                if single_route && !retried_transport {
+                    retried_transport = true;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    continue 'attempt;
+                }
                 let duration_ms = start.elapsed().as_millis() as i64;
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
@@ -1310,7 +1466,7 @@ async fn failover_loop(
                 probe_guard.disarm();
                 svc.record_failure(&cb_key);
                 last_err = Some((StatusCode::BAD_GATEWAY, e, None));
-                continue;
+                continue 'routes;
             }
             Err(_timeout) => {
                 let duration_ms = start.elapsed().as_millis() as i64;
@@ -1338,7 +1494,7 @@ async fn failover_loop(
                     "ttft_timeout".to_string(),
                     None,
                 ));
-                continue;
+                continue 'routes;
             }
         };
 
@@ -1424,7 +1580,7 @@ async fn failover_loop(
                         probe_guard.disarm();
                         svc.record_failure(&cb_key);
                         last_err = Some((StatusCode::BAD_GATEWAY, e, None));
-                        continue;
+                        continue 'routes;
                     }
                 }
             } else {
@@ -1460,7 +1616,7 @@ async fn failover_loop(
                     );
                     let text = String::from_utf8_lossy(&transcoded).to_string();
                     last_err = Some((StatusCode::BAD_REQUEST, text, None));
-                    continue;
+                    continue 'routes;
                 }
                 // Release in-flight probe reservation so HalfOpen is not permanently blocked
                 probe_guard.disarm();
@@ -1520,7 +1676,7 @@ async fn failover_loop(
                                 "error": format!("read body: {e}"),
                             }));
                             last_err = Some((StatusCode::BAD_GATEWAY, e.to_string(), None));
-                            continue;
+                            continue 'routes;
                         }
                         Err(_timeout) => {
                             let duration_ms = start.elapsed().as_millis() as i64;
@@ -1548,7 +1704,7 @@ async fn failover_loop(
                                 "read body timeout".to_string(),
                                 None,
                             ));
-                            continue;
+                            continue 'routes;
                         }
                     };
 
@@ -1582,7 +1738,7 @@ async fn failover_loop(
                         "error": "non_json_response",
                     }));
                     last_err = Some((StatusCode::BAD_GATEWAY, msg, None));
-                    continue;
+                    continue 'routes;
                 }
 
                 if let Some(err_msg) = robustness::SemanticDetector::is_error_payload(&bytes) {
@@ -1623,7 +1779,7 @@ async fn failover_loop(
                         ),
                         None,
                     ));
-                    continue;
+                    continue 'routes;
                 }
 
                 // Verified non-streaming response: commit!
@@ -1656,94 +1812,52 @@ async fn failover_loop(
                 )
                 .await;
             } else {
-                // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout
-                const MAX_PRE_COMMIT_BUFFER_BYTES: usize = 2 * 1024 * 1024; // 2MB
-                let mut raw_stream = resp.bytes_stream();
-                let mut buffered_chunks: Vec<Bytes> = Vec::new();
-                let mut buffered_bytes: usize = 0;
-                let mut accumulated_buf: Vec<u8> = Vec::new();
-                let mut has_tool_call = false;
-                let mut is_committed = false;
-                let mut stream_err: Option<String> = None;
-
-                while !is_committed {
-                    let now = tokio::time::Instant::now();
-                    if now >= ttft_deadline {
-                        stream_err = Some("ttft_timeout".to_string());
-                        break;
-                    }
-                    let remaining = ttft_deadline - now;
-                    match tokio::time::timeout(remaining, raw_stream.next()).await {
-                        Ok(Some(Ok(chunk))) => {
-                            buffered_bytes += chunk.len();
-                            if buffered_bytes > MAX_PRE_COMMIT_BUFFER_BYTES {
-                                stream_err = Some("pre_commit_buffer_overflow".to_string());
-                                break;
+                // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout.
+                // If the stream ends before commit, retry the same route once with a
+                // short backoff before counting it as a failure.
+                let (buffered_chunks, has_tool_call, raw_stream) =
+                    match run_streaming_pre_commit(resp, provider.protocol, ttft_deadline).await {
+                        PreCommitOutcome::Committed {
+                            buffered_chunks,
+                            has_tool_call,
+                            raw_stream,
+                        } => (buffered_chunks, has_tool_call, raw_stream),
+                        PreCommitOutcome::Failed(err_str) => {
+                            let is_transient_stream_drop = err_str == "stream_ended_before_commit"
+                                || err_str.starts_with("upstream_read_error:");
+                            if is_transient_stream_drop && !retried_stream_end {
+                                retried_stream_end = true;
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                continue 'attempt;
                             }
-                            accumulated_buf.extend_from_slice(&chunk);
-                            let decision = robustness::SemanticDetector::inspect_chunk(
-                                &accumulated_buf,
-                                provider.protocol,
+                            let duration_ms = start.elapsed().as_millis() as i64;
+                            log_request(
+                                svc,
+                                session_id,
+                                endpoint,
+                                &model,
+                                route_id,
+                                provider.tool.as_str(),
+                                StatusCode::BAD_GATEWAY.as_u16() as i64,
+                                Usage::default(),
+                                duration_ms,
+                                Some(err_str.clone()),
                             );
-                            match decision {
-                                robustness::CommitDecision::Error(e) => {
-                                    stream_err = Some(format!("upstream_stream_error: {e}"));
-                                    break;
-                                }
-                                robustness::CommitDecision::Commit { has_tool_call: tc } => {
-                                    has_tool_call = tc;
-                                    is_committed = true;
-                                    buffered_chunks.push(chunk);
-                                }
-                                robustness::CommitDecision::Buffering => {
-                                    buffered_chunks.push(chunk);
-                                }
-                            }
+                            probe_guard.disarm();
+                            svc.record_failure(&cb_key);
+                            failover_trajectory.push(serde_json::json!({
+                                "provider": route_id,
+                                "status": 502,
+                                "error": &err_str,
+                            }));
+                            last_err = Some((
+                                StatusCode::BAD_GATEWAY,
+                                format!("{{\"error\":\"{err_str}\"}}"),
+                                None,
+                            ));
+                            continue 'routes;
                         }
-                        Ok(Some(Err(e))) => {
-                            stream_err = Some(format!("upstream_read_error: {e}"));
-                            break;
-                        }
-                        Ok(None) => {
-                            stream_err = Some("stream_ended_before_commit".to_string());
-                            break;
-                        }
-                        Err(_timeout) => {
-                            stream_err = Some("ttft_timeout".to_string());
-                            break;
-                        }
-                    }
-                }
-
-                if !is_committed {
-                    let duration_ms = start.elapsed().as_millis() as i64;
-                    let err_str = stream_err.unwrap_or_else(|| "pre_commit_failure".to_string());
-                    log_request(
-                        svc,
-                        session_id,
-                        endpoint,
-                        &model,
-                        route_id,
-                        provider.tool.as_str(),
-                        StatusCode::BAD_GATEWAY.as_u16() as i64,
-                        Usage::default(),
-                        duration_ms,
-                        Some(err_str.clone()),
-                    );
-                    probe_guard.disarm();
-                    svc.record_failure(&cb_key);
-                    failover_trajectory.push(serde_json::json!({
-                        "provider": route_id,
-                        "status": 502,
-                        "error": &err_str,
-                    }));
-                    last_err = Some((
-                        StatusCode::BAD_GATEWAY,
-                        format!("{{\"error\":\"{err_str}\"}}"),
-                        None,
-                    ));
-                    continue;
-                }
+                    };
 
                 // We reached Commit Point!
                 // Success will be recorded when the stream completes cleanly without interruption.
@@ -1803,6 +1917,9 @@ async fn failover_loop(
         // too. Either way the guard must not release again on drop.
         probe_guard.disarm();
         if should_continue {
+            if status == StatusCode::FORBIDDEN {
+                svc.circuit_breaker.release_probe(&cb_key);
+            }
             failover_trajectory.push(serde_json::json!({
                 "provider": route_id,
                 "status": status.as_u16(),
@@ -1817,10 +1934,12 @@ async fn failover_loop(
                 super::convert::transcode_error_body(&raw_bytes, provider.protocol, inbound_proto);
             let text = String::from_utf8_lossy(&transcoded).to_string();
             last_err = Some((status, text, retry_after));
-            continue;
+            continue 'routes;
         }
         // Non-qualifying 4xx: passthrough, stop failover.
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        // 403 (e.g. invalid model name or permission) is a client/request error and
+        // must not trip the circuit breaker; 401 still counts for key rotation.
+        if status == StatusCode::UNAUTHORIZED {
             svc.record_failure(&cb_key);
         } else {
             svc.circuit_breaker.release_probe(&cb_key);
@@ -1841,7 +1960,8 @@ async fn failover_loop(
             return builder.body(Body::from(transcoded)).unwrap();
         }
         return err_resp;
-    }
+        } // 'attempt
+    } // 'routes
 
     session_failed(svc, session_id);
 
@@ -1856,10 +1976,21 @@ async fn failover_loop(
             }
             builder.body(text.into()).unwrap()
         }
-        None => Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body("no usable provider".into())
-            .unwrap(),
+        None => {
+            let cb_keys: Vec<String> = entries
+                .iter()
+                .map(|e| super::circuit_key(e.tool, &e.route_id))
+                .collect();
+            build_unavailable_503_response(
+                svc,
+                session_id,
+                endpoint,
+                &model,
+                client_tool,
+                &cb_keys,
+                start,
+            )
+        }
     }
 }
 
@@ -1926,10 +2057,19 @@ async fn forward_with_failover(
     );
     if plan.entries.is_empty() {
         session_failed(svc, session_id);
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body("no usable provider".into())
-            .unwrap();
+        let cb_keys: Vec<String> = route_providers
+            .iter()
+            .map(|p| super::circuit_key(p.tool, &p.id))
+            .collect();
+        return build_unavailable_503_response(
+            svc,
+            session_id,
+            endpoint,
+            &model,
+            client_tool,
+            &cb_keys,
+            start,
+        );
     }
 
     // Stage 2b: resolve each route's effective model override. The router
@@ -1993,6 +2133,7 @@ async fn forward_with_failover(
         &req_model,
         start,
         failover_4xx,
+        client_tool,
     )
     .await
 }
@@ -2910,6 +3051,7 @@ data: [DONE]\n\n";
             "test-model",
             Instant::now(),
             false,
+            Some(ToolKind::ClaudeCode),
         )
         .await;
 
@@ -2993,6 +3135,7 @@ data: [DONE]\n\n";
             "test-model",
             Instant::now(),
             false,
+            Some(ToolKind::ClaudeCode),
         )
         .await;
 

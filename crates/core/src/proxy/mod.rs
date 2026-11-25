@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
-pub const FAIL_THRESHOLD: u32 = 3;
-pub const COOLDOWN_SECS: u64 = 60;
+pub const FAIL_THRESHOLD: u32 = 5;
+pub const COOLDOWN_SECS: u64 = 15;
 
 /// Canonical circuit-breaker key scoped by `(tool, provider_id)` so two tools
 /// sharing the same provider name (e.g. `claude/devops` and `pi/devops`) do
@@ -1212,13 +1212,13 @@ mod tests {
         let url = spawn_service(ProxyService::new(core)).await;
         up.respond_with(500, "boom");
         up2.respond_with(200, "{}");
-        for _ in 0..3 {
+        for _ in 0..super::FAIL_THRESHOLD {
             let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         }
-        let calls_after_3 = up.call_count().await;
+        let calls_after_threshold = up.call_count().await;
         let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
-        assert_eq!(up.call_count().await, calls_after_3);
-        assert!(up2.call_count().await >= 4);
+        assert_eq!(up.call_count().await, calls_after_threshold);
+        assert!(up2.call_count().await >= super::FAIL_THRESHOLD as usize + 1);
     }
 
     #[tokio::test]
@@ -2465,24 +2465,24 @@ mod tests {
         assert_eq!(up_failing.call_count().await, 1);
         assert_eq!(up_backup.call_count().await, 1);
 
-        // Send 2 more requests so failing provider reaches failure_threshold (3)
-        for _ in 0..2 {
+        // Send remaining requests so failing provider reaches FAIL_THRESHOLD (5)
+        for _ in 1..super::FAIL_THRESHOLD {
             let (s, _) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
             assert_eq!(s, 200);
         }
-        assert_eq!(up_failing.call_count().await, 3);
-        assert_eq!(up_backup.call_count().await, 3);
+        assert_eq!(up_failing.call_count().await, super::FAIL_THRESHOLD as usize);
+        assert_eq!(up_backup.call_count().await, super::FAIL_THRESHOLD as usize);
 
-        // 4th request: circuit is OPEN on failing provider, so it must be skipped without an HTTP call!
+        // Next request: circuit is OPEN on failing provider, so it must be skipped without an HTTP call!
         let (s4, t4) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
         assert_eq!(s4, 200);
         assert!(t4.contains("resp-1"));
         assert_eq!(
             up_failing.call_count().await,
-            3,
+            super::FAIL_THRESHOLD as usize,
             "circuit-open provider must be skipped without network call"
         );
-        assert_eq!(up_backup.call_count().await, 4);
+        assert_eq!(up_backup.call_count().await, super::FAIL_THRESHOLD as usize + 1);
     }
 
     #[tokio::test]
@@ -2632,7 +2632,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, 503);
-        assert_eq!(body, "no usable provider");
+        let err_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err_json["error"]["code"], "no_usable_provider");
+        assert_eq!(err_json["error"]["message"], "no usable provider");
 
         // The probe slot must have been released (not leaked): a subsequent
         // request can admit a probe instead of being rejected forever.
@@ -3086,6 +3088,158 @@ mod tests {
             cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
             1,
             "pre-commit failure must trip circuit on p1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_circuit_open_503_returns_json_retry_after_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 15,
+            error_rate_threshold: 0.9,
+            min_requests: 20,
+        }));
+        let p_key = super::circuit_key(crate::models::ToolKind::Codex, "p1");
+        cb.record_failure(&p_key);
+        assert_eq!(cb.state(&p_key), CircuitState::Open);
+
+        let svc = ProxyService::new(core.clone()).with_circuit_breaker(cb);
+        let url = spawn_service(svc).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(r#"{"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503);
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        assert!(retry_after.is_some(), "expected Retry-After header");
+        assert!(retry_after.unwrap() <= 15);
+
+        let body_json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body_json["error"]["code"], "circuit_open");
+
+        let logs = core.db().recent_request_logs(10).unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.status == 503 && l.error.as_deref() == Some("circuit_open")),
+            "expected circuit_open 503 entry in request_logs, got: {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_ended_before_commit_retries_once_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let svc = ProxyService::new(core);
+        let cb = svc.circuit_breaker.clone();
+        let url = spawn_service(svc).await;
+
+        // First response: 200 SSE that ends immediately before commit
+        up.respond_sse(vec![]);
+        // Second response (same-route retry): valid SSE
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"recovered"}}]}"#,
+            r#"data: [DONE]"#,
+        ]);
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(body.contains("recovered"), "expected retry to succeed, got: {body}");
+        assert_eq!(
+            cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
+            0,
+            "successful same-route retry must not record failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_read_error_before_commit_retries_once_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let svc = ProxyService::new(core);
+        let cb = svc.circuit_breaker.clone();
+        let url = spawn_service(svc).await;
+
+        // First response: 200 SSE that errors mid-stream before commit
+        up.respond_sse_error(vec![]);
+        // Second response (same-route retry): valid SSE
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"recovered-read-err"}}]}"#,
+            r#"data: [DONE]"#,
+        ]);
+
+        let (status, body) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("recovered-read-err"),
+            "expected retry to succeed, got: {body}"
+        );
+        assert_eq!(
+            cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
+            0,
+            "successful same-route retry must not record failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_403_passthrough_does_not_count_against_circuit_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let svc = ProxyService::new(core);
+        let cb = svc.circuit_breaker.clone();
+        let url = spawn_service(svc).await;
+
+        up.respond_with(403, r#"{"error":{"message":"invalid model"}}"#);
+
+        let (status, _) = http_post_json(
+            &url,
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            "Bearer x",
+        )
+        .await;
+
+        assert_eq!(status, 403);
+        assert_eq!(
+            cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
+            0,
+            "403 must passthrough without counting as a circuit failure"
         );
     }
 }
