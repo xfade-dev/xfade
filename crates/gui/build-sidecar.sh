@@ -10,6 +10,10 @@ cargo build --release -p xfade
 
 mkdir -p crates/gui/src-tauri/binaries
 BIN=target/release/xfade
-[ "$(uname)" = "Darwin" ] || [ "$(uname)" = "Linux" ] || BIN=target/release/xfade.exe
-cp "$BIN" "crates/gui/src-tauri/binaries/xfade-$TRIPLE"
-echo "sidecar -> crates/gui/src-tauri/binaries/xfade-$TRIPLE"
+EXT=""
+if [ "$(uname)" != "Darwin" ] && [ "$(uname)" != "Linux" ]; then
+  BIN=target/release/xfade.exe
+  EXT=".exe"
+fi
+cp "$BIN" "crates/gui/src-tauri/binaries/xfade-$TRIPLE$EXT"
+echo "sidecar -> crates/gui/src-tauri/binaries/xfade-$TRIPLE$EXT"

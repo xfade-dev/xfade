@@ -425,6 +425,7 @@ impl Core {
         let mut cfg = self.config();
         cfg.keychain_allow_all = allow_all;
         cfg.save(&self.data_dir)?;
+        self.secrets.set_allow_all_acl(allow_all);
         Ok(cfg)
     }
 
@@ -765,6 +766,30 @@ pub async fn probe_models_http(
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
     parse_models_response(&bytes)
+}
+
+/// TCP connect timing for probing a provider endpoint. Returns elapsed
+/// milliseconds, or `None` when the endpoint is unreachable within `timeout`.
+pub fn probe_latency(host: &str, port: u16, timeout: std::time::Duration) -> Option<u128> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let start = std::time::Instant::now();
+    TcpStream::connect_timeout(&addr, timeout).ok()?;
+    Some(start.elapsed().as_millis())
+}
+
+/// Parse `host:port` out of a base URL for the TCP latency probe.
+/// Returns `None` when unparseable or the scheme has no known default port.
+pub fn probe_target(base_url: &str) -> Option<(String, u16)> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    // url::Url's host_str() brackets IPv6 literals; normalize to the bare form.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = url.port_or_known_default()?;
+    Some((host, port))
 }
 
 /// Parse model IDs from a `/v1/models` JSON payload (`{data:[{id}]}`,
@@ -1564,6 +1589,18 @@ mod tests {
             store.0.load(Ordering::SeqCst),
             1,
             "must not fall back to global_api_key after a keyring error"
+        );
+    }
+
+    #[test]
+    fn probe_target_parses_http_https_and_explicit_port() {
+        assert_eq!(
+            probe_target("https://api.example.com/v1"),
+            Some(("api.example.com".to_string(), 443))
+        );
+        assert_eq!(
+            probe_target("http://127.0.0.1:8080"),
+            Some(("127.0.0.1".to_string(), 8080))
         );
     }
 }

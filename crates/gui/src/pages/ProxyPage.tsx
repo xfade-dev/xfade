@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ProxyStatus } from "../types";
-import { proxyStart, proxyStatus, proxyStop } from "../api";
+import { proxyRestart, proxyStart, proxyStatus, proxyStop } from "../api";
 import RoutesEditor from "../components/RoutesEditor";
+import ModelMapEditor from "../components/ModelMapEditor";
 import Toast from "../components/Toast";
 
-export default function ProxyPage() {
+export default function ProxyPage({ onStatusChange }: { onStatusChange?: () => void }) {
   const [host, setHost] = useState("127.0.0.1");
   const [port, setPort] = useState(24860);
   const [authToken, setAuthToken] = useState("");
   const [status, setStatus] = useState<ProxyStatus | null>(null);
+  const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ message: string; kind: "error" | "success" } | null>(null);
 
   const fetchStatus = useCallback(() => {
@@ -21,7 +23,6 @@ export default function ProxyPage() {
     fetchStatus();
   }, [fetchStatus]);
 
-  // poll every 2s while running (refresh circuit status)
   useEffect(() => {
     if (!status?.running) return;
     const t = setInterval(fetchStatus, 2000);
@@ -29,26 +30,49 @@ export default function ProxyPage() {
   }, [status?.running, fetchStatus]);
 
   const start = async () => {
+    setBusy(true);
     try {
       const s = await proxyStart(host, port, authToken.trim() || null);
       setStatus(s);
       setToast({ message: `Proxy started :${port}`, kind: "success" });
+      onStatusChange?.();
     } catch (e) {
       setToast({ message: String(e), kind: "error" });
+    } finally {
+      setBusy(false);
     }
   };
 
   const stop = async () => {
+    setBusy(true);
     try {
       const s = await proxyStop();
       setStatus(s);
       setToast({ message: "Proxy stopped", kind: "success" });
+      onStatusChange?.();
     } catch (e) {
       setToast({ message: String(e), kind: "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const restart = async () => {
+    setBusy(true);
+    try {
+      const s = await proxyRestart();
+      setStatus(s);
+      setToast({ message: "Proxy restarted", kind: "success" });
+      onStatusChange?.();
+    } catch (e) {
+      setToast({ message: String(e), kind: "error" });
+    } finally {
+      setBusy(false);
     }
   };
 
   const running = status?.running ?? false;
+  const managed = status?.managed ?? false;
 
   return (
     <div className="space-y-4">
@@ -85,17 +109,38 @@ export default function ProxyPage() {
               placeholder="(no auth check if unset)"
             />
           </div>
-          <div className="self-end">
+          <div className="self-end flex gap-2">
             {running ? (
-              <button
-                className="px-4 py-1.5 text-sm rounded bg-red-600 text-white"
-                onClick={stop}
-              >
-                Stop
-              </button>
+              <>
+                <button
+                  className="px-3 py-1.5 text-sm rounded border bg-white hover:bg-gray-50 disabled:opacity-40"
+                  disabled={!managed || busy}
+                  onClick={restart}
+                  title={
+                    managed
+                      ? "Restart OS daemon"
+                      : "External proxy process cannot be restarted from GUI"
+                  }
+                >
+                  Restart
+                </button>
+                <button
+                  className="px-4 py-1.5 text-sm rounded bg-red-600 text-white disabled:opacity-40"
+                  disabled={!managed || busy}
+                  onClick={stop}
+                  title={
+                    managed
+                      ? "Stop OS daemon"
+                      : "External proxy process was started outside OS service"
+                  }
+                >
+                  Stop
+                </button>
+              </>
             ) : (
               <button
-                className="px-4 py-1.5 text-sm rounded bg-emerald-600 text-white"
+                className="px-4 py-1.5 text-sm rounded bg-emerald-600 text-white disabled:opacity-40"
+                disabled={busy}
                 onClick={start}
               >
                 Start
@@ -110,7 +155,9 @@ export default function ProxyPage() {
             }`}
           />
           {running
-            ? `Running ${status?.host}:${status?.port}${status?.auth_enabled ? " (auth)" : ""}`
+            ? `Running ${status?.host}:${status?.port}${status?.auth_enabled ? " (auth)" : ""}${
+                managed ? "" : " (external)"
+              }`
             : "Stopped"}
         </div>
 
@@ -142,6 +189,7 @@ export default function ProxyPage() {
       </div>
 
       <RoutesEditor />
+      <ModelMapEditor />
 
       {toast && (
         <Toast
