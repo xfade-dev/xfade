@@ -28,6 +28,7 @@ pub fn run() {
             commands::update_provider,
             commands::remove_provider,
             commands::use_provider,
+            commands::is_tool_direct,
             commands::current_provider,
             commands::list_presets,
             commands::import_provider,
@@ -37,12 +38,22 @@ pub fn run() {
             commands::set_config,
             commands::proxy_start,
             commands::proxy_stop,
+            commands::proxy_restart,
             commands::proxy_status,
             commands::get_routes,
             commands::set_routes,
             commands::clear_routes,
             commands::stats,
             commands::recent_logs,
+            commands::probe_provider_latency,
+            commands::probe_provider_models,
+            commands::probe_models_adhoc,
+            commands::get_model_map,
+            commands::set_model_mapping,
+            commands::remove_model_mapping,
+            commands::set_models_merge,
+            commands::security_doctor,
+            commands::security_doctor_fix,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -51,6 +62,19 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Register bundled `xfade` sidecar path so `Core::use_provider` /
+            // `ensure_gateway_running` never spawns `xfade-gui` itself.
+            if let Ok(exe_dir) = std::env::current_exe().and_then(|p| {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
+            }) {
+                let sidecar_name = if cfg!(windows) { "xfade.exe" } else { "xfade" };
+                let candidate = exe_dir.join(sidecar_name);
+                if candidate.exists() {
+                    xfade_core::daemon_spawner::set_daemon_exe(candidate);
+                }
+            }
             tray::build(app.handle())?;
             if cfg!(debug_assertions) {
                 app.handle().plugin(

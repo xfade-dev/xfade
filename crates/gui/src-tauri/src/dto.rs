@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use xfade_core::models::ToolKind;
+use std::collections::BTreeMap;
+use xfade_core::models::{ProviderProtocol, ToolKind};
 use xfade_core::presets::Preset;
 
 // CircuitDto is moved down into core; the GUI reuses it directly (avoiding duplication).
@@ -11,6 +12,8 @@ pub struct AddProviderInput {
     pub tool: ToolKind,
     pub base_url: Option<String>,
     pub key: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<ProviderProtocol>,
     #[serde(default)]
     pub extra: serde_json::Value,
     /// Official login provider; when false, blank base_url/model use global defaults.
@@ -24,6 +27,8 @@ pub struct UpdateProviderInput {
     pub tool: ToolKind,
     pub base_url: Option<String>,
     pub key: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<ProviderProtocol>,
     #[serde(default)]
     pub extra: serde_json::Value,
 }
@@ -65,6 +70,21 @@ pub struct RoutesDto {
     pub routes: Vec<String>,
     pub model_override: Option<String>,
     pub target_protocol: String,
+    #[serde(default)]
+    pub route_models: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ModelMappingDto {
+    pub alias: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ModelMapDto {
+    pub mappings: Vec<ModelMappingDto>,
+    pub models_merge: bool,
 }
 
 /// Global config, as exposed to the frontend (`api_key` is masked).
@@ -74,8 +94,9 @@ pub struct ConfigDto {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api: Option<String>,
-    /// Masked hint of the stored global API key (`Some("sk-1…")`) or `None` when unset.
+    /// Masked hint of the stored global API key (`Some("sk-…abcd")`) or `None` when unset.
     pub api_key: Option<String>,
+    pub keychain_allow_all: bool,
 }
 
 /// Frontend → backend config update. `None` leaves a field unchanged; an empty
@@ -88,6 +109,7 @@ pub struct ConfigInput {
     pub model: Option<String>,
     pub api: Option<String>,
     pub api_key: Option<String>,
+    pub keychain_allow_all: Option<bool>,
 }
 
 // Pass through core types that already derive Serialize: Provider / ToolKind / StatsRow / RequestLog / StatsGroupBy
