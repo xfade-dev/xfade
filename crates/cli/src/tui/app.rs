@@ -1374,30 +1374,7 @@ fn is_loopback_or_private(host: &str) -> bool {
     }
 }
 
-/// TCP connect timing used by the `t` key. Returns elapsed milliseconds, or
-/// None when the endpoint is unreachable within `timeout`. Runs in a worker
-/// thread from the UI so the event loop never blocks.
-pub fn probe_latency(host: &str, port: u16, timeout: std::time::Duration) -> Option<u128> {
-    use std::net::{TcpStream, ToSocketAddrs};
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
-    let start = std::time::Instant::now();
-    TcpStream::connect_timeout(&addr, timeout).ok()?;
-    Some(start.elapsed().as_millis())
-}
-
-/// Parse `host:port` out of a base URL for the TCP latency probe.
-/// Returns None when unparseable or the scheme has no known default port.
-pub fn probe_target(base_url: &str) -> Option<(String, u16)> {
-    let url = reqwest::Url::parse(base_url).ok()?;
-    // url::Url's host_str() brackets IPv6 literals; normalize to the bare form.
-    let host = url
-        .host_str()?
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = url.port_or_known_default()?;
-    Some((host, port))
-}
+pub use xfade_core::service::{probe_latency, probe_target};
 
 #[cfg(test)]
 mod tests {

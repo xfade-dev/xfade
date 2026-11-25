@@ -103,6 +103,23 @@ fn raw_get_health(port: u16, timeout: Duration) -> RawHealth {
     RawHealth::Response(String::from_utf8_lossy(&buf).into_owned())
 }
 
+static DAEMON_EXE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Register an explicit `xfade` CLI executable path for background daemon
+/// spawning (used by GUI hosts where `std::env::current_exe()` is `xfade-gui`).
+pub fn set_daemon_exe(path: std::path::PathBuf) {
+    let _ = DAEMON_EXE_OVERRIDE.set(path);
+}
+
+/// Resolve the executable used to spawn `xfade serve`.
+pub fn daemon_exe() -> Result<std::path::PathBuf> {
+    if let Some(path) = DAEMON_EXE_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
+    Ok(std::env::current_exe()?)
+}
+
 /// Ensure the xfade gateway is running on `port`.
 /// If already running with valid fingerprint, returns `Ok(())`.
 /// If occupied by a foreign server, returns `Err(CoreError::PortConflict(port))`.
@@ -129,7 +146,7 @@ pub fn ensure_gateway_running(port: u16) -> Result<()> {
         return Ok(());
     }
 
-    let current_exe = std::env::current_exe()?;
+    let current_exe = daemon_exe()?;
     let mut cmd = std::process::Command::new(current_exe);
     cmd.args(["serve", "--port", &port.to_string()])
         .stdin(Stdio::null())
@@ -287,5 +304,12 @@ mod tests {
             probe_health(port, Duration::from_millis(50)),
             ProbeResult::Unreachable
         );
+    }
+
+    #[test]
+    fn daemon_exe_prefers_override_when_set() {
+        let override_path = std::path::PathBuf::from("/tmp/custom-xfade-sidecar");
+        set_daemon_exe(override_path.clone());
+        assert_eq!(daemon_exe().unwrap(), override_path);
     }
 }

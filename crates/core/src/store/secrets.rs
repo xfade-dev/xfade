@@ -36,6 +36,10 @@ pub trait SecretStore: Send + Sync {
         Ok(false)
     }
 
+    /// Update the macOS "allow all applications" ACL setting in-place for stores
+    /// backed by the OS keychain.
+    fn set_allow_all_acl(&self, _allow: bool) {}
+
     /// Migrate a secret from the old key `from` to the new key `to` (used when the
     /// key_ref prefix changes). Returns `Ok(false)` when `from` does not exist.
     ///
@@ -61,7 +65,7 @@ pub trait SecretStore: Send + Sync {
 pub struct KeyringStore {
     service: String,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    allow_all_acl: bool,
+    allow_all_acl: std::sync::Arc<AtomicBool>,
     cache: RwLock<HashMap<String, String>>,
 }
 
@@ -78,9 +82,17 @@ impl KeyringStore {
     pub fn with_allow_all_acl(allow_all_acl: bool) -> Self {
         Self {
             service: SERVICE.into(),
-            allow_all_acl,
+            allow_all_acl: std::sync::Arc::new(AtomicBool::new(allow_all_acl)),
             cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn allow_all_acl(&self) -> bool {
+        self.allow_all_acl.load(Ordering::Relaxed)
+    }
+
+    pub fn set_allow_all_acl(&self, allow: bool) {
+        self.allow_all_acl.store(allow, Ordering::Relaxed);
     }
 
     fn entry(&self, key_ref: &str) -> Result<keyring::Entry> {
@@ -192,10 +204,14 @@ impl Default for KeyringStore {
 }
 
 impl SecretStore for KeyringStore {
+    fn set_allow_all_acl(&self, allow: bool) {
+        KeyringStore::set_allow_all_acl(self, allow);
+    }
+
     fn set(&self, key_ref: &str, secret: &str) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            if self.allow_all_acl
+            if self.allow_all_acl()
                 && !secret.contains('\n')
                 && !secret.contains('\r')
                 && !key_ref.contains('\n')
@@ -532,6 +548,10 @@ impl VaultStore {
 }
 
 impl SecretStore for VaultStore {
+    fn set_allow_all_acl(&self, allow: bool) {
+        self.master_keyring.set_allow_all_acl(allow);
+    }
+
     fn set(&self, key_ref: &str, secret: &str) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let key = self.get_or_create_master_key()?;
@@ -751,5 +771,15 @@ mod tests {
             vault.get("xfade/claude/office").unwrap(),
             "sk-legacy-office"
         );
+    }
+
+    #[test]
+    fn keyring_store_updates_allow_all_acl_in_place() {
+        let store = KeyringStore::with_allow_all_acl(true);
+        assert!(store.allow_all_acl());
+        store.set_allow_all_acl(false);
+        assert!(!store.allow_all_acl());
+        store.set_allow_all_acl(true);
+        assert!(store.allow_all_acl());
     }
 }
