@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.13.2 — 2026-11-25
+
+### macOS Keychain Prompt & ACL Fixes
+- **fix(secrets)**: Delete any existing `(service, key_ref)` keychain entry before recreating it with `add-generic-password ... -T ""` in `set_password_macos_allow_all` (with `entry.set_password` rollback on failure), because `-U` preserved the old restricted `SecAccess` ACL on macOS.
+- **fix(doctor,service)**: Normalize Keychain ACLs across all non-official providers (active/routed first) in `xfade doctor --security --fix`, and immediately abort remaining lookups in `normalize_keychain_acls` and `migrate_legacy_key_refs` when a keyring error (such as user denial/cancellation) occurs.
+- **fix(tui,core)**: Move TUI `/v1/models` parameter resolution (`p`) to a background thread, stop falling back to `global_api_key()` on `CoreError::Keyring` (`ProbeParamError::Keyring`), abort the remaining batch on first keyring error, and suppress stderr keyring-wait hints while the alternate screen is active.
+
 ## v0.13.1 — 2026-11-25
 
 ### Circuit Isolation & Keychain Upgrade Ergonomics

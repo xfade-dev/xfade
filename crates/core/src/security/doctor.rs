@@ -1,8 +1,9 @@
 use crate::adapters::adapter_for;
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::models::ToolKind;
 use crate::service::Core;
 use crate::store::config::{SecretsBackend, GLOBAL_API_KEY_REF};
+use crate::store::secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -307,7 +308,7 @@ impl<'a> SecurityDoctor<'a> {
     /// so macOS Keychain items receive the allow-all ACL (`-T ""`).
     /// Only touches in-use entries to avoid prompting for unused legacy keys.
     fn fix_keychain_acls(&self) -> Vec<String> {
-        let mut actions = Vec::new();
+        let actions = Vec::new();
         if !cfg!(target_os = "macos")
             || self.core.active_secrets_backend() != Some(SecretsBackend::Keyring)
             || !self.core.config().keychain_allow_all
@@ -328,11 +329,16 @@ impl<'a> SecurityDoctor<'a> {
         let mut key_refs: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         if let Ok(providers) = self.core.list(None) {
-            for p in providers {
+            for p in &providers {
                 if !p.is_official()
                     && (p.is_active || route_ids.contains(&p.id))
                     && seen.insert(p.key_ref.clone())
                 {
+                    key_refs.push(p.key_ref.clone());
+                }
+            }
+            for p in providers {
+                if !p.is_official() && seen.insert(p.key_ref.clone()) {
                     key_refs.push(p.key_ref);
                 }
             }
@@ -341,17 +347,7 @@ impl<'a> SecurityDoctor<'a> {
             key_refs.push(GLOBAL_API_KEY_REF.to_string());
         }
 
-        for key_ref in key_refs {
-            if let Ok(secret) = self.core.secrets().get(&key_ref) {
-                if self.core.secrets().set(&key_ref, &secret).is_ok() {
-                    actions.push(format!(
-                        "Updated macOS Keychain ACL (allow-all) for {key_ref}"
-                    ));
-                }
-            }
-        }
-
-        actions
+        normalize_keychain_acls(self.core.secrets(), &key_refs)
     }
 
     fn audit_file_permissions(&self) -> Vec<SecurityCheckItem> {
@@ -450,8 +446,7 @@ impl<'a> SecurityDoctor<'a> {
     }
 
     fn audit_daemon_binding(&self) -> SecurityCheckItem {
-        let dd = crate::daemon::data_dir(self.core.home());
-        if let Some(cfg) = crate::daemon::read(&dd) {
+        if let Some(cfg) = crate::daemon::read(self.core.data_dir()) {
             let is_loopback =
                 cfg.host == "127.0.0.1" || cfg.host == "localhost" || cfg.host == "::1";
             if !is_loopback && cfg.auth_token.is_none() {
@@ -508,6 +503,34 @@ fn contains_raw_key(text: &str) -> bool {
 
 fn is_loopback_url(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
+}
+
+/// Re-write each `key_ref` in place so its macOS Keychain ACL allows all
+/// applications. Stops immediately on any keyring error (e.g. user canceled or
+/// denied authorization) instead of popping up a dialog for every remaining key.
+fn normalize_keychain_acls(secrets: &dyn SecretStore, key_refs: &[String]) -> Vec<String> {
+    let mut actions = Vec::new();
+    for key_ref in key_refs {
+        match secrets.get(key_ref) {
+            Ok(secret) => match secrets.set(key_ref, &secret) {
+                Ok(()) => {
+                    actions.push(format!(
+                        "Updated macOS Keychain ACL (allow-all) for {key_ref}"
+                    ));
+                }
+                Err(e) => {
+                    actions.push(format!("Stopped macOS Keychain ACL fix at {key_ref}: {e}"));
+                    break;
+                }
+            },
+            Err(CoreError::SecretNotFound(_)) => continue,
+            Err(e) => {
+                actions.push(format!("Stopped macOS Keychain ACL fix at {key_ref}: {e}"));
+                break;
+            }
+        }
+    }
+    actions
 }
 
 #[cfg(test)]
@@ -690,5 +713,57 @@ mod tests {
         assert!(!content.contains("sk-secret-1234567890"));
         assert!(content.contains("http://127.0.0.1:24860"));
         assert!(content.contains("xfade-local-claude-"));
+    }
+
+    #[test]
+    fn audit_daemon_binding_uses_core_data_dir() {
+        let (_dir, core) = setup_test_core();
+        assert_ne!(core.data_dir(), crate::daemon::data_dir(core.home()));
+        let cfg = crate::daemon::DaemonConfig {
+            host: "0.0.0.0".into(),
+            port: 24860,
+            auth_token: None,
+        };
+        crate::daemon::write(core.data_dir(), &cfg).unwrap();
+
+        let doctor = SecurityDoctor::new(&core);
+        let item = doctor.audit_daemon_binding();
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(item.details.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn normalize_keychain_acls_stops_on_first_keyring_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailingStore {
+            gets: AtomicUsize,
+        }
+        impl SecretStore for FailingStore {
+            fn set(&self, _key_ref: &str, _secret: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get(&self, _key_ref: &str) -> Result<String> {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::Keyring("User canceled".into()))
+            }
+            fn delete(&self, _key_ref: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = FailingStore {
+            gets: AtomicUsize::new(0),
+        };
+        let refs = vec![
+            "xfade/aider/office".to_string(),
+            "xfade/claude/office".to_string(),
+            GLOBAL_API_KEY_REF.to_string(),
+        ];
+        let actions = normalize_keychain_acls(&store, &refs);
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].contains("xfade/aider/office"));
+        assert!(actions[0].contains("Stopped"));
     }
 }

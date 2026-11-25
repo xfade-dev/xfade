@@ -119,6 +119,9 @@ impl Core {
                     eprintln!(
                         "[xfade] keyring migration: failed to probe new key {rest}: {e} (will retry on next startup)"
                     );
+                    if matches!(e, CoreError::Keyring(_)) {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -140,6 +143,9 @@ impl Core {
                     eprintln!(
                         "[xfade] keyring migration: failed to migrate {rest}: {e} (will retry on next startup)"
                     );
+                    if matches!(e, CoreError::Keyring(_)) {
+                        break;
+                    }
                 }
             }
         }
@@ -685,21 +691,40 @@ impl Core {
     pub fn resolve_probe_params(
         &self,
         provider: &Provider,
-    ) -> std::result::Result<(String, ProviderProtocol, Option<String>), String> {
+    ) -> std::result::Result<(String, ProviderProtocol, Option<String>), ProbeParamError> {
         let base_url = provider
             .base_url
             .clone()
-            .ok_or_else(|| "official provider has no base_url".to_string())?;
+            .ok_or(ProbeParamError::OfficialProvider)?;
         if let Ok(false) = self.is_domain_allowed(&base_url) {
-            return Err("blocked by egress policy".to_string());
+            return Err(ProbeParamError::EgressBlocked);
         }
-        let auth_key = self
-            .secrets()
-            .get(&provider.key_ref)
-            .ok()
-            .or_else(|| self.global_api_key());
+        // Only fall back to the global key when the provider's own key is
+        // genuinely absent. A keyring backend error (e.g. user denied/canceled
+        // the macOS Keychain prompt) must surface directly instead of popping up
+        // a second prompt for the global key.
+        let auth_key = match self.secrets().get(&provider.key_ref) {
+            Ok(key) => Some(key),
+            Err(CoreError::SecretNotFound(_)) => match self.secrets().get(GLOBAL_API_KEY_REF) {
+                Ok(key) => Some(key),
+                Err(CoreError::SecretNotFound(_)) => None,
+                Err(e) => return Err(ProbeParamError::Keyring(e.to_string())),
+            },
+            Err(e) => return Err(ProbeParamError::Keyring(e.to_string())),
+        };
         Ok((base_url, provider.protocol, auth_key))
     }
+}
+
+/// Error returned by [`Core::resolve_probe_params`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProbeParamError {
+    #[error("official provider has no base_url")]
+    OfficialProvider,
+    #[error("blocked by egress policy")]
+    EgressBlocked,
+    #[error("keyring: {0}")]
+    Keyring(String),
 }
 
 /// Probe a provider's `/v1/models` endpoint and return the discovered model IDs.
@@ -1493,5 +1518,46 @@ mod tests {
         assert_eq!(url, "https://api.deepseek.com");
         assert_eq!(proto, ProviderProtocol::Chat);
         assert_eq!(key.as_deref(), Some("sk-ds"));
+    }
+
+    #[test]
+    fn resolve_probe_params_does_not_fallback_on_keyring_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingErrorStore(AtomicUsize);
+        impl SecretStore for CountingErrorStore {
+            fn set(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn get(&self, _: &str) -> Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::Keyring("User canceled".into()))
+            }
+            fn delete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CountingErrorStore(AtomicUsize::new(0)));
+        let core = Core::with_paths(
+            &dir.path().join("home"),
+            &dir.path().join("data"),
+            store.clone(),
+        )
+        .unwrap();
+        let custom = Provider::new(
+            "ds",
+            ToolKind::ClaudeCode,
+            Some("https://api.deepseek.com".into()),
+        );
+        core.add_provider(custom.clone(), None).unwrap();
+        let err = core.resolve_probe_params(&custom).unwrap_err();
+        assert!(matches!(err, ProbeParamError::Keyring(_)));
+        assert_eq!(
+            store.0.load(Ordering::SeqCst),
+            1,
+            "must not fall back to global_api_key after a keyring error"
+        );
     }
 }

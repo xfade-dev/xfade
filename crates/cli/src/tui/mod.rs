@@ -57,6 +57,7 @@ pub fn run_tui(core: &Core, tool: ToolKind) -> Result<()> {
         }
     };
 
+    let _hint_guard = xfade_core::store::secrets::StderrHintGuard::suppress();
     let result = event_loop(core, tool, &mut terminal);
 
     // ── Terminal cleanup ──────────────────────────────────────────────
@@ -104,7 +105,8 @@ fn event_loop(
     // `/v1/models` catalog probes run in worker threads; results arrive here.
     let (model_probe_tx, model_probe_rx) =
         mpsc::channel::<(ToolKind, String, std::result::Result<Vec<String>, String>)>();
-    let (mut mprobe_ok, mut mprobe_fail, mut mprobe_total) = (0u32, 0u32, 0usize);
+    let (mut mprobe_ok, mut mprobe_fail, mut mprobe_total, mut mprobe_keyring_err) =
+        (0u32, 0u32, 0usize, false);
 
     // Redraw only when state changed or an animation is in flight, so an idle
     // terminal doesn't repaint at the poll cadence.
@@ -164,6 +166,9 @@ fn event_loop(
                 }
                 Err(err) => {
                     mprobe_fail += 1;
+                    if err.starts_with("keyring:") {
+                        mprobe_keyring_err = true;
+                    }
                     app.model_probes.insert(id, ModelProbeResult::Failed(err));
                 }
             }
@@ -175,6 +180,9 @@ fn event_loop(
                 let n = mprobe_ok + mprobe_fail;
                 app.message = Some(if mprobe_fail == 0 {
                     format!("models: {mprobe_ok}/{n} ok · {mprobe_total} models")
+                } else if mprobe_ok == 0 && mprobe_keyring_err {
+                    "models: keyring denied — run 'xfade doctor --security --fix' or use file secrets"
+                        .into()
                 } else if mprobe_ok == 0 {
                     format!("models: all {n} failed")
                 } else {
@@ -185,6 +193,7 @@ fn event_loop(
                 mprobe_ok = 0;
                 mprobe_fail = 0;
                 mprobe_total = 0;
+                mprobe_keyring_err = false;
             }
         }
 
@@ -389,38 +398,7 @@ fn event_loop(
                 if !app.model_probing.is_empty() {
                     app.message = Some("model probe already running…".into());
                 } else {
-                    let mut targets = Vec::new();
-                    for p in &app.providers {
-                        if let Ok((base_url, protocol, auth_key)) = core.resolve_probe_params(p) {
-                            targets.push((p.id.clone(), base_url, protocol, auth_key));
-                        }
-                    }
-                    if targets.is_empty() {
-                        app.message = Some("no probeable provider for /v1/models".into());
-                    } else {
-                        let n = targets.len();
-                        let current_tool = app.tool;
-                        for (id, base_url, protocol, auth_key) in targets {
-                            let tx = model_probe_tx.clone();
-                            app.model_probing.insert(id.clone());
-                            std::thread::spawn(move || {
-                                let res = match tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                {
-                                    Ok(rt) => rt.block_on(xfade_core::service::probe_models_http(
-                                        &base_url,
-                                        protocol,
-                                        auth_key.as_deref(),
-                                        Duration::from_secs(5),
-                                    )),
-                                    Err(e) => Err(format!("runtime: {e}")),
-                                };
-                                let _ = tx.send((current_tool, id, res));
-                            });
-                        }
-                        app.message = Some(format!("probing models on {n} providers…"));
-                    }
+                    start_model_probes(core, &mut app, &model_probe_tx);
                 }
             }
             _ => {}
@@ -439,4 +417,153 @@ fn load_stats(core: &Core, tool: &ToolKind) -> Vec<StatsRow> {
     core.db()
         .stats_since(&since, StatsGroupBy::Provider, Some(tool))
         .unwrap_or_default()
+}
+
+/// Start `/v1/models` probes for all probeable providers of the active tool.
+///
+/// Keyring lookups happen sequentially on a background thread so the TUI event
+/// loop never blocks on an OS Keychain dialog, and a keyring error (such as
+/// the user denying/canceling the prompt) immediately aborts remaining lookups
+/// instead of popping up a dialog for every provider in the list.
+type ModelProbeSender = mpsc::Sender<(ToolKind, String, std::result::Result<Vec<String>, String>)>;
+
+fn start_model_probes(core: &Core, app: &mut App, model_probe_tx: &ModelProbeSender) {
+    let candidates: Vec<_> = app
+        .providers
+        .iter()
+        .filter(|p| {
+            p.base_url
+                .as_deref()
+                .is_some_and(|url| !matches!(core.is_domain_allowed(url), Ok(false)))
+        })
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        app.message = Some("no probeable provider for /v1/models".into());
+        return;
+    }
+
+    let n = candidates.len();
+    for p in &candidates {
+        app.model_probing.insert(p.id.clone());
+    }
+    app.message = Some(format!("probing models on {n} providers…"));
+
+    let current_tool = app.tool;
+    let core = core.clone();
+    let tx = model_probe_tx.clone();
+    std::thread::spawn(move || {
+        let mut iter = candidates.into_iter();
+        while let Some(p) = iter.next() {
+            match core.resolve_probe_params(&p) {
+                Ok((base_url, protocol, auth_key)) => {
+                    let tx = tx.clone();
+                    let id = p.id;
+                    std::thread::spawn(move || {
+                        let res = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt.block_on(xfade_core::service::probe_models_http(
+                                &base_url,
+                                protocol,
+                                auth_key.as_deref(),
+                                Duration::from_secs(5),
+                            )),
+                            Err(e) => Err(format!("runtime: {e}")),
+                        };
+                        let _ = tx.send((current_tool, id, res));
+                    });
+                }
+                Err(xfade_core::service::ProbeParamError::Keyring(err)) => {
+                    let _ = tx.send((current_tool, p.id, Err(format!("keyring: {err}"))));
+                    for rest in iter {
+                        let _ = tx.send((
+                            current_tool,
+                            rest.id,
+                            Err("aborted: keyring access denied".to_string()),
+                        ));
+                    }
+                    break;
+                }
+                Err(err) => {
+                    let _ = tx.send((current_tool, p.id, Err(err.to_string())));
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use xfade_core::models::Provider;
+    use xfade_core::store::secrets::SecretStore;
+
+    struct FailingKeyringStore {
+        calls: AtomicUsize,
+    }
+
+    impl SecretStore for FailingKeyringStore {
+        fn set(&self, _key_ref: &str, _secret: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, _key_ref: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::Keyring("User canceled the operation".into()))
+        }
+
+        fn delete(&self, _key_ref: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn start_model_probes_aborts_after_first_keyring_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FailingKeyringStore {
+            calls: AtomicUsize::new(0),
+        });
+        let core = Core::with_paths(
+            &dir.path().join("home"),
+            &dir.path().join("data"),
+            store.clone(),
+        )
+        .unwrap();
+
+        for id in ["p1", "p2", "p3"] {
+            let p = Provider::new(
+                id,
+                ToolKind::ClaudeCode,
+                Some("https://api.example.com".into()),
+            );
+            core.add_provider(p, None).unwrap();
+        }
+
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        let (tx, rx) = mpsc::channel();
+        start_model_probes(&core, &mut app, &tx);
+
+        assert_eq!(app.model_probing.len(), 3);
+        let results: Vec<_> = (0..3)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect();
+
+        // Must prompt at most once: no fallback to global_api_key and no
+        // queries for p2/p3 after p1 fails with a keyring error.
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        assert!(results[0].2.as_ref().unwrap_err().starts_with("keyring:"));
+        assert_eq!(
+            results[1].2.as_ref().unwrap_err(),
+            "aborted: keyring access denied"
+        );
+        assert_eq!(
+            results[2].2.as_ref().unwrap_err(),
+            "aborted: keyring access denied"
+        );
+    }
 }

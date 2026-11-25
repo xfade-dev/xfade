@@ -1,6 +1,28 @@
 use crate::error::{CoreError, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
+
+static SUPPRESS_STDERR_HINTS: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that suppresses `eprintln!` keychain-wait hints on stderr while
+/// active (e.g., while the TUI owns the alternate screen in raw mode).
+pub struct StderrHintGuard {
+    prev: bool,
+}
+
+impl StderrHintGuard {
+    pub fn suppress() -> Self {
+        let prev = SUPPRESS_STDERR_HINTS.swap(true, Ordering::Relaxed);
+        Self { prev }
+    }
+}
+
+impl Drop for StderrHintGuard {
+    fn drop(&mut self) {
+        SUPPRESS_STDERR_HINTS.store(self.prev, Ordering::Relaxed);
+    }
+}
 
 pub trait SecretStore: Send + Sync {
     fn set(&self, key_ref: &str, secret: &str) -> Result<()>;
@@ -81,8 +103,18 @@ fn set_password_macos_allow_all(service: &str, key_ref: &str, secret: &str) -> R
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // `security add-generic-password -U` updates the password in-place while
+    // preserving the existing SecAccess ACL. Delete any existing entry first
+    // so the recreated item genuinely receives the `-T ""` (allow-all) ACL.
+    let entry =
+        keyring::Entry::new(service, key_ref).map_err(|e| CoreError::Keyring(e.to_string()))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(CoreError::Keyring(e.to_string())),
+    }
+
     let cmd_line = format!(
-        "add-generic-password -s {} -a {} -w {} -U -T \"\"\n",
+        "add-generic-password -s {} -a {} -w {} -T \"\"\n",
         quote_security_arg(service),
         quote_security_arg(key_ref),
         quote_security_arg(secret),
@@ -105,6 +137,8 @@ fn set_password_macos_allow_all(service: &str, key_ref: &str, secret: &str) -> R
         .wait_with_output()
         .map_err(|e| CoreError::Keyring(format!("wait security: {e}")))?;
     if !output.status.success() {
+        // Restore via keyring if `security` failed after we deleted the old item.
+        let _ = entry.set_password(secret);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CoreError::Keyring(format!(
             "security add-generic-password failed: {}",
@@ -126,10 +160,12 @@ fn get_password_with_hint(entry: keyring::Entry, key_ref: &str) -> Result<String
     let result = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
         Ok(r) => r,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!(
-                "xfade: waiting on the OS keychain for '{key_ref}' — \
-                 if an authorization dialog is showing, please allow it"
-            );
+            if !SUPPRESS_STDERR_HINTS.load(Ordering::Relaxed) {
+                eprintln!(
+                    "xfade: waiting on the OS keychain for '{key_ref}' — \
+                     if an authorization dialog is showing, please allow it"
+                );
+            }
             rx.recv().expect("keyring worker disconnected")
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
