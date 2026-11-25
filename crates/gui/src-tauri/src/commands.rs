@@ -245,8 +245,8 @@ pub async fn proxy_start(
 }
 
 #[tauri::command]
-pub async fn proxy_stop(app: tauri::AppHandle) -> CmdResult<ProxyStatus> {
-    crate::daemon_ctl::stop(&app).await?;
+pub async fn proxy_stop() -> CmdResult<ProxyStatus> {
+    crate::daemon_ctl::stop().await?;
     Ok(crate::daemon_ctl::status_from_config().await)
 }
 

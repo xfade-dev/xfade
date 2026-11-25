@@ -9,10 +9,27 @@ use xfade_core::proxy::status::StatusDto;
 fn stopped() -> ProxyStatus {
     ProxyStatus {
         running: false,
+        managed: false,
         port: None,
         host: None,
         auth_enabled: false,
         circuits: vec![],
+    }
+}
+
+pub fn unmanaged_status(
+    host: &str,
+    port: u16,
+    auth_enabled: bool,
+    circuits: Vec<xfade_core::proxy::status::CircuitDto>,
+) -> ProxyStatus {
+    ProxyStatus {
+        running: true,
+        managed: false,
+        port: Some(port),
+        host: Some(host.to_string()),
+        auth_enabled,
+        circuits,
     }
 }
 
@@ -24,8 +41,23 @@ pub fn config() -> Option<DaemonConfig> {
 
 /// Query /__xfade/status. Returns stopped on connection/auth failure.
 pub async fn status(host: &str, port: u16, auth_token: Option<&str>) -> ProxyStatus {
+    status_with_managed(host, port, auth_token, true).await
+}
+
+async fn status_with_managed(
+    host: &str,
+    port: u16,
+    auth_token: Option<&str>,
+    managed: bool,
+) -> ProxyStatus {
     let url = format!("http://{host}:{port}/__xfade/status");
-    let client = Client::new();
+    let client = match Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return stopped(),
+    };
     let mut req = client.get(&url);
     if let Some(t) = auth_token {
         req = req.header("Authorization", format!("Bearer {t}"));
@@ -34,6 +66,7 @@ pub async fn status(host: &str, port: u16, auth_token: Option<&str>) -> ProxySta
         Ok(r) if r.status().is_success() => match r.json::<StatusDto>().await {
             Ok(s) => ProxyStatus {
                 running: s.running,
+                managed,
                 port: Some(s.port),
                 host: Some(s.host),
                 auth_enabled: s.auth_enabled,
@@ -45,11 +78,19 @@ pub async fn status(host: &str, port: u16, auth_token: Option<&str>) -> ProxySta
     }
 }
 
-/// Query status per the daemon.json config; returns stopped if not installed.
+/// Query status per the daemon.json config; falls back to probing 127.0.0.1:24860
+/// (reported as `managed: false`) when `daemon.json` is absent.
 pub async fn status_from_config() -> ProxyStatus {
     match config() {
-        Some(cfg) => status(&cfg.host, cfg.port, cfg.auth_token.as_deref()).await,
-        None => stopped(),
+        Some(cfg) => status_with_managed(&cfg.host, cfg.port, cfg.auth_token.as_deref(), true).await,
+        None => {
+            let fallback = status_with_managed("127.0.0.1", 24860, None, false).await;
+            if fallback.running {
+                fallback
+            } else {
+                stopped()
+            }
+        }
     }
 }
 
@@ -103,25 +144,27 @@ pub async fn start(
     }
 }
 
-/// Stop the daemon: run `xfade serve uninstall` via the sidecar.
-pub async fn stop(app: &AppHandle) -> Result<(), String> {
-    let args = uninstall_args();
-    let status = app
-        .shell()
-        .sidecar("xfade")
-        .map_err(|e| e.to_string())?
-        .args(&args)
-        .status()
+/// Stop the daemon without deleting `daemon.json`, preserving host/port/auth_token.
+pub fn stop_in_home(home: &Path) -> Result<(), String> {
+    daemon::unload_job(home).map_err(|e| e.to_string())
+}
+
+/// Stop the daemon without uninstalling `daemon.json`.
+pub async fn stop() -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || stop_in_home(Path::new(&home)))
         .await
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "xfade serve uninstall failed (exit {:?})",
-            status.code()
-        ))
-    }
+        .map_err(|e| e.to_string())?
+}
+
+/// Restart the managed daemon with the current `daemon.json` config (or defaults).
+pub async fn restart(app: &AppHandle) -> Result<(), String> {
+    let _ = stop().await;
+    let cfg = config();
+    let (host, port, auth_token) = cfg
+        .map(|c| (c.host, c.port, c.auth_token))
+        .unwrap_or_else(|| ("127.0.0.1".into(), 24860, None));
+    start(app, host, port, auth_token).await
 }
 
 #[cfg(test)]
@@ -208,5 +251,32 @@ mod tests {
     #[test]
     fn uninstall_args_shape() {
         assert_eq!(uninstall_args(), vec!["serve", "uninstall"]);
+    }
+
+    #[test]
+    fn proxy_status_unmanaged_fallback_sets_managed_false() {
+        let s = unmanaged_status("127.0.0.1", 24860, false, vec![]);
+        assert!(s.running);
+        assert!(!s.managed);
+        assert_eq!(s.port, Some(24860));
+        assert_eq!(s.host.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn stop_in_dir_preserves_daemon_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let dd = daemon::data_dir(&home);
+        daemon::write(
+            &dd,
+            &DaemonConfig {
+                host: "127.0.0.1".into(),
+                port: 24860,
+                auth_token: Some("tok".into()),
+            },
+        )
+        .unwrap();
+        stop_in_home(&home).unwrap();
+        assert!(daemon::read(&dd).is_some());
     }
 }

@@ -227,7 +227,7 @@ pub fn unload_job(home: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("systemctl")
-            .args(["--user", "disable", "--now", LABEL])
+            .args(["--user", "stop", LABEL])
             .status();
     }
     Ok(())

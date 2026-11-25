@@ -53,6 +53,7 @@ impl From<Preset> for PresetDto {
 #[derive(Serialize)]
 pub struct ProxyStatus {
     pub running: bool,
+    pub managed: bool,
     pub port: Option<u16>,
     pub host: Option<String>,
     pub auth_enabled: bool,

@@ -45,19 +45,26 @@ async fn refresh_menu(app: &AppHandle) {
 
 fn build_menu(app: &AppHandle, status: &ProxyStatus, autostart: bool) -> tauri::Result<Menu<Wry>> {
     let status_text = if status.running {
+        let ext = if !status.managed { " (external)" } else { "" };
         match (&status.host, status.port) {
             (Some(h), Some(p)) => format!(
-                "Running {h}:{p}{}",
+                "Running {h}:{p}{}{ext}",
                 if status.auth_enabled { " (auth)" } else { "" }
             ),
-            _ => "Running".to_string(),
+            _ => format!("Running{ext}"),
         }
     } else {
         "Stopped".to_string()
     };
     let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
-    let start = MenuItem::with_id(app, "start", "Start proxy", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "Stop proxy", true, None::<&str>)?;
+    let start = MenuItem::with_id(app, "start", "Start proxy", !status.running, None::<&str>)?;
+    let stop = MenuItem::with_id(
+        app,
+        "stop",
+        "Stop proxy",
+        status.running && status.managed,
+        None::<&str>,
+    )?;
     let autostart_item = CheckMenuItem::with_id(
         app,
         "autostart",
@@ -147,9 +154,8 @@ fn on_menu_event(app: &AppHandle, e: MenuEvent) {
             });
         }
         "stop" => {
-            let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = daemon_ctl::stop(&app).await;
+                let _ = daemon_ctl::stop().await;
             });
         }
         "autostart" => {
