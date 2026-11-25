@@ -1218,7 +1218,7 @@ mod tests {
         let calls_after_threshold = up.call_count().await;
         let _ = http_post_json(&url, "/v1/chat/completions", "{}", "Bearer x").await;
         assert_eq!(up.call_count().await, calls_after_threshold);
-        assert!(up2.call_count().await >= super::FAIL_THRESHOLD as usize + 1);
+        assert!(up2.call_count().await > super::FAIL_THRESHOLD as usize);
     }
 
     #[tokio::test]
@@ -2470,7 +2470,10 @@ mod tests {
             let (s, _) = http_post_json(&url, "/v1/messages", body, "Bearer test").await;
             assert_eq!(s, 200);
         }
-        assert_eq!(up_failing.call_count().await, super::FAIL_THRESHOLD as usize);
+        assert_eq!(
+            up_failing.call_count().await,
+            super::FAIL_THRESHOLD as usize
+        );
         assert_eq!(up_backup.call_count().await, super::FAIL_THRESHOLD as usize);
 
         // Next request: circuit is OPEN on failing provider, so it must be skipped without an HTTP call!
@@ -2482,7 +2485,10 @@ mod tests {
             super::FAIL_THRESHOLD as usize,
             "circuit-open provider must be skipped without network call"
         );
-        assert_eq!(up_backup.call_count().await, super::FAIL_THRESHOLD as usize + 1);
+        assert_eq!(
+            up_backup.call_count().await,
+            super::FAIL_THRESHOLD as usize + 1
+        );
     }
 
     #[tokio::test]
@@ -3167,7 +3173,10 @@ mod tests {
         .await;
 
         assert_eq!(status, 200);
-        assert!(body.contains("recovered"), "expected retry to succeed, got: {body}");
+        assert!(
+            body.contains("recovered"),
+            "expected retry to succeed, got: {body}"
+        );
         assert_eq!(
             cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
             0,
@@ -3240,6 +3249,41 @@ mod tests {
             cb.failure_count(&super::circuit_key(crate::models::ToolKind::Codex, "p1")),
             0,
             "403 must passthrough without counting as a circuit failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_accept_encoding_not_forwarded_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = MockUpstream::spawn().await;
+        let core = test_core(&dir, &[("p1", &up.url(), "k1")]);
+        core.db().set_routes(&["p1".into()], None, "chat").unwrap();
+
+        let svc = ProxyService::new(core);
+        let url = spawn_service(svc).await;
+
+        up.respond_sse(vec![
+            r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+            r#"data: [DONE]"#,
+        ]);
+
+        let resp = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .header("Authorization", "Bearer x")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Content-Type", "application/json")
+            .body(r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let _ = resp.text().await.unwrap();
+
+        let recorded = up.last_request().await;
+        assert_eq!(
+            recorded.accept_encoding, None,
+            "client Accept-Encoding must be stripped before forwarding upstream"
         );
     }
 }

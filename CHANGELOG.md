@@ -2,6 +2,11 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.13.5 — 2026-11-25
+
+### Proxy Upstream Compression Fix
+- **fix(proxy,forward)**: Strip client `accept-encoding` in `STRIP_HEADERS` before forwarding requests upstream. Because `reqwest` is built with `default-features = false` (no gzip/deflate/brotli decompression), forwarding `Accept-Encoding: gzip, deflate, br` caused compressed upstream SSE/JSON responses to fail pre-commit parsing with `502 stream_ended_before_commit` (or `502 non_json_response`).
+
 ## v0.13.4 — 2026-11-25
 
 ### Circuit Breaker & Upstream Jitter Resilience

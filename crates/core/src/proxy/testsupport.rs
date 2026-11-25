@@ -11,6 +11,7 @@ pub struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub authorization: String,
+    pub accept_encoding: Option<String>,
     pub body: String,
 }
 
@@ -67,6 +68,11 @@ impl MockUpstream {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string(),
+                    accept_encoding: parts
+                        .headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string()),
                     body: String::from_utf8_lossy(&bytes).to_string(),
                 };
                 c.lock().unwrap().push(recorded);

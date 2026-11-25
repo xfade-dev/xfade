@@ -49,6 +49,10 @@ const STRIP_HEADERS: &[&str] = &[
     "anthropic-beta",
     // Local-only hint for handover context; must not leak a filesystem path.
     "x-xfade-project-root",
+    // `reqwest` is built with `default-features = false` (no gzip/brotli/deflate
+    // decompression); forwarding client `Accept-Encoding` causes compressed
+    // upstream responses that fail pre-commit SSE/JSON parsing.
+    "accept-encoding",
 ];
 
 /// Tail ring buffer size kept while streaming to extract usage at the end (~8KB).
@@ -1213,8 +1217,7 @@ async fn run_streaming_pre_commit(
     resp: reqwest::Response,
     protocol: ProviderProtocol,
     ttft_deadline: tokio::time::Instant,
-) -> PreCommitOutcome<impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>
-{
+) -> PreCommitOutcome<impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static> {
     const MAX_PRE_COMMIT_BUFFER_BYTES: usize = 2 * 1024 * 1024; // 2MB
     let mut raw_stream = resp.bytes_stream();
     let mut buffered_chunks: Vec<Bytes> = Vec::new();
@@ -1421,237 +1424,244 @@ async fn failover_loop(
         let mut retried_stream_end = false;
         let mut retried_transport = false;
         'attempt: loop {
-        let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
-        let time_for_headers = ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ttft_deadline = tokio::time::Instant::now() + svc.timeouts.ttft_timeout;
+            let time_for_headers =
+                ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
 
-        let mut resp = match tokio::time::timeout(
-            time_for_headers,
-            try_forward(
-                &svc.client,
-                method,
-                &base_url,
-                upstream_endpoint,
-                headers,
-                sending_body,
-                auth_key.as_deref(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                if single_route && !retried_transport {
-                    retried_transport = true;
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    continue 'attempt;
-                }
-                let duration_ms = start.elapsed().as_millis() as i64;
-                failover_trajectory.push(serde_json::json!({
-                    "provider": route_id,
-                    "status": 502,
-                    "error": &e
-                }));
-                log_request(
-                    svc,
-                    session_id,
-                    endpoint,
-                    &model,
-                    route_id,
-                    provider.tool.as_str(),
-                    0,
-                    Usage::default(),
-                    duration_ms,
-                    Some(e.clone()),
-                );
-                probe_guard.disarm();
-                svc.record_failure(&cb_key);
-                last_err = Some((StatusCode::BAD_GATEWAY, e, None));
-                continue 'routes;
-            }
-            Err(_timeout) => {
-                let duration_ms = start.elapsed().as_millis() as i64;
-                failover_trajectory.push(serde_json::json!({
-                    "provider": route_id,
-                    "status": 504,
-                    "error": "ttft_timeout"
-                }));
-                log_request(
-                    svc,
-                    session_id,
-                    endpoint,
-                    &model,
-                    route_id,
-                    provider.tool.as_str(),
-                    0,
-                    Usage::default(),
-                    duration_ms,
-                    Some("ttft_timeout".to_string()),
-                );
-                probe_guard.disarm();
-                svc.record_failure(&cb_key);
-                last_err = Some((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "ttft_timeout".to_string(),
-                    None,
-                ));
-                continue 'routes;
-            }
-        };
-
-        // Intra-upstream retry on 429/503 if Retry-After <= 2s (and bounded by remaining TTFT deadline)
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS
-            || resp.status() == StatusCode::SERVICE_UNAVAILABLE
-        {
-            if let Some(delay) = robustness::parse_retry_after(resp.headers()) {
-                let now = tokio::time::Instant::now();
-                if delay <= Duration::from_secs(2) && now + delay < ttft_deadline {
-                    tokio::time::sleep(delay).await;
-                    let remaining =
-                        ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if let Ok(Ok(retry_resp)) = tokio::time::timeout(
-                        remaining,
-                        try_forward(
-                            &svc.client,
-                            method,
-                            &base_url,
-                            upstream_endpoint,
-                            headers,
-                            sending_body,
-                            auth_key.as_deref(),
-                        ),
-                    )
-                    .await
-                    {
-                        resp = retry_resp;
-                    }
-                }
-            }
-        }
-
-        // If response is 400 Bad Request, attempt self-healing parameter rectification
-        if resp.status() == StatusCode::BAD_REQUEST {
-            let err_bytes = resp.bytes().await.unwrap_or_default();
-            let err_body = String::from_utf8_lossy(&err_bytes);
-            let mut rectified_bytes = None;
-            if let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(sending_body) {
-                if super::thinking_rectifier::rectify_thinking_error(&mut body_json, 400, &err_body)
-                {
-                    if let Ok(new_bytes) = serde_json::to_vec(&body_json) {
-                        rectified_bytes = Some(new_bytes);
-                    }
-                }
-            }
-
-            if let Some(new_body) = rectified_bytes {
-                // Immediately retry on current provider!
-                match try_forward(
+            let mut resp = match tokio::time::timeout(
+                time_for_headers,
+                try_forward(
                     &svc.client,
                     method,
                     &base_url,
                     upstream_endpoint,
                     headers,
-                    &new_body,
+                    sending_body,
                     auth_key.as_deref(),
-                )
-                .await
-                {
-                    Ok(retry_resp) => {
-                        resp = retry_resp;
+                ),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    if single_route && !retried_transport {
+                        retried_transport = true;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        continue 'attempt;
                     }
-                    Err(e) => {
-                        let duration_ms = start.elapsed().as_millis() as i64;
-                        failover_trajectory.push(serde_json::json!({
-                            "provider": route_id,
-                            "status": 502,
-                            "error": &e
-                        }));
-                        log_request(
-                            svc,
-                            session_id,
-                            endpoint,
-                            &model,
-                            route_id,
-                            provider.tool.as_str(),
-                            0,
-                            Usage::default(),
-                            duration_ms,
-                            Some(e.clone()),
-                        );
-                        probe_guard.disarm();
-                        svc.record_failure(&cb_key);
-                        last_err = Some((StatusCode::BAD_GATEWAY, e, None));
-                        continue 'routes;
-                    }
-                }
-            } else {
-                // Not rectified: handle this 400 error.
-                let duration_ms = start.elapsed().as_millis() as i64;
-                let usage = Usage::from_json(&err_bytes);
-                log_request(
-                    svc,
-                    session_id,
-                    endpoint,
-                    &model,
-                    route_id,
-                    provider.tool.as_str(),
-                    400,
-                    usage,
-                    duration_ms,
-                    None,
-                );
-                let should_continue =
-                    failover_4xx && qualifies_for_4xx_failover(StatusCode::BAD_REQUEST, &err_bytes);
-                if should_continue {
+                    let duration_ms = start.elapsed().as_millis() as i64;
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
-                        "status": 400,
-                        "error": "model_rejection"
+                        "status": 502,
+                        "error": &e
                     }));
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        0,
+                        Usage::default(),
+                        duration_ms,
+                        Some(e.clone()),
+                    );
                     probe_guard.disarm();
                     svc.record_failure(&cb_key);
-                    let transcoded = super::convert::transcode_error_body(
-                        &err_bytes,
-                        provider.protocol,
-                        inbound_proto,
-                    );
-                    let text = String::from_utf8_lossy(&transcoded).to_string();
-                    last_err = Some((StatusCode::BAD_REQUEST, text, None));
+                    last_err = Some((StatusCode::BAD_GATEWAY, e, None));
                     continue 'routes;
                 }
-                // Release in-flight probe reservation so HalfOpen is not permanently blocked
-                probe_guard.disarm();
-                svc.circuit_breaker.release_probe(&cb_key);
-                let out_bytes = if inbound_proto != provider.protocol {
-                    super::convert::transcode_error_body(
-                        &err_bytes,
-                        provider.protocol,
-                        inbound_proto,
-                    )
-                } else {
-                    err_bytes.to_vec()
-                };
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(out_bytes))
-                    .unwrap();
-            }
-        }
+                Err(_timeout) => {
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": 504,
+                        "error": "ttft_timeout"
+                    }));
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        0,
+                        Usage::default(),
+                        duration_ms,
+                        Some("ttft_timeout".to_string()),
+                    );
+                    probe_guard.disarm();
+                    svc.record_failure(&cb_key);
+                    last_err = Some((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "ttft_timeout".to_string(),
+                        None,
+                    ));
+                    continue 'routes;
+                }
+            };
 
-        let status = resp.status();
-        if status.is_success() || status.is_redirection() {
-            let is_stream = is_stream_response(&resp);
-            let resp_headers = resp.headers().clone();
-            if !is_stream {
-                let content_type = resp_headers
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_lowercase();
-                // Non-streaming pre-commit gate: read body and inspect with total timeout
-                let bytes =
-                    match tokio::time::timeout(svc.timeouts.total_non_stream_timeout, resp.bytes())
+            // Intra-upstream retry on 429/503 if Retry-After <= 2s (and bounded by remaining TTFT deadline)
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            {
+                if let Some(delay) = robustness::parse_retry_after(resp.headers()) {
+                    let now = tokio::time::Instant::now();
+                    if delay <= Duration::from_secs(2) && now + delay < ttft_deadline {
+                        tokio::time::sleep(delay).await;
+                        let remaining =
+                            ttft_deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if let Ok(Ok(retry_resp)) = tokio::time::timeout(
+                            remaining,
+                            try_forward(
+                                &svc.client,
+                                method,
+                                &base_url,
+                                upstream_endpoint,
+                                headers,
+                                sending_body,
+                                auth_key.as_deref(),
+                            ),
+                        )
                         .await
+                        {
+                            resp = retry_resp;
+                        }
+                    }
+                }
+            }
+
+            // If response is 400 Bad Request, attempt self-healing parameter rectification
+            if resp.status() == StatusCode::BAD_REQUEST {
+                let err_bytes = resp.bytes().await.unwrap_or_default();
+                let err_body = String::from_utf8_lossy(&err_bytes);
+                let mut rectified_bytes = None;
+                if let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(sending_body)
+                {
+                    if super::thinking_rectifier::rectify_thinking_error(
+                        &mut body_json,
+                        400,
+                        &err_body,
+                    ) {
+                        if let Ok(new_bytes) = serde_json::to_vec(&body_json) {
+                            rectified_bytes = Some(new_bytes);
+                        }
+                    }
+                }
+
+                if let Some(new_body) = rectified_bytes {
+                    // Immediately retry on current provider!
+                    match try_forward(
+                        &svc.client,
+                        method,
+                        &base_url,
+                        upstream_endpoint,
+                        headers,
+                        &new_body,
+                        auth_key.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(retry_resp) => {
+                            resp = retry_resp;
+                        }
+                        Err(e) => {
+                            let duration_ms = start.elapsed().as_millis() as i64;
+                            failover_trajectory.push(serde_json::json!({
+                                "provider": route_id,
+                                "status": 502,
+                                "error": &e
+                            }));
+                            log_request(
+                                svc,
+                                session_id,
+                                endpoint,
+                                &model,
+                                route_id,
+                                provider.tool.as_str(),
+                                0,
+                                Usage::default(),
+                                duration_ms,
+                                Some(e.clone()),
+                            );
+                            probe_guard.disarm();
+                            svc.record_failure(&cb_key);
+                            last_err = Some((StatusCode::BAD_GATEWAY, e, None));
+                            continue 'routes;
+                        }
+                    }
+                } else {
+                    // Not rectified: handle this 400 error.
+                    let duration_ms = start.elapsed().as_millis() as i64;
+                    let usage = Usage::from_json(&err_bytes);
+                    log_request(
+                        svc,
+                        session_id,
+                        endpoint,
+                        &model,
+                        route_id,
+                        provider.tool.as_str(),
+                        400,
+                        usage,
+                        duration_ms,
+                        None,
+                    );
+                    let should_continue = failover_4xx
+                        && qualifies_for_4xx_failover(StatusCode::BAD_REQUEST, &err_bytes);
+                    if should_continue {
+                        failover_trajectory.push(serde_json::json!({
+                            "provider": route_id,
+                            "status": 400,
+                            "error": "model_rejection"
+                        }));
+                        probe_guard.disarm();
+                        svc.record_failure(&cb_key);
+                        let transcoded = super::convert::transcode_error_body(
+                            &err_bytes,
+                            provider.protocol,
+                            inbound_proto,
+                        );
+                        let text = String::from_utf8_lossy(&transcoded).to_string();
+                        last_err = Some((StatusCode::BAD_REQUEST, text, None));
+                        continue 'routes;
+                    }
+                    // Release in-flight probe reservation so HalfOpen is not permanently blocked
+                    probe_guard.disarm();
+                    svc.circuit_breaker.release_probe(&cb_key);
+                    let out_bytes = if inbound_proto != provider.protocol {
+                        super::convert::transcode_error_body(
+                            &err_bytes,
+                            provider.protocol,
+                            inbound_proto,
+                        )
+                    } else {
+                        err_bytes.to_vec()
+                    };
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(out_bytes))
+                        .unwrap();
+                }
+            }
+
+            let status = resp.status();
+            if status.is_success() || status.is_redirection() {
+                let is_stream = is_stream_response(&resp);
+                let resp_headers = resp.headers().clone();
+                if !is_stream {
+                    let content_type = resp_headers
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    // Non-streaming pre-commit gate: read body and inspect with total timeout
+                    let bytes = match tokio::time::timeout(
+                        svc.timeouts.total_non_stream_timeout,
+                        resp.bytes(),
+                    )
+                    .await
                     {
                         Ok(Ok(b)) => b,
                         Ok(Err(e)) => {
@@ -1708,258 +1718,267 @@ async fn failover_loop(
                         }
                     };
 
-                let is_valid_json = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok();
-                if (!content_type.contains("json") && !body_looks_like_json(&bytes))
-                    || !is_valid_json
-                {
-                    let msg = format!(
-                        "xfade: upstream provider '{route_id}' returned a non-JSON response \
+                    let is_valid_json = serde_json::from_slice::<serde_json::Value>(&bytes).is_ok();
+                    if (!content_type.contains("json") && !body_looks_like_json(&bytes))
+                        || !is_valid_json
+                    {
+                        let msg = format!(
+                            "xfade: upstream provider '{route_id}' returned a non-JSON response \
                          (content-type: '{content_type}'); its base_url is probably wrong — \
                          OpenAI/Anthropic-compatible upstreams usually need a /v1 path suffix"
-                    );
-                    let duration_ms = start.elapsed().as_millis() as i64;
-                    log_request(
-                        svc,
-                        session_id,
-                        endpoint,
-                        &model,
-                        route_id,
-                        provider.tool.as_str(),
-                        StatusCode::BAD_GATEWAY.as_u16() as i64,
-                        Usage::default(),
-                        duration_ms,
-                        Some(msg.clone()),
-                    );
-                    probe_guard.disarm();
-                    svc.record_failure(&cb_key);
-                    failover_trajectory.push(serde_json::json!({
-                        "provider": route_id,
-                        "status": 502,
-                        "error": "non_json_response",
-                    }));
-                    last_err = Some((StatusCode::BAD_GATEWAY, msg, None));
-                    continue 'routes;
-                }
+                        );
+                        let duration_ms = start.elapsed().as_millis() as i64;
+                        log_request(
+                            svc,
+                            session_id,
+                            endpoint,
+                            &model,
+                            route_id,
+                            provider.tool.as_str(),
+                            StatusCode::BAD_GATEWAY.as_u16() as i64,
+                            Usage::default(),
+                            duration_ms,
+                            Some(msg.clone()),
+                        );
+                        probe_guard.disarm();
+                        svc.record_failure(&cb_key);
+                        failover_trajectory.push(serde_json::json!({
+                            "provider": route_id,
+                            "status": 502,
+                            "error": "non_json_response",
+                        }));
+                        last_err = Some((StatusCode::BAD_GATEWAY, msg, None));
+                        continue 'routes;
+                    }
 
-                if let Some(err_msg) = robustness::SemanticDetector::is_error_payload(&bytes) {
-                    let duration_ms = start.elapsed().as_millis() as i64;
-                    log_request(
-                        svc,
-                        session_id,
-                        endpoint,
-                        &model,
-                        route_id,
-                        provider.tool.as_str(),
-                        StatusCode::BAD_GATEWAY.as_u16() as i64,
-                        Usage::default(),
-                        duration_ms,
-                        Some(format!("upstream 200 error payload: {err_msg}")),
-                    );
+                    if let Some(err_msg) = robustness::SemanticDetector::is_error_payload(&bytes) {
+                        let duration_ms = start.elapsed().as_millis() as i64;
+                        log_request(
+                            svc,
+                            session_id,
+                            endpoint,
+                            &model,
+                            route_id,
+                            provider.tool.as_str(),
+                            StatusCode::BAD_GATEWAY.as_u16() as i64,
+                            Usage::default(),
+                            duration_ms,
+                            Some(format!("upstream 200 error payload: {err_msg}")),
+                        );
+                        probe_guard.disarm();
+                        svc.record_failure(&cb_key);
+                        failover_trajectory.push(serde_json::json!({
+                            "provider": route_id,
+                            "status": 200,
+                            "error": format!("error_payload: {err_msg}"),
+                        }));
+                        let is_rate_limit = err_msg.to_lowercase().contains("rate")
+                            || err_msg.to_lowercase().contains("quota")
+                            || err_msg.to_lowercase().contains("insufficient");
+                        let mapped_status = if is_rate_limit {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        };
+                        last_err = Some((
+                            mapped_status,
+                            format!(
+                                "{{\"error\":{{\"code\":\"upstream_error\",\"message\":{}}}}}",
+                                serde_json::to_string(&err_msg)
+                                    .unwrap_or_else(|_| "\"upstream error\"".to_string())
+                            ),
+                            None,
+                        ));
+                        continue 'routes;
+                    }
+
+                    // Verified non-streaming response: commit!
                     probe_guard.disarm();
-                    svc.record_failure(&cb_key);
+                    svc.record_success(&cb_key);
                     failover_trajectory.push(serde_json::json!({
                         "provider": route_id,
-                        "status": 200,
-                        "error": format!("error_payload: {err_msg}"),
+                        "status": status.as_u16(),
                     }));
-                    let is_rate_limit = err_msg.to_lowercase().contains("rate")
-                        || err_msg.to_lowercase().contains("quota")
-                        || err_msg.to_lowercase().contains("insufficient");
-                    let mapped_status = if is_rate_limit {
-                        StatusCode::TOO_MANY_REQUESTS
+                    let failover_path_json = if failover_trajectory.len() > 1 {
+                        serde_json::to_string(&failover_trajectory).ok()
                     } else {
-                        StatusCode::BAD_GATEWAY
+                        None
                     };
-                    last_err = Some((
-                        mapped_status,
-                        format!(
-                            "{{\"error\":{{\"code\":\"upstream_error\",\"message\":{}}}}}",
-                            serde_json::to_string(&err_msg)
-                                .unwrap_or_else(|_| "\"upstream error\"".to_string())
-                        ),
-                        None,
-                    ));
-                    continue 'routes;
-                }
-
-                // Verified non-streaming response: commit!
-                probe_guard.disarm();
-                svc.record_success(&cb_key);
-                failover_trajectory.push(serde_json::json!({
-                    "provider": route_id,
-                    "status": status.as_u16(),
-                }));
-                let failover_path_json = if failover_trajectory.len() > 1 {
-                    serde_json::to_string(&failover_trajectory).ok()
+                    let effective_model = entry.model_override.clone().or_else(|| model.clone());
+                    return handle_success_non_streaming(
+                        svc,
+                        session_id,
+                        route_id,
+                        provider.tool.as_str(),
+                        status,
+                        bytes,
+                        endpoint,
+                        effective_model,
+                        start,
+                        inbound_proto,
+                        provider.protocol,
+                        req_model.to_string(),
+                        failover_path_json.as_deref(),
+                    )
+                    .await;
                 } else {
-                    None
-                };
-                let effective_model = entry.model_override.clone().or_else(|| model.clone());
-                return handle_success_non_streaming(
-                    svc,
-                    session_id,
-                    route_id,
-                    provider.tool.as_str(),
-                    status,
-                    bytes,
-                    endpoint,
-                    effective_model,
-                    start,
-                    inbound_proto,
-                    provider.protocol,
-                    req_model.to_string(),
-                    failover_path_json.as_deref(),
-                )
-                .await;
-            } else {
-                // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout.
-                // If the stream ends before commit, retry the same route once with a
-                // short backoff before counting it as a failure.
-                let (buffered_chunks, has_tool_call, raw_stream) =
-                    match run_streaming_pre_commit(resp, provider.protocol, ttft_deadline).await {
-                        PreCommitOutcome::Committed {
-                            buffered_chunks,
-                            has_tool_call,
-                            raw_stream,
-                        } => (buffered_chunks, has_tool_call, raw_stream),
-                        PreCommitOutcome::Failed(err_str) => {
-                            let is_transient_stream_drop = err_str == "stream_ended_before_commit"
-                                || err_str.starts_with("upstream_read_error:");
-                            if is_transient_stream_drop && !retried_stream_end {
-                                retried_stream_end = true;
-                                tokio::time::sleep(Duration::from_millis(150)).await;
-                                continue 'attempt;
+                    // Streaming pre-commit gate: buffer initial chunks up to TTFT timeout.
+                    // If the stream ends before commit, retry the same route once with a
+                    // short backoff before counting it as a failure.
+                    let (buffered_chunks, has_tool_call, raw_stream) =
+                        match run_streaming_pre_commit(resp, provider.protocol, ttft_deadline).await
+                        {
+                            PreCommitOutcome::Committed {
+                                buffered_chunks,
+                                has_tool_call,
+                                raw_stream,
+                            } => (buffered_chunks, has_tool_call, raw_stream),
+                            PreCommitOutcome::Failed(err_str) => {
+                                let is_transient_stream_drop = err_str
+                                    == "stream_ended_before_commit"
+                                    || err_str.starts_with("upstream_read_error:");
+                                if is_transient_stream_drop && !retried_stream_end {
+                                    retried_stream_end = true;
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    continue 'attempt;
+                                }
+                                let duration_ms = start.elapsed().as_millis() as i64;
+                                log_request(
+                                    svc,
+                                    session_id,
+                                    endpoint,
+                                    &model,
+                                    route_id,
+                                    provider.tool.as_str(),
+                                    StatusCode::BAD_GATEWAY.as_u16() as i64,
+                                    Usage::default(),
+                                    duration_ms,
+                                    Some(err_str.clone()),
+                                );
+                                probe_guard.disarm();
+                                svc.record_failure(&cb_key);
+                                failover_trajectory.push(serde_json::json!({
+                                    "provider": route_id,
+                                    "status": 502,
+                                    "error": &err_str,
+                                }));
+                                last_err = Some((
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("{{\"error\":\"{err_str}\"}}"),
+                                    None,
+                                ));
+                                continue 'routes;
                             }
-                            let duration_ms = start.elapsed().as_millis() as i64;
-                            log_request(
-                                svc,
-                                session_id,
-                                endpoint,
-                                &model,
-                                route_id,
-                                provider.tool.as_str(),
-                                StatusCode::BAD_GATEWAY.as_u16() as i64,
-                                Usage::default(),
-                                duration_ms,
-                                Some(err_str.clone()),
-                            );
-                            probe_guard.disarm();
-                            svc.record_failure(&cb_key);
-                            failover_trajectory.push(serde_json::json!({
-                                "provider": route_id,
-                                "status": 502,
-                                "error": &err_str,
-                            }));
-                            last_err = Some((
-                                StatusCode::BAD_GATEWAY,
-                                format!("{{\"error\":\"{err_str}\"}}"),
-                                None,
-                            ));
-                            continue 'routes;
-                        }
+                        };
+
+                    // We reached Commit Point!
+                    // Success will be recorded when the stream completes cleanly without interruption.
+                    failover_trajectory.push(serde_json::json!({
+                        "provider": route_id,
+                        "status": status.as_u16(),
+                    }));
+                    let failover_path_json = if failover_trajectory.len() > 1 {
+                        serde_json::to_string(&failover_trajectory).ok()
+                    } else {
+                        None
                     };
 
-                // We reached Commit Point!
-                // Success will be recorded when the stream completes cleanly without interruption.
+                    let req_id = headers
+                        .get("x-request-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("req_{:016x}", rand::random::<u64>()));
+
+                    let effective_model = entry.model_override.clone().or_else(|| model.clone());
+                    return handle_success_streaming_committed(
+                        svc,
+                        session_id,
+                        route_id,
+                        provider.tool.as_str(),
+                        status,
+                        &resp_headers,
+                        buffered_chunks,
+                        raw_stream,
+                        has_tool_call,
+                        endpoint,
+                        effective_model,
+                        start,
+                        inbound_proto,
+                        provider.protocol,
+                        req_model.to_string(),
+                        failover_path_json.as_deref(),
+                        req_id,
+                    );
+                }
+            }
+            let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+            let (err_resp, should_continue) = handle_upstream_error(
+                svc,
+                session_id,
+                route_id,
+                provider.tool.as_str(),
+                resp,
+                endpoint,
+                &model,
+                start,
+                failover_4xx,
+            )
+            .await;
+            // `handle_upstream_error` records the failure (and releases the probe)
+            // on the continue path; the non-qualifying 4xx branch below releases it
+            // too. Either way the guard must not release again on drop.
+            probe_guard.disarm();
+            if should_continue {
+                if status == StatusCode::FORBIDDEN {
+                    svc.circuit_breaker.release_probe(&cb_key);
+                }
                 failover_trajectory.push(serde_json::json!({
                     "provider": route_id,
                     "status": status.as_u16(),
                 }));
-                let failover_path_json = if failover_trajectory.len() > 1 {
-                    serde_json::to_string(&failover_trajectory).ok()
-                } else {
-                    None
+                // Preserve the upstream error body (e.g. 429 budget_exceeded)
+                // transcoded to client inbound protocol so the client understands the error.
+                let raw_bytes = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await
+                {
+                    Ok(b) => b,
+                    Err(_) => Bytes::new(),
                 };
-
-                let req_id = headers
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("req_{:016x}", rand::random::<u64>()));
-
-                let effective_model = entry.model_override.clone().or_else(|| model.clone());
-                return handle_success_streaming_committed(
-                    svc,
-                    session_id,
-                    route_id,
-                    provider.tool.as_str(),
-                    status,
-                    &resp_headers,
-                    buffered_chunks,
-                    raw_stream,
-                    has_tool_call,
-                    endpoint,
-                    effective_model,
-                    start,
-                    inbound_proto,
+                let transcoded = super::convert::transcode_error_body(
+                    &raw_bytes,
                     provider.protocol,
-                    req_model.to_string(),
-                    failover_path_json.as_deref(),
-                    req_id,
+                    inbound_proto,
                 );
+                let text = String::from_utf8_lossy(&transcoded).to_string();
+                last_err = Some((status, text, retry_after));
+                continue 'routes;
             }
-        }
-        let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
-        let (err_resp, should_continue) = handle_upstream_error(
-            svc,
-            session_id,
-            route_id,
-            provider.tool.as_str(),
-            resp,
-            endpoint,
-            &model,
-            start,
-            failover_4xx,
-        )
-        .await;
-        // `handle_upstream_error` records the failure (and releases the probe)
-        // on the continue path; the non-qualifying 4xx branch below releases it
-        // too. Either way the guard must not release again on drop.
-        probe_guard.disarm();
-        if should_continue {
-            if status == StatusCode::FORBIDDEN {
+            // Non-qualifying 4xx: passthrough, stop failover.
+            // 403 (e.g. invalid model name or permission) is a client/request error and
+            // must not trip the circuit breaker; 401 still counts for key rotation.
+            if status == StatusCode::UNAUTHORIZED {
+                svc.record_failure(&cb_key);
+            } else {
                 svc.circuit_breaker.release_probe(&cb_key);
             }
-            failover_trajectory.push(serde_json::json!({
-                "provider": route_id,
-                "status": status.as_u16(),
-            }));
-            // Preserve the upstream error body (e.g. 429 budget_exceeded)
-            // transcoded to client inbound protocol so the client understands the error.
-            let raw_bytes = match axum::body::to_bytes(err_resp.into_body(), 1024 * 1024).await {
-                Ok(b) => b,
-                Err(_) => Bytes::new(),
-            };
-            let transcoded =
-                super::convert::transcode_error_body(&raw_bytes, provider.protocol, inbound_proto);
-            let text = String::from_utf8_lossy(&transcoded).to_string();
-            last_err = Some((status, text, retry_after));
-            continue 'routes;
-        }
-        // Non-qualifying 4xx: passthrough, stop failover.
-        // 403 (e.g. invalid model name or permission) is a client/request error and
-        // must not trip the circuit breaker; 401 still counts for key rotation.
-        if status == StatusCode::UNAUTHORIZED {
-            svc.record_failure(&cb_key);
-        } else {
-            svc.circuit_breaker.release_probe(&cb_key);
-        }
-        if inbound_proto != provider.protocol {
-            let (parts, body) = err_resp.into_parts();
-            let raw_bytes = axum::body::to_bytes(body, 1024 * 1024)
-                .await
-                .unwrap_or_default();
-            let transcoded =
-                super::convert::transcode_error_body(&raw_bytes, provider.protocol, inbound_proto);
-            let mut builder = Response::builder().status(parts.status);
-            if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
-                builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
-            } else {
-                builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            if inbound_proto != provider.protocol {
+                let (parts, body) = err_resp.into_parts();
+                let raw_bytes = axum::body::to_bytes(body, 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let transcoded = super::convert::transcode_error_body(
+                    &raw_bytes,
+                    provider.protocol,
+                    inbound_proto,
+                );
+                let mut builder = Response::builder().status(parts.status);
+                if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+                } else {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+                }
+                return builder.body(Body::from(transcoded)).unwrap();
             }
-            return builder.body(Body::from(transcoded)).unwrap();
-        }
-        return err_resp;
+            return err_resp;
         } // 'attempt
     } // 'routes
 
