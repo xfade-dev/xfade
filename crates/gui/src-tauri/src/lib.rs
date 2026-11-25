@@ -64,6 +64,7 @@ pub fn run() {
         .setup(|app| {
             // Register bundled `xfade` sidecar path so `Core::use_provider` /
             // `ensure_gateway_running` never spawns `xfade-gui` itself.
+            xfade_core::daemon_spawner::disallow_current_exe_fallback();
             if let Ok(exe_dir) = std::env::current_exe().and_then(|p| {
                 p.parent()
                     .map(|d| d.to_path_buf())

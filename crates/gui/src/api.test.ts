@@ -38,7 +38,7 @@ describe("api", () => {
       tool: "codex",
       base_url: "http://u",
       key: "k",
-      protocol: "Chat",
+      protocol: "chat",
     });
     expect(r).toBe("add_provider");
   });
@@ -60,7 +60,7 @@ describe("api", () => {
   it("probing wrappers call expected commands", async () => {
     expect(await probeProviderLatency("codex", "ds")).toBe("probe_provider_latency");
     expect(await probeProviderModels("codex", "ds")).toBe("probe_provider_models");
-    expect(await probeModelsAdhoc("https://api.example.com", "sk-1", "Chat")).toBe(
+    expect(await probeModelsAdhoc("https://api.example.com", "sk-1", "chat")).toBe(
       "probe_models_adhoc"
     );
   });

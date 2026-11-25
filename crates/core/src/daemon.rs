@@ -295,6 +295,9 @@ pub fn unload(home: &Path) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", LABEL])
+            .status();
         let _ = std::fs::remove_file(systemd_unit_path());
     }
     Ok(())

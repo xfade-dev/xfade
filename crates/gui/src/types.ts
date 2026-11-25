@@ -9,7 +9,7 @@ export type ToolKind =
   | "hermes"
   | "openclaw";
 
-export type ProviderProtocol = "Chat" | "Messages" | "Responses";
+export type ProviderProtocol = "chat" | "messages" | "responses";
 
 export interface Provider {
   id: string;
@@ -19,7 +19,6 @@ export interface Provider {
   protocol?: ProviderProtocol | null;
   extra: unknown;
   is_active: boolean;
-  is_official?: boolean;
 }
 
 export interface PresetDto {

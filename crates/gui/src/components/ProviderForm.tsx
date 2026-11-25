@@ -47,7 +47,7 @@ export default function ProviderForm({
       ? JSON.stringify(editing.extra, null, 2)
       : ""
   );
-  const [official, setOfficial] = useState(editing?.is_official ?? false);
+  const [official, setOfficial] = useState(editing ? editing.base_url === null : false);
   const [presets, setPresets] = useState<PresetDto[]>([]);
   const [probedModels, setProbedModels] = useState<string[]>(cachedModels);
   const [probing, setProbing] = useState(false);
@@ -202,9 +202,9 @@ export default function ProviderForm({
                 onChange={(e) => setProtocol(e.target.value as ProviderProtocol | "")}
               >
                 <option value="">auto</option>
-                <option value="Chat">chat (OpenAI)</option>
-                <option value="Messages">messages (Anthropic)</option>
-                <option value="Responses">responses (Codex)</option>
+                <option value="chat">chat (OpenAI)</option>
+                <option value="messages">messages (Anthropic)</option>
+                <option value="responses">responses (Codex)</option>
               </select>
             </div>
             <div>

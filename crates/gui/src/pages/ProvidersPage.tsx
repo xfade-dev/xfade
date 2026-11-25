@@ -231,7 +231,7 @@ export default function ProvidersPage({ onTrustChange }: { onTrustChange?: () =>
                   <td className="py-2 pr-2">
                     <div className="font-mono">{p.id}</div>
                     <div className="flex gap-1 mt-0.5">
-                      {p.is_official && (
+                      {p.base_url === null && (
                         <span className="text-[10px] px-1.5 py-0.2 rounded bg-gray-100 text-gray-600">
                           official
                         </span>
@@ -308,12 +308,14 @@ export default function ProvidersPage({ onTrustChange }: { onTrustChange?: () =>
                     >
                       Edit
                     </button>
-                    <button
-                      className="text-xs px-2 py-0.5 rounded border text-red-600"
-                      onClick={() => del(p.id)}
-                    >
-                      Delete
-                    </button>
+                    {!p.is_active && (
+                      <button
+                        className="text-xs px-2 py-0.5 rounded border text-red-600"
+                        onClick={() => del(p.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
                   </td>
                 </tr>
               );

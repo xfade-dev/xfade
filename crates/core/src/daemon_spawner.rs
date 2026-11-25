@@ -104,6 +104,8 @@ fn raw_get_health(port: u16, timeout: Duration) -> RawHealth {
 }
 
 static DAEMON_EXE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static ALLOW_CURRENT_EXE_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Register an explicit `xfade` CLI executable path for background daemon
 /// spawning (used by GUI hosts where `std::env::current_exe()` is `xfade-gui`).
@@ -111,10 +113,21 @@ pub fn set_daemon_exe(path: std::path::PathBuf) {
     let _ = DAEMON_EXE_OVERRIDE.set(path);
 }
 
+/// Disable falling back to `std::env::current_exe()` when no override is set
+/// (prevents GUI hosts from spawning themselves if the sidecar is absent).
+pub fn disallow_current_exe_fallback() {
+    ALLOW_CURRENT_EXE_FALLBACK.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Resolve the executable used to spawn `xfade serve`.
 pub fn daemon_exe() -> Result<std::path::PathBuf> {
     if let Some(path) = DAEMON_EXE_OVERRIDE.get() {
         return Ok(path.clone());
+    }
+    if !ALLOW_CURRENT_EXE_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(CoreError::Proxy(
+            "xfade sidecar executable not found (refusing to spawn GUI binary)".into(),
+        ));
     }
     Ok(std::env::current_exe()?)
 }

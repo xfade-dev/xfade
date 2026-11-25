@@ -6,7 +6,7 @@ use crate::state::AppState;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tauri::State;
-use xfade_core::models::{ProviderProtocol, ToolKind};
+use xfade_core::models::{Provider, ProviderProtocol, ToolKind};
 use xfade_core::presets::presets_for;
 use xfade_core::security::doctor::SecurityDoctorReport;
 use xfade_core::service::{probe_latency, probe_models_http, probe_target};
@@ -95,13 +95,12 @@ pub async fn update_provider(
             .ok_or_else(|| {
                 xfade_core::CoreError::ProviderNotFound(format!("{}/{}", input.tool, input.id))
             })?;
-        if let Some(u) = input.base_url {
-            p.base_url = Some(u);
-        }
-        p.protocol = input.protocol;
-        if !input.extra.is_null() {
-            p.extra = input.extra;
-        }
+        p.base_url = input.base_url;
+        p.protocol = match input.protocol {
+            Some(proto) => proto,
+            None => Provider::new(&p.id, p.tool, p.base_url.clone()).protocol,
+        };
+        p.extra = input.extra;
         core.update_provider(&p, input.key.as_deref())
     })
     .await
@@ -390,7 +389,7 @@ pub async fn probe_provider_latency(
             .into_iter()
             .find(|p| p.id == id)
             .ok_or_else(|| format!("provider not found: {tool}/{id}"))?;
-        let Some(base_url) = core.effective_base_url(p.base_url.as_deref(), p.is_official) else {
+        let Some(base_url) = core.effective_base_url(p.base_url.as_deref(), p.is_official()) else {
             return Ok(None);
         };
         let Some((host, port)) = probe_target(&base_url) else {
