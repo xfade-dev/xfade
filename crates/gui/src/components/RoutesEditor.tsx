@@ -1,36 +1,48 @@
-import { useEffect, useState } from "react";
-import type { Provider, RoutesDto } from "../types";
+import { useCallback, useEffect, useState } from "react";
+import type { Provider } from "../types";
 import { clearRoutes, getRoutes, listProviders, setRoutes as setRoutesApi } from "../api";
+import Toast from "./Toast";
 
 export default function RoutesEditor() {
-  const [all, setAll] = useState<Provider[]>([]);
+  const [allIds, setAllIds] = useState<string[]>([]);
   const [routes, setRoutes] = useState<string[]>([]);
+  const [routeModels, setRouteModels] = useState<Record<string, string>>({});
   const [modelOverride, setModelOverride] = useState("");
   const [targetProtocol, setTargetProtocol] = useState("chat");
-  const [msg, setMsg] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; kind: "error" | "success" } | null>(null);
 
-  const load = () => {
-    listProviders().then(setAll).catch((e) => setMsg(String(e)));
-    getRoutes()
-      .then((r) => {
+  const load = useCallback(() => {
+    Promise.all([listProviders(), getRoutes()])
+      .then(([providers, r]) => {
+        const uniqueIds = Array.from(
+          new Set(providers.map((p: Provider) => p.id))
+        ).sort();
+        setAllIds(uniqueIds);
         if (r) {
           setRoutes(r.routes);
+          setRouteModels(r.route_models ?? {});
           setModelOverride(r.model_override ?? "");
-          setTargetProtocol(r.target_protocol);
+          setTargetProtocol(r.target_protocol || "chat");
         }
       })
-      .catch((e) => setMsg(String(e)));
-  };
+      .catch((e) => setToast({ message: String(e), kind: "error" }));
+  }, []);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
 
-  const addRoute = (id: string) => {
-    if (!routes.includes(id)) setRoutes([...routes, id]);
+  const toggle = (id: string, enabled: boolean) => {
+    if (enabled) {
+      if (!routes.includes(id)) setRoutes([...routes, id]);
+    } else {
+      setRoutes(routes.filter((r) => r !== id));
+    }
   };
-  const removeRoute = (id: string) => setRoutes(routes.filter((r) => r !== id));
-  const move = (i: number, dir: -1 | 1) => {
+
+  const move = (id: string, dir: -1 | 1) => {
+    const i = routes.indexOf(id);
+    if (i < 0) return;
     const j = i + dir;
     if (j < 0 || j >= routes.length) return;
     const next = [...routes];
@@ -38,145 +50,186 @@ export default function RoutesEditor() {
     setRoutes(next);
   };
 
+  const setUpstreamModel = (id: string, val: string) => {
+    setRouteModels((prev) => {
+      const next = { ...prev };
+      if (val.trim()) {
+        next[id] = val;
+      } else {
+        delete next[id];
+      }
+      return next;
+    });
+  };
+
   const save = async () => {
-    setMsg(null);
     try {
-      await setRoutesApi(routes, modelOverride.trim() || null, targetProtocol);
-      setMsg("Saved (takes effect immediately for the running proxy)");
+      const cleanedModels: Record<string, string> = {};
+      for (const id of routes) {
+        const m = routeModels[id]?.trim();
+        if (m) cleanedModels[id] = m;
+      }
+      await setRoutesApi(
+        routes,
+        modelOverride.trim() || null,
+        targetProtocol,
+        cleanedModels
+      );
+      setToast({
+        message: "Routes saved (takes effect immediately)",
+        kind: "success",
+      });
     } catch (e) {
-      setMsg(String(e));
+      setToast({ message: String(e), kind: "error" });
     }
   };
 
   const clear = async () => {
-    if (!window.confirm("Clear routes?")) return;
-    setMsg(null);
+    if (!window.confirm("Clear all routes?")) return;
     try {
       await clearRoutes();
       setRoutes([]);
+      setRouteModels({});
       setModelOverride("");
       setTargetProtocol("chat");
-      setMsg("Cleared");
+      setToast({ message: "Routes cleared", kind: "success" });
     } catch (e) {
-      setMsg(String(e));
+      setToast({ message: String(e), kind: "error" });
     }
   };
 
-  const candidates = all
-    .map((p) => p.id)
-    .filter((id) => !routes.includes(id));
+  const disabledIds = allIds.filter((id) => !routes.includes(id));
+  const orderedIds = [...routes, ...disabledIds];
 
   return (
     <div className="border rounded p-4 bg-white">
-      <h3 className="font-semibold mb-3">Routes</h3>
-      <div className="mb-3">
-        <div className="text-xs text-gray-500 mb-1">Primary → fallback order</div>
-        {routes.length === 0 ? (
-          <div className="text-sm text-gray-400">No routes set</div>
-        ) : (
-          <ol className="space-y-1">
-            {routes.map((id, i) => (
-              <li
-                key={id}
-                className="flex items-center justify-between bg-gray-50 px-2 py-1 rounded text-sm"
-              >
-                <span className="font-mono">
-                  {i === 0 ? "★ " : `${i + 1}. `}
-                  {id}
-                </span>
-                <span className="space-x-1">
-                  <button
-                    className="text-xs px-1.5 border rounded"
-                    onClick={() => move(i, -1)}
-                    disabled={i === 0}
-                  >
-                    ↑
-                  </button>
-                  <button
-                    className="text-xs px-1.5 border rounded"
-                    onClick={() => move(i, 1)}
-                    disabled={i === routes.length - 1}
-                  >
-                    ↓
-                  </button>
-                  <button
-                    className="text-xs px-1.5 border rounded text-red-600"
-                    onClick={() => removeRoute(id)}
-                  >
-                    ✕
-                  </button>
-                </span>
-              </li>
-            ))}
-          </ol>
-        )}
-      </div>
-
-      <div className="mb-3">
-        <div className="text-xs text-gray-500 mb-1">Add provider</div>
-        {candidates.length === 0 ? (
-          <span className="text-sm text-gray-400">No available providers</span>
-        ) : (
-          <select
-            className="border rounded px-2 py-1 text-sm"
-            defaultValue=""
-            onChange={(e) => {
-              if (e.target.value) addRoute(e.target.value);
-              e.target.value = "";
-            }}
-          >
-            <option value="">Select provider…</option>
-            {candidates.map((id) => (
-              <option key={id} value={id}>
-                {id}
-              </option>
-            ))}
-          </select>
-        )}
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 mb-3">
+      <div className="flex items-center justify-between mb-3">
         <div>
-          <label className="block text-xs text-gray-500 mb-1">model_override</label>
+          <h3 className="font-semibold">Proxy Routes</h3>
+          <p className="text-xs text-gray-400">
+            Enable providers, set failover priority, and optionally bind a per-route upstream model.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            className="px-3 py-1.5 text-sm rounded bg-gray-900 text-white"
+            onClick={save}
+          >
+            Save
+          </button>
+          <button
+            className="px-3 py-1.5 text-sm rounded border text-red-600"
+            onClick={clear}
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">
+            Target protocol
+          </label>
+          <select
+            className="w-full border rounded px-2 py-1.5 text-sm"
+            value={targetProtocol}
+            onChange={(e) => setTargetProtocol(e.target.value)}
+          >
+            <option value="chat">chat (OpenAI)</option>
+            <option value="messages">messages (Anthropic)</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">
+            Global model override (optional)
+          </label>
           <input
-            className="w-full border rounded px-2 py-1 text-sm"
+            className="w-full border rounded px-2 py-1.5 text-sm font-mono"
             value={modelOverride}
             onChange={(e) => setModelOverride(e.target.value)}
-            placeholder="(passthrough)"
+            placeholder="(none)"
           />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">target_protocol</label>
-          <div className="flex gap-3 text-sm">
-            {["chat", "messages"].map((t) => (
-              <label key={t} className="flex items-center gap-1">
-                <input
-                  type="radio"
-                  checked={targetProtocol === t}
-                  onChange={() => setTargetProtocol(t)}
-                />
-                {t}
-              </label>
-            ))}
-          </div>
         </div>
       </div>
 
-      <div className="flex gap-2">
-        <button
-          className="px-3 py-1.5 text-sm rounded bg-gray-900 text-white"
-          onClick={save}
-        >
-          Save
-        </button>
-        <button
-          className="px-3 py-1.5 text-sm rounded border"
-          onClick={clear}
-        >
-          Clear
-        </button>
-      </div>
-      {msg && <div className="text-sm text-gray-600 mt-2">{msg}</div>}
+      {orderedIds.length === 0 ? (
+        <div className="text-sm text-gray-400">No configured providers</div>
+      ) : (
+        <table className="w-full text-sm">
+          <thead className="text-left text-gray-400 border-b">
+            <tr>
+              <th className="py-1.5 pr-2 w-8">On</th>
+              <th className="py-1.5 pr-2">Priority</th>
+              <th className="py-1.5 pr-2">Provider</th>
+              <th className="py-1.5 pr-2">Upstream model</th>
+              <th className="py-1.5 text-right">Order</th>
+            </tr>
+          </thead>
+          <tbody>
+            {orderedIds.map((id) => {
+              const idx = routes.indexOf(id);
+              const enabled = idx >= 0;
+              return (
+                <tr key={id} className="border-b last:border-0">
+                  <td className="py-1.5 pr-2">
+                    <input
+                      type="checkbox"
+                      checked={enabled}
+                      onChange={(e) => toggle(id, e.target.checked)}
+                    />
+                  </td>
+                  <td className="py-1.5 pr-2 text-xs">
+                    {!enabled ? (
+                      <span className="text-gray-400">—</span>
+                    ) : idx === 0 ? (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 font-medium">
+                        ★ Primary
+                      </span>
+                    ) : (
+                      <span className="text-gray-600">Fallback #{idx}</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 pr-2 font-mono">{id}</td>
+                  <td className="py-1.5 pr-2">
+                    <input
+                      className="w-full border rounded px-2 py-1 text-xs font-mono disabled:bg-gray-50 disabled:text-gray-400"
+                      value={routeModels[id] ?? ""}
+                      disabled={!enabled}
+                      onChange={(e) => setUpstreamModel(id, e.target.value)}
+                      placeholder="(default)"
+                    />
+                  </td>
+                  <td className="py-1.5 text-right space-x-1 whitespace-nowrap">
+                    <button
+                      className="text-xs px-1.5 py-0.5 border rounded disabled:opacity-30"
+                      disabled={!enabled || idx === 0}
+                      onClick={() => move(id, -1)}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      className="text-xs px-1.5 py-0.5 border rounded disabled:opacity-30"
+                      disabled={!enabled || idx === routes.length - 1}
+                      onClick={() => move(id, 1)}
+                    >
+                      ↓
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      {toast && (
+        <Toast
+          message={toast.message}
+          kind={toast.kind}
+          onClose={() => setToast(null)}
+        />
+      )}
     </div>
   );
 }
