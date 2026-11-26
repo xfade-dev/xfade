@@ -114,7 +114,7 @@ impl ProxyService {
                 }
             }
         }
-        let timeouts = robustness::TimeoutConfig::default();
+        let timeouts = robustness::TimeoutConfig::from_config(&core.config());
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect_timeout)
             .pool_max_idle_per_host(4)
@@ -3284,6 +3284,38 @@ mod tests {
         assert_eq!(
             recorded.accept_encoding, None,
             "client Accept-Encoding must be stripped before forwarding upstream"
+        );
+    }
+
+    #[test]
+    fn test_proxy_service_reads_ttft_timeout_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir, &[]);
+
+        // Default is 90s when unset in config.json
+        let svc_default = ProxyService::new(core.clone());
+        assert_eq!(
+            svc_default.timeouts.ttft_timeout,
+            std::time::Duration::from_secs(90)
+        );
+
+        // Persisting ttft_timeout_secs updates newly created ProxyService instances
+        core.set_ttft_timeout_secs(Some(180)).unwrap();
+        let svc_custom = ProxyService::new(core.clone());
+        assert_eq!(
+            svc_custom.timeouts.ttft_timeout,
+            std::time::Duration::from_secs(180)
+        );
+
+        // Zero is rejected
+        assert!(core.set_ttft_timeout_secs(Some(0)).is_err());
+
+        // Resetting to None restores default
+        core.set_ttft_timeout_secs(None).unwrap();
+        let svc_reset = ProxyService::new(core);
+        assert_eq!(
+            svc_reset.timeouts.ttft_timeout,
+            std::time::Duration::from_secs(90)
         );
     }
 }

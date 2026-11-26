@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use crate::models::ProviderProtocol;
 
+/// Default TTFT (Time To First Token) timeout in seconds.
+/// Raised from 30s to 90s so large-context prefill requests (e.g. 30k+ tokens)
+/// do not falsely trip `ttft_timeout` during upstream latency spikes.
+pub const DEFAULT_TTFT_TIMEOUT_SECS: u64 = 90;
+
 /// Tiered timeout configuration for the proxy forwarding pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutConfig {
@@ -23,10 +28,22 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
-            ttft_timeout: Duration::from_secs(30),
+            ttft_timeout: Duration::from_secs(DEFAULT_TTFT_TIMEOUT_SECS),
             idle_timeout: Duration::from_secs(15),
             total_non_stream_timeout: Duration::from_secs(120),
         }
+    }
+}
+
+impl TimeoutConfig {
+    /// Build a `TimeoutConfig` from persisted global `Config`, falling back to
+    /// [`TimeoutConfig::default`] for any unset fields.
+    pub fn from_config(cfg: &crate::store::config::Config) -> Self {
+        let mut out = Self::default();
+        if let Some(secs) = cfg.ttft_timeout_secs {
+            out.ttft_timeout = Duration::from_secs(secs.max(1));
+        }
+        out
     }
 }
 
@@ -314,8 +331,34 @@ mod tests {
     fn test_timeout_config_defaults() {
         let cfg = TimeoutConfig::default();
         assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
-        assert_eq!(cfg.ttft_timeout, Duration::from_secs(30));
+        assert_eq!(
+            cfg.ttft_timeout,
+            Duration::from_secs(DEFAULT_TTFT_TIMEOUT_SECS)
+        );
+        assert_eq!(cfg.ttft_timeout, Duration::from_secs(90));
         assert_eq!(cfg.idle_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_timeout_config_from_config() {
+        let mut c = crate::store::config::Config::default();
+        assert_eq!(
+            TimeoutConfig::from_config(&c).ttft_timeout,
+            Duration::from_secs(90)
+        );
+
+        c.ttft_timeout_secs = Some(150);
+        assert_eq!(
+            TimeoutConfig::from_config(&c).ttft_timeout,
+            Duration::from_secs(150)
+        );
+
+        // Zero is clamped to at least 1s
+        c.ttft_timeout_secs = Some(0);
+        assert_eq!(
+            TimeoutConfig::from_config(&c).ttft_timeout,
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

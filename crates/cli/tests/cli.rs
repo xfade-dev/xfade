@@ -470,6 +470,50 @@ fn config_set_unknown_key_errors() {
 }
 
 #[test]
+fn config_view_and_set_ttft_timeout_secs() {
+    let home = tempfile::tempdir().unwrap();
+
+    // default is shown when unset
+    xfade(home.path())
+        .args(["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ttft_timeout_secs: 90 (default)"));
+
+    // set custom timeout
+    xfade(home.path())
+        .args(["config", "set", "ttft_timeout_secs", "150"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ttft_timeout_secs: 150"));
+
+    // zero or non-numeric is rejected
+    xfade(home.path())
+        .args(["config", "set", "ttft_timeout_secs", "0"])
+        .assert()
+        .failure();
+    xfade(home.path())
+        .args(["config", "set", "ttft_timeout_secs", "abc"])
+        .assert()
+        .failure();
+
+    // reset to default
+    xfade(home.path())
+        .args(["config", "set", "ttft_timeout_secs", "default"])
+        .assert()
+        .success();
+    xfade(home.path())
+        .args(["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ttft_timeout_secs: 90 (default)"));
+}
+
+#[test]
 fn add_uses_global_defaults() {
     let home = tempfile::tempdir().unwrap();
 

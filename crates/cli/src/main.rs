@@ -233,6 +233,9 @@ enum Cmd {
         /// Read the auth token from a file (keeps it out of the process list)
         #[arg(long, conflicts_with = "auth_token")]
         auth_token_file: Option<PathBuf>,
+        /// Override TTFT (Time To First Token) timeout in seconds (defaults to config.json or 90s)
+        #[arg(long)]
+        ttft_timeout: Option<u64>,
         #[command(subcommand)]
         cmd: Option<ServeCmd>,
     },
@@ -810,6 +813,13 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 let cfg = Config::load(&dir);
                 println!("secrets: {}", cfg.secrets);
                 println!("keychain_allow_all: {}", cfg.keychain_allow_all);
+                match cfg.ttft_timeout_secs {
+                    Some(s) => println!("ttft_timeout_secs: {s}"),
+                    None => println!(
+                        "ttft_timeout_secs: {} (default)",
+                        xfade_core::proxy::robustness::DEFAULT_TTFT_TIMEOUT_SECS
+                    ),
+                }
                 println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
                 println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
                 println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
@@ -846,10 +856,25 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                             })?;
                         core.set_keychain_allow_all(allow_all)?;
                     }
+                    "ttft_timeout_secs" => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                            core.set_ttft_timeout_secs(None)?;
+                        } else {
+                            let secs =
+                                trimmed.parse::<u64>().map_err(|_| CoreError::ConfigParse {
+                                    path: "ttft_timeout_secs".into(),
+                                    msg: format!(
+                                        "invalid seconds '{value}' (expected integer >= 1 or 'default')"
+                                    ),
+                                })?;
+                            core.set_ttft_timeout_secs(Some(secs))?;
+                        }
+                    }
                     other => {
                         return Err(CoreError::ConfigParse {
                             path: other.to_string(),
-                            msg: "unknown config key (expected: secrets|keychain_allow_all|base_url|model|api|api_key)".into(),
+                            msg: "unknown config key (expected: secrets|keychain_allow_all|ttft_timeout_secs|base_url|model|api|api_key)".into(),
                         });
                     }
                 }
@@ -936,9 +961,16 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             host,
             auth_token,
             auth_token_file,
+            ttft_timeout,
             cmd,
         } => match cmd {
             None => {
+                if ttft_timeout == Some(0) {
+                    return Err(CoreError::ConfigParse {
+                        path: "ttft_timeout".into(),
+                        msg: "must be >= 1 second".into(),
+                    });
+                }
                 let auth_token = match auth_token_file {
                     Some(p) => {
                         let t = std::fs::read_to_string(&p).map_err(|e| {
@@ -966,11 +998,13 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| CoreError::Proxy(format!("create tokio runtime: {e}")))?;
                 rt.block_on(async {
-                    ProxyService::new(core)
+                    let mut svc = ProxyService::new(core)
                         .with_host_port(&host, port)
-                        .with_auth_token(auth_token)
-                        .serve()
-                        .await
+                        .with_auth_token(auth_token);
+                    if let Some(secs) = ttft_timeout {
+                        svc.timeouts.ttft_timeout = std::time::Duration::from_secs(secs);
+                    }
+                    svc.serve().await
                 })
             }
             Some(ServeCmd::Install {

@@ -2,6 +2,12 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.1 — 2026-11-26
+
+### Configurable Proxy TTFT Timeout
+- **fix(proxy,robustness)**: Raise default `TimeoutConfig.ttft_timeout` from `30s` to `90s` (`DEFAULT_TTFT_TIMEOUT_SECS`) so large-context prefill requests do not falsely trip `ttft_timeout` (502) and trigger circuit-breaker cooldowns during upstream latency spikes.
+- **feat(config,cli)**: Add `ttft_timeout_secs` to global `Config` (`config.json`), `Core::set_ttft_timeout_secs`, `TimeoutConfig::from_config`, `xfade config set ttft_timeout_secs <secs|default>`, and `xfade serve --ttft-timeout <secs>`.
+
 ## v0.14.0 — 2026-11-25
 
 ### GUI TUI Parity & Hardening

@@ -69,6 +69,10 @@ pub struct Config {
     /// re-trigger authorization prompts. Defaults to `true`.
     #[serde(default = "default_true")]
     pub keychain_allow_all: bool,
+    /// TTFT (Time To First Token) timeout in seconds for proxy requests.
+    /// Defaults to `90` when unset (`None`).
+    #[serde(default)]
+    pub ttft_timeout_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -79,6 +83,7 @@ impl Default for Config {
             model: None,
             api: None,
             keychain_allow_all: true,
+            ttft_timeout_secs: None,
         }
     }
 }
@@ -112,6 +117,7 @@ mod tests {
         let c = Config::load(dir.path());
         assert_eq!(c.secrets, SecretsBackend::Keyring);
         assert!(c.keychain_allow_all);
+        assert_eq!(c.ttft_timeout_secs, None);
     }
 
     #[test]
@@ -123,6 +129,7 @@ mod tests {
             model: Some("glm-5".into()),
             api: Some("anthropic-messages".into()),
             keychain_allow_all: false,
+            ttft_timeout_secs: Some(120),
         };
         c.save(dir.path()).unwrap();
         let loaded = Config::load(dir.path());
@@ -131,6 +138,7 @@ mod tests {
         assert_eq!(loaded.model.as_deref(), Some("glm-5"));
         assert_eq!(loaded.api.as_deref(), Some("anthropic-messages"));
         assert!(!loaded.keychain_allow_all);
+        assert_eq!(loaded.ttft_timeout_secs, Some(120));
     }
 
     #[test]
