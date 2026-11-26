@@ -7,7 +7,7 @@ export type ToolKind =
   | "aider"
   | "cline"
   | "hermes"
-  | "openclaw";
+  | "open-claw";
 
 export type ProviderProtocol = "chat" | "messages" | "responses";
 

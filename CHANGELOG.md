@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.5 — 2026-11-26
+
+### macOS GUI Ad-Hoc Signing & UX Fixes
+- **fix(gui,release)**: Configure `bundle.macOS.signingIdentity: "-"` in `tauri.conf.json` so `.app`/`.dmg` bundles are ad-hoc signed (avoiding Gatekeeper "damaged" errors on Apple Silicon), and add `codesign --verify --deep --strict` verification to the `gui` job in `release.yml`.
+- **fix(gui)**: Fix `OpenClaw` tool key (`"openclaw"` → `"open-claw"`) in `types.ts` and `ProvidersPage.tsx` to match `ToolKind` kebab-case serde serialization.
+- **feat(gui)**: Replace HTML5 `<datalist>` in `ProviderForm.tsx` with a real `<select>` dropdown for probed `/v1/models` results so model selection works reliably in macOS WKWebView.
+
 ## v0.14.4 — 2026-11-26
 
 ### GUI Release Build Fix

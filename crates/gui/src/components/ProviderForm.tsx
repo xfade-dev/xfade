@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useState } from "react";
 import type { PresetDto, Provider, ProviderProtocol, ToolKind } from "../types";
 import { listPresets, probeModelsAdhoc, probeProviderModels } from "../api";
 
@@ -53,7 +53,6 @@ export default function ProviderForm({
   const [probing, setProbing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const datalistId = useId();
 
   useEffect(() => {
     listPresets(tool).then(setPresets).catch(() => {});
@@ -243,18 +242,12 @@ export default function ProviderForm({
             </label>
             <div className="flex gap-2">
               <input
-                list={datalistId}
                 className="flex-1 border rounded px-2 py-1.5 text-sm font-mono"
                 value={model}
                 disabled={official}
                 onChange={(e) => setModel(e.target.value)}
                 placeholder="blank = global default"
               />
-              <datalist id={datalistId}>
-                {probedModels.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
               <button
                 type="button"
                 disabled={official || probing || (!editing && !baseUrl.trim())}
@@ -265,9 +258,23 @@ export default function ProviderForm({
               </button>
             </div>
             {probedModels.length > 0 && (
-              <div className="text-[11px] text-gray-400 mt-1">
-                {probedModels.length} probed models available in dropdown
-              </div>
+              <select
+                className="w-full border rounded px-2 py-1.5 text-sm font-mono bg-white mt-1.5"
+                disabled={official}
+                value={probedModels.includes(model) ? model : ""}
+                onChange={(e) => {
+                  if (e.target.value) setModel(e.target.value);
+                }}
+              >
+                <option value="">
+                  Select probed model ({probedModels.length} available)…
+                </option>
+                {probedModels.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
             )}
           </div>
 

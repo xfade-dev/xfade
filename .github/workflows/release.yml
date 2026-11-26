@@ -91,6 +91,10 @@ jobs:
       - name: tauri build
         working-directory: crates/gui
         run: npx tauri build
+      - name: verify macOS signature
+        shell: bash
+        run: |
+          codesign --verify --deep --strict target/release/bundle/macos/*.app
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gui-dmg
