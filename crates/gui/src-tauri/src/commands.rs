@@ -10,7 +10,7 @@ use xfade_core::models::{Provider, ProviderProtocol, ToolKind};
 use xfade_core::presets::presets_for;
 use xfade_core::security::doctor::SecurityDoctorReport;
 use xfade_core::service::{probe_latency, probe_models_http, probe_target};
-use xfade_core::store::db::{StatsGroupBy, StatsRow};
+use xfade_core::store::db::{RequestLog, StatsGroupBy, StatsRow};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -88,7 +88,7 @@ pub async fn update_provider(
     input: UpdateProviderInput,
 ) -> CmdResult<()> {
     let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), xfade_core::CoreError> {
         let mut p = core
             .list(Some(input.tool))?
             .into_iter()

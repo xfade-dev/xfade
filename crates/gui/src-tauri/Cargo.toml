@@ -13,7 +13,7 @@ name = "xfade_gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3", features = [] }
+tauri-build = { version = "2.7.6", features = [] }
 
 [dependencies]
 xfade-core = { path = "../../core" }

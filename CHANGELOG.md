@@ -2,6 +2,12 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.4 — 2026-11-26
+
+### GUI Release Build Fix
+- **fix(gui,build)**: Upgrade `tauri-build` from `2.6.3` to `2.7.6` so `OUT_DIR` target-directory detection handles Cargo's `build/<pkg>/<hash>/out` layout without panicking on macOS `copy_binaries`.
+- **fix(gui)**: Import `RequestLog` in `commands.rs` (`recent_logs`) and annotate the `update_provider` `spawn_blocking` closure return type (`Result<(), CoreError>`).
+
 ## v0.14.3 — 2026-11-26
 
 ### TUI Shortcuts, Visual Polish & Form Parity
