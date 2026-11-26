@@ -87,6 +87,7 @@ pub fn cycle_model_candidate(
 pub enum EditField {
     BaseUrl,
     Model,
+    Protocol,
     ApiKey,
 }
 
@@ -96,6 +97,7 @@ pub struct EditState {
     pub field: EditField,
     pub base_url: String,
     pub model: String,
+    pub protocol: String,
     pub api_key: String,
     pub available_models: Vec<String>,
 }
@@ -133,6 +135,7 @@ pub enum ConfigField {
     BaseUrl,
     Model,
     Api,
+    TtftTimeout,
     ApiKey,
 }
 
@@ -146,6 +149,7 @@ pub struct ConfigState {
     pub base_url: String,
     pub model: String,
     pub api: String,
+    pub ttft_timeout_secs: String,
     pub api_key: String,
     pub api_key_is_set: bool,
 }
@@ -203,6 +207,8 @@ pub struct App {
     pub model_map: Option<ModelMapState>,
     pub routes_edit: Option<RoutesState>,
     pub delete_confirm: Option<String>,
+    /// Whether the `?` keyboard shortcuts overlay is open.
+    pub show_help: bool,
     /// provider id -> outcome of the latest `t` probe.
     pub probes: HashMap<String, ProbeResult>,
     /// Animated knob position; eased toward [`fader_target`] on every tick.
@@ -244,6 +250,7 @@ impl App {
             model_map: None,
             routes_edit: None,
             delete_confirm: None,
+            show_help: false,
             probes: HashMap::new(),
             fader_pos: 0.5,
             probing: HashSet::new(),
@@ -300,12 +307,21 @@ impl App {
         }
     }
 
-    pub fn next_tool(&mut self, core: &Core) {
-        let idx = ToolKind::ALL
-            .iter()
-            .position(|t| *t == self.tool)
-            .unwrap_or(0);
-        self.tool = ToolKind::ALL[(idx + 1) % ToolKind::ALL.len()];
+    pub fn first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn last(&mut self) {
+        if !self.providers.is_empty() {
+            self.selected = self.providers.len() - 1;
+        }
+    }
+
+    fn switch_tool_to(&mut self, core: &Core, target: ToolKind) {
+        if self.tool == target {
+            return;
+        }
+        self.tool = target;
         // Drop state tied to the previous tool so `reload` doesn't try to carry
         // the old selection forward (ids can collide across tools), and probes
         // don't bleed into the new tool's providers.
@@ -319,21 +335,27 @@ impl App {
         self.reload(core);
     }
 
+    pub fn select_tool(&mut self, core: &Core, idx: usize) {
+        if let Some(&target) = ToolKind::ALL.get(idx) {
+            self.switch_tool_to(core, target);
+        }
+    }
+
+    pub fn next_tool(&mut self, core: &Core) {
+        let idx = ToolKind::ALL
+            .iter()
+            .position(|t| *t == self.tool)
+            .unwrap_or(0);
+        self.switch_tool_to(core, ToolKind::ALL[(idx + 1) % ToolKind::ALL.len()]);
+    }
+
     pub fn prev_tool(&mut self, core: &Core) {
         let idx = ToolKind::ALL
             .iter()
             .position(|t| *t == self.tool)
             .unwrap_or(0);
         let n = ToolKind::ALL.len();
-        self.tool = ToolKind::ALL[(idx + n - 1) % n];
-        self.providers.clear();
-        self.probes.clear();
-        self.probing.clear();
-        self.model_probes.clear();
-        self.model_probing.clear();
-        self.message = None;
-        self.selected = 0;
-        self.reload(core);
+        self.switch_tool_to(core, ToolKind::ALL[(idx + n - 1) % n]);
     }
 
     pub fn selected_provider(&self) -> Option<&Provider> {
@@ -469,6 +491,7 @@ impl App {
             field: EditField::BaseUrl,
             base_url: p.base_url.clone().unwrap_or_default(),
             model: p.extra["model"].as_str().unwrap_or("").to_string(),
+            protocol: p.protocol.to_string(),
             api_key: String::new(),
             available_models,
         });
@@ -512,6 +535,10 @@ impl App {
             base_url: config.base_url.unwrap_or_default(),
             model: config.model.unwrap_or_default(),
             api: config.api.unwrap_or_else(|| DEFAULT_API.to_string()),
+            ttft_timeout_secs: config
+                .ttft_timeout_secs
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
             api_key: String::new(),
             api_key_is_set,
         });
@@ -776,7 +803,13 @@ impl App {
 
     pub fn edit_char(&mut self, c: char) {
         if let Some(e) = self.edit.as_mut() {
-            focused_field_mut(e).push(c);
+            match e.field {
+                EditField::Protocol if c == ' ' => {
+                    e.protocol = cycle_choice(&PROTOCOL_CHOICES[1..], &e.protocol, true)
+                }
+                EditField::Protocol => {}
+                _ => focused_field_mut(e).push(c),
+            }
         } else if let Some(a) = self.add.as_mut() {
             match a.field {
                 AddField::Id => a.id.push(c),
@@ -801,6 +834,8 @@ impl App {
                 ConfigField::Secrets | ConfigField::Api => {}
                 ConfigField::BaseUrl => config.base_url.push(c),
                 ConfigField::Model => config.model.push(c),
+                ConfigField::TtftTimeout if c.is_ascii_digit() => config.ttft_timeout_secs.push(c),
+                ConfigField::TtftTimeout => {}
                 ConfigField::ApiKey => config.api_key.push(c),
             }
         } else if let Some(mm) = self.model_map.as_mut() {
@@ -826,10 +861,18 @@ impl App {
     /// same going forward on choice fields.
     pub fn edit_cycle(&mut self, forward: bool) {
         if let Some(e) = self.edit.as_mut() {
-            if e.field == EditField::Model {
-                if let Some(next) = cycle_model_candidate(&e.available_models, &e.model, forward) {
-                    e.model = next;
+            match e.field {
+                EditField::Model => {
+                    if let Some(next) =
+                        cycle_model_candidate(&e.available_models, &e.model, forward)
+                    {
+                        e.model = next;
+                    }
                 }
+                EditField::Protocol => {
+                    e.protocol = cycle_choice(&PROTOCOL_CHOICES[1..], &e.protocol, forward);
+                }
+                _ => {}
             }
         } else if let Some(a) = self.add.as_mut() {
             match a.field {
@@ -897,7 +940,11 @@ impl App {
 
     pub fn edit_backspace(&mut self) {
         if let Some(e) = self.edit.as_mut() {
-            focused_field_mut(e).pop();
+            if e.field == EditField::Protocol {
+                e.protocol = "chat".to_string();
+            } else {
+                focused_field_mut(e).pop();
+            }
         } else if let Some(a) = self.add.as_mut() {
             match a.field {
                 AddField::Id => {
@@ -927,6 +974,9 @@ impl App {
                     config.model.pop();
                 }
                 ConfigField::Api => config.api = DEFAULT_API.to_string(),
+                ConfigField::TtftTimeout => {
+                    config.ttft_timeout_secs.pop();
+                }
                 ConfigField::ApiKey => {
                     config.api_key.pop();
                 }
@@ -957,7 +1007,8 @@ impl App {
         if let Some(e) = self.edit.as_mut() {
             e.field = match e.field {
                 EditField::BaseUrl => EditField::Model,
-                EditField::Model => EditField::ApiKey,
+                EditField::Model => EditField::Protocol,
+                EditField::Protocol => EditField::ApiKey,
                 EditField::ApiKey => EditField::BaseUrl,
             };
         } else if let Some(a) = self.add.as_mut() {
@@ -974,7 +1025,8 @@ impl App {
                 ConfigField::Secrets => ConfigField::BaseUrl,
                 ConfigField::BaseUrl => ConfigField::Model,
                 ConfigField::Model => ConfigField::Api,
-                ConfigField::Api => ConfigField::ApiKey,
+                ConfigField::Api => ConfigField::TtftTimeout,
+                ConfigField::TtftTimeout => ConfigField::ApiKey,
                 ConfigField::ApiKey => ConfigField::Secrets,
             };
         } else if let Some(mm) = self.model_map.as_mut() {
@@ -993,7 +1045,8 @@ impl App {
             e.field = match e.field {
                 EditField::BaseUrl => EditField::ApiKey,
                 EditField::Model => EditField::BaseUrl,
-                EditField::ApiKey => EditField::Model,
+                EditField::Protocol => EditField::Model,
+                EditField::ApiKey => EditField::Protocol,
             };
         } else if let Some(a) = self.add.as_mut() {
             a.field = match a.field {
@@ -1010,7 +1063,8 @@ impl App {
                 ConfigField::BaseUrl => ConfigField::Secrets,
                 ConfigField::Model => ConfigField::BaseUrl,
                 ConfigField::Api => ConfigField::Model,
-                ConfigField::ApiKey => ConfigField::Api,
+                ConfigField::TtftTimeout => ConfigField::Api,
+                ConfigField::ApiKey => ConfigField::TtftTimeout,
             };
         } else if let Some(mm) = self.model_map.as_mut() {
             if let Some(ed) = mm.editing.as_mut() {
@@ -1217,6 +1271,18 @@ impl App {
             self.config_edit = Some(config);
             return;
         }
+        let ttft_secs = match config.ttft_timeout_secs.trim() {
+            "" => None,
+            s => match s.parse::<u64>() {
+                Ok(v) if v >= 1 => Some(v),
+                _ => {
+                    self.message =
+                        Some("Error: TTFT timeout must be >= 1 second (or blank for 90s)".into());
+                    self.config_edit = Some(config);
+                    return;
+                }
+            },
+        };
         let result = core.update_config(
             Some(config.secrets.trim()),
             Some(config.base_url.trim()),
@@ -1224,6 +1290,11 @@ impl App {
             Some(config.api.trim()),
         );
         if let Err(error) = result {
+            self.message = Some(format!("Error: {error}"));
+            self.config_edit = Some(config);
+            return;
+        }
+        if let Err(error) = core.set_ttft_timeout_secs(ttft_secs) {
             self.message = Some(format!("Error: {error}"));
             self.config_edit = Some(config);
             return;
@@ -1308,6 +1379,9 @@ impl App {
             }
         }
         provider.extra = serde_json::Value::Object(map);
+        if let Ok(proto) = e.protocol.trim().parse::<ProviderProtocol>() {
+            provider.protocol = proto;
+        }
         // Blank api key = keep the stored secret (pass None to update_provider).
         let api_key = match e.api_key.trim() {
             "" => None,
@@ -1335,6 +1409,7 @@ fn focused_field_mut(e: &mut EditState) -> &mut String {
     match e.field {
         EditField::BaseUrl => &mut e.base_url,
         EditField::Model => &mut e.model,
+        EditField::Protocol => &mut e.protocol,
         EditField::ApiKey => &mut e.api_key,
     }
 }
@@ -1732,6 +1807,8 @@ mod tests {
         app.edit_next_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::Model);
         app.edit_next_field();
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::Protocol);
+        app.edit_next_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::ApiKey);
         app.edit_next_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::BaseUrl);
@@ -1748,9 +1825,41 @@ mod tests {
         app.edit_prev_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::ApiKey);
         app.edit_prev_field();
+        assert_eq!(app.edit.as_ref().unwrap().field, EditField::Protocol);
+        app.edit_prev_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::Model);
         app.edit_prev_field();
         assert_eq!(app.edit.as_ref().unwrap().field, EditField::BaseUrl);
+    }
+
+    #[test]
+    fn edit_protocol_saves_and_select_tool_jumps() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        add(&core, ToolKind::ClaudeCode, "a", Some("http://x"));
+        add(&core, ToolKind::ClaudeCode, "b", Some("http://y"));
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+
+        app.last();
+        assert_eq!(app.selected, 1);
+        app.first();
+        assert_eq!(app.selected, 0);
+
+        app.start_edit();
+        app.edit_next_field(); // -> Model
+        app.edit_next_field(); // -> Protocol
+        app.edit_cycle(true); // chat -> messages
+        app.submit_edit(&core);
+        let p = core
+            .list(Some(ToolKind::ClaudeCode))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == "a")
+            .unwrap();
+        assert_eq!(p.protocol, ProviderProtocol::Messages);
+
+        app.select_tool(&core, 1);
+        assert_eq!(app.tool, ToolKind::ALL[1]);
     }
 
     #[test]

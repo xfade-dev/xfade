@@ -246,6 +246,18 @@ fn event_loop(
             break;
         }
 
+        if app.show_help {
+            match key.code {
+                KeyCode::Char('?')
+                | KeyCode::Esc
+                | KeyCode::Char('q')
+                | KeyCode::Enter
+                | KeyCode::Char(' ') => app.show_help = false,
+                _ => {}
+            }
+            continue;
+        }
+
         if app.delete_confirm.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete(core, true),
@@ -337,15 +349,27 @@ fn event_loop(
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
+            KeyCode::Char('?') => app.show_help = true,
             KeyCode::Char('j') | KeyCode::Down => app.next(),
             KeyCode::Char('k') | KeyCode::Up => app.prev(),
-            KeyCode::Tab => {
+            KeyCode::Home => app.first(),
+            KeyCode::End | KeyCode::Char('G') => app.last(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 app.next_tool(core);
                 stats = load_stats(core, &app.tool);
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 app.prev_tool(core);
                 stats = load_stats(core, &app.tool);
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                app.select_tool(core, (c as u8 - b'1') as usize);
+                stats = load_stats(core, &app.tool);
+            }
+            KeyCode::Char('R') => {
+                app.reload(core);
+                stats = load_stats(core, &app.tool);
+                app.message = Some("Refreshed".into());
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 app.switch_selected(core);

@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use std::sync::OnceLock;
@@ -78,6 +78,10 @@ pub fn draw(f: &mut Frame, app: &App, stats: &[StatsRow]) {
     }
 
     draw_footer(f, app, chunks[2]);
+
+    if app.show_help {
+        draw_help_overlay(f, area);
+    }
 }
 
 /// Degraded layout below [`MIN_WIDTH`]×[`MIN_HEIGHT`]: name the requirement
@@ -400,16 +404,39 @@ fn latency_badge(result: &ProbeResult) -> (String, Color) {
 }
 
 fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
+    let list_focused = !app.is_input_mode() && !app.show_help;
+    let border_color = if list_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(format!(" Providers ({}) ", app.tool.as_str()));
+
     if app.providers.is_empty() {
-        let msg = format!(
-            "No providers configured for {}.\n\nPress [a] to add a provider.",
-            app.tool.as_str()
-        );
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Providers ({}) ", app.tool.as_str()));
-        let p = Paragraph::new(msg)
-            .block(block)
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!(
+                "No providers configured for {}.",
+                app.tool.as_str()
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Press "),
+                Span::styled(
+                    "[a]",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" to add a provider."),
+            ]),
+        ];
+        let p = Paragraph::new(lines)
+            .block(list_block)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
         f.render_widget(p, area);
@@ -424,10 +451,21 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
             let mark = if p.is_active { "*" } else { " " };
             let base = p.base_url.as_deref().unwrap_or("(official)");
             let mut spans = if area.width >= 55 {
-                vec![Span::raw(format!("{mark} {:<14} {:<20} ", p.id, base))]
+                vec![Span::raw(format!("{mark} {:<12} {:<18} ", p.id, base))]
             } else {
                 vec![Span::raw(format!("{mark} {:<13} ", p.id))]
             };
+            if area.width >= 48 {
+                let (proto_tag, proto_color) = match p.protocol {
+                    xfade_core::ProviderProtocol::Messages => ("[msg] ", Color::Magenta),
+                    xfade_core::ProviderProtocol::Responses => ("[resp]", Color::Blue),
+                    xfade_core::ProviderProtocol::Chat => ("[chat]", Color::DarkGray),
+                };
+                spans.push(Span::styled(
+                    format!("{proto_tag} "),
+                    Style::default().fg(proto_color),
+                ));
+            }
             if app.probing.contains(p.id.as_str()) {
                 spans.push(Span::styled(
                     app.spinner_glyph().to_string(),
@@ -445,7 +483,7 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
                     Color::Red
                 };
                 spans.push(Span::styled(
-                    format!("   {ok:.0}% ok"),
+                    format!("  {ok:.0}% ok"),
                     Style::default().fg(color),
                 ));
             }
@@ -463,17 +501,15 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
             ListItem::new(line).style(style)
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Providers ({}) ", app.tool.as_str())),
-    );
+    let list = List::new(items).block(list_block);
     f.render_widget(list, area);
 }
 
 fn draw_provider_details(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
         .title(match app.selected_provider() {
             Some(p) => format!(" Provider Details: {} ", p.id),
             None => " Provider Details ".to_string(),
@@ -594,6 +630,8 @@ fn draw_provider_details(f: &mut Frame, app: &App, area: Rect) {
 fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
         .title(" Gateway & Traffic Health ");
 
     let Some(p) = app.selected_provider() else {
@@ -670,6 +708,31 @@ fn draw_gateway_metrics(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+
+        if row.cached_prompt_tokens > 0 || row.cache_write_tokens > 0 {
+            let total_in = row
+                .prompt_tokens
+                .saturating_add(row.cached_prompt_tokens)
+                .max(1);
+            let hit_pct = 100.0 * (row.cached_prompt_tokens.max(0) as f64 / total_in as f64);
+            lines.push(Line::from(vec![
+                Span::styled("  • Cache:      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "{} read ({hit_pct:.1}% hit)",
+                        format_tokens(row.cached_prompt_tokens.max(0) as u64)
+                    ),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!(
+                        " · {} write",
+                        format_tokens(row.cache_write_tokens.max(0) as u64)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
     } else {
         lines.push(Line::from(vec![
             Span::styled("  • Traffic:    ", Style::default().fg(Color::DarkGray)),
@@ -730,10 +793,16 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
             false,
         ),
         field_line("Model:", &e.model, e.field == EditField::Model, false),
+        choice_line(
+            "Protocol:",
+            &PROTOCOL_CHOICES[1..],
+            &e.protocol,
+            e.field == EditField::Protocol,
+        ),
         field_line("API Key:", &e.api_key, e.field == EditField::ApiKey, true),
         Line::from(""),
         Line::from(Span::styled(
-            "blank Base URL = official login   [Tab] next field   [Enter] save   [Esc] cancel",
+            "blank Base URL = official login   ←/→ or Space on Protocol   [Tab] next   [Enter] save   [Esc] cancel",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -748,6 +817,8 @@ fn draw_edit(f: &mut Frame, app: &App, area: Rect) {
     }
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
         .title(format!(" Edit provider: {} ", e.provider_id));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -840,7 +911,11 @@ fn render_form(f: &mut Frame, area: Rect, title: String, lines: Vec<Line<'static
         .map(|l| wrapped_rows(l, inner_width))
         .sum();
     let scroll = rows_through_focus.saturating_sub(inner_height) as u16;
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1035,6 +1110,17 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             config.field == ConfigField::Api,
         ),
         input_line(
+            "TTFT (s):",
+            if config.ttft_timeout_secs.is_empty() {
+                "90 (default)".to_string()
+            } else {
+                config.ttft_timeout_secs.clone()
+            },
+            config.field == ConfigField::TtftTimeout,
+            false,
+            config.ttft_timeout_secs.is_empty(),
+        ),
+        input_line(
             "API Key:",
             key_text,
             config.field == ConfigField::ApiKey,
@@ -1061,8 +1147,12 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             3,
             "←/→ or Space. Only Pi, Oh My Pi and OpenClaw use it. Pick anthropic-messages for /v1/messages gateways.",
         ),
-        ConfigField::ApiKey => (
+        ConfigField::TtftTimeout => (
             4,
+            "Proxy Time-To-First-Token timeout in seconds (blank = 90s default; restart daemon to apply).",
+        ),
+        ConfigField::ApiKey => (
+            5,
             "Copied into new providers that leave API Key blank. Not shown after saving.",
         ),
     };
@@ -1265,32 +1355,101 @@ fn draw_routes(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn keycap_line(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mode = gradient_mode();
+    let total_keys: usize = pairs.iter().map(|(k, _)| k.split('/').count()).sum();
+    let mut spans = Vec::with_capacity(pairs.len() * 4);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let mut key_idx = 0usize;
+
+    for (i, (key, desc)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        for (j, part) in key.split('/').enumerate() {
+            if j > 0 {
+                spans.push(Span::styled("/", dim_style));
+            }
+            let t = if total_keys <= 1 {
+                0.0
+            } else {
+                key_idx as f32 / (total_keys - 1) as f32
+            };
+            key_idx += 1;
+
+            let is_single_lower = part.len() == 1 && part.chars().all(|c| c.is_ascii_lowercase());
+            let mut style = Style::default()
+                .fg(gradient_color(mode, t, 1.0))
+                .add_modifier(Modifier::BOLD);
+            if is_single_lower {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            spans.push(Span::styled(part.to_string(), style));
+        }
+        if !desc.is_empty() {
+            spans.push(Span::styled(format!(" {desc}"), dim_style));
+        }
+    }
+    Line::from(spans)
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let hints = if app.delete_confirm.is_some() {
-        "confirm removal: [y] yes   [n/Esc] cancel"
+    let hint_line = if app.show_help {
+        keycap_line(&[("?/Esc/q", "close help")])
+    } else if app.delete_confirm.is_some() {
+        keycap_line(&[("y", "confirm remove"), ("n/Esc", "cancel")])
     } else if let Some(mm) = app.model_map.as_ref() {
         if mm.editing.is_some() {
-            "Tab next field  ←/→ choose  Enter save  Esc back"
+            keycap_line(&[
+                ("Tab", "field"),
+                ("←/→", "choose"),
+                ("Enter", "save"),
+                ("Esc", "back"),
+            ])
         } else {
-            "j/k move  a add  e edit  d del  Space merge  Esc close"
+            keycap_line(&[
+                ("j/k", "move"),
+                ("a", "add"),
+                ("e", "edit"),
+                ("d", "del"),
+                ("Space", "merge"),
+                ("Esc", "close"),
+            ])
         }
     } else if let Some(r) = app.routes_edit.as_ref() {
         if r.editing_model {
-            "←/→ pick probed model  type custom  Enter/Esc done"
+            keycap_line(&[("←/→", "probed"), ("type", "custom"), ("Enter/Esc", "done")])
         } else {
-            "j/k move  Space toggle  +/- order  e model  Enter save  Esc cancel"
+            keycap_line(&[
+                ("j/k", "move"),
+                ("Space", "toggle"),
+                ("+/-", "order"),
+                ("e", "model"),
+                ("Enter", "save"),
+                ("Esc", "cancel"),
+            ])
         }
-    } else if app.is_adding() || app.is_configuring() {
-        "Tab next field  ←/→ or Space choose  Enter save  Esc cancel"
-    } else if app.is_input_mode() {
-        "editing: [Tab/BackTab] field   [Enter] save   [Esc] cancel"
+    } else if app.is_adding() || app.is_configuring() || app.is_editing() {
+        keycap_line(&[
+            ("Tab", "next field"),
+            ("←/→ Space", "choose"),
+            ("Enter", "save"),
+            ("Esc", "cancel"),
+        ])
     } else {
-        "j/k  Enter use  a/e/d  g cfg  t net  p probe  m map  r routes  Tab  q quit"
+        keycap_line(&[
+            ("Enter", "use"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "del"),
+            ("t/p", "probe"),
+            ("m/r", "route"),
+            ("g", "cfg"),
+            ("?", "help"),
+            ("q", "quit"),
+        ])
     };
-    let mut lines = vec![Line::from(Span::styled(
-        hints,
-        Style::default().fg(Color::DarkGray),
-    ))];
+    let mut lines = vec![hint_line];
     if let Some(m) = &app.message {
         lines.push(Line::from(Span::styled(
             m.clone(),
@@ -1300,6 +1459,62 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let w = area.width.saturating_sub(6).min(68);
+    let h = area.height.saturating_sub(4).min(20);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    let sec = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<16}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(desc.to_string()),
+        ])
+    };
+
+    let lines = vec![
+        sec("Navigation"),
+        row("j/k, ↑/↓", "Move provider selection"),
+        row("Home / End, G", "Jump to first / last provider"),
+        row("1-9, ←/→, h/l", "Switch tool tab (or Tab / Shift+Tab)"),
+        Line::from(""),
+        sec("Providers & Gateway"),
+        row("Enter / Space", "Switch active provider for current tool"),
+        row("a / e / d", "Add / Edit (incl. protocol) / Delete provider"),
+        row("t / p", "Probe TCP latency / /v1/models catalog"),
+        row("r / m", "Edit failover routes / model alias map"),
+        row("g / R", "Global config (incl. TTFT) / Refresh"),
+        row("? / q / Esc", "Toggle this help / Quit"),
+    ];
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keyboard Shortcuts (?) ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// Compact token count: 1234 -> "1.2k", 2_500_000 -> "2.5M".
@@ -1730,7 +1945,8 @@ mod tests {
         core.add_provider(p, None).unwrap();
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.start_edit();
-        app.edit_next_field();
+        app.edit_next_field(); // -> Model
+        app.edit_next_field(); // -> Protocol
         app.edit_next_field(); // -> ApiKey
         for c in "secret".chars() {
             app.edit_char(c);
@@ -1814,7 +2030,7 @@ mod tests {
         let core = test_core(&dir);
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.start_config(&core);
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.edit_next_field(); // -> API Key, the last field
         }
         // Narrow + short: the Secrets/API option rows wrap here.
@@ -2070,5 +2286,58 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Proxy Routes (1 active)"));
         assert!(text.contains("[x] glm  ->  glm-4-plus"));
+    }
+
+    #[test]
+    fn help_overlay_renders_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.show_help = true;
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Keyboard Shortcuts (?)"));
+        assert!(text.contains("1-9, ←/→, h/l"));
+        assert!(text.contains("Global config (incl. TTFT)"));
+    }
+
+    #[test]
+    fn gateway_metrics_displays_cache_hit_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new(
+                "devops",
+                ToolKind::ClaudeCode,
+                Some("http://gw:3000".into()),
+            ),
+            Some("sk-test"),
+        )
+        .unwrap();
+        let app = App::new(ToolKind::ClaudeCode, &core);
+        let stats = vec![StatsRow {
+            group: "devops".into(),
+            requests: 2,
+            prompt_tokens: 2_000,
+            completion_tokens: 300,
+            cached_prompt_tokens: 8_000,
+            cache_write_tokens: 500,
+            cost_usd_micros: 12_000,
+            errors: 0,
+            avg_duration_ms: 450,
+        }];
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app, &stats)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("8.0k read (80.0% hit)"),
+            "cache read:\n{text}"
+        );
+        assert!(text.contains("500 write"), "cache write:\n{text}");
     }
 }

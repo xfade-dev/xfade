@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.3 — 2026-11-26
+
+### TUI Shortcuts, Visual Polish & Form Parity
+- **feat(tui)**: Add `1`–`9` direct tool-tab hotkeys, `h`/`l` (`←`/`→`) tab switching in list mode, `Home`/`End`/`G` jump navigation, `R` manual refresh, and `?` keyboard shortcuts help overlay.
+- **feat(tui,ui)**: Upgrade panel borders to `BorderType::Rounded` with active-pane `Cyan` focus highlighting, per-row protocol badges (`[msg]` / `[resp]` / `[chat]`), cache hit rate & read/write token metrics in `Gateway & Traffic Health`, and a Cyan → Magenta gradient footer with bold underlined single-letter hotkeys.
+- **feat(tui,forms)**: Add `Protocol` (`chat` / `messages` / `responses`) to the `Edit` provider form and `TTFT (s)` (`ttft_timeout_secs`) to the global `Config` form for full parity with CLI flags.
+
 ## v0.14.2 — 2026-11-26
 
 ### Protocol Management & Cache Observability
