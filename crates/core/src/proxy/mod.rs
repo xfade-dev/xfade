@@ -3318,4 +3318,73 @@ mod tests {
             std::time::Duration::from_secs(90)
         );
     }
+
+    #[tokio::test]
+    async fn test_anthropic_beta_forwarded_only_for_messages_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_msg = MockUpstream::spawn().await;
+        let up_chat = MockUpstream::spawn().await;
+
+        let core = test_core(&dir, &[("p_chat", &up_chat.url(), "k1")]);
+        let p_msg = crate::models::Provider::new(
+            "p_msg",
+            crate::models::ToolKind::ClaudeCode,
+            Some(up_msg.url()),
+        )
+        .with_protocol(crate::models::ProviderProtocol::Messages);
+        core.add_provider(p_msg, Some("k2")).unwrap();
+
+        let url = spawn_service(ProxyService::new(core.clone())).await;
+
+        // 1. Messages provider: anthropic-beta is forwarded and path is /v1/messages
+        core.db()
+            .set_routes(&["p_msg".into()], None, "chat")
+            .unwrap();
+        up_msg.respond_with(
+            200,
+            r#"{"id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-5-5","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2}}"#,
+        );
+        let resp = reqwest::Client::new()
+            .post(format!("{url}/v1/messages"))
+            .header("Authorization", "Bearer x")
+            .header("anthropic-beta", "context-1m-2025-08-07")
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"claude-sonnet-5-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rec_msg = up_msg.last_request().await;
+        assert_eq!(rec_msg.path, "/v1/messages");
+        assert_eq!(
+            rec_msg.anthropic_beta.as_deref(),
+            Some("context-1m-2025-08-07"),
+            "anthropic-beta must be forwarded to Anthropic messages upstream"
+        );
+
+        // 2. Chat provider: anthropic-beta is stripped and path is /v1/chat/completions
+        core.db()
+            .set_routes(&["p_chat".into()], None, "chat")
+            .unwrap();
+        up_chat.respond_with(
+            200,
+            r#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+        );
+        let resp2 = reqwest::Client::new()
+            .post(format!("{url}/v1/messages"))
+            .header("Authorization", "Bearer x")
+            .header("anthropic-beta", "context-1m-2025-08-07")
+            .header("Content-Type", "application/json")
+            .body(r#"{"model":"claude-sonnet-5-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), 200);
+        let rec_chat = up_chat.last_request().await;
+        assert_eq!(rec_chat.path, "/v1/chat/completions");
+        assert_eq!(
+            rec_chat.anthropic_beta, None,
+            "anthropic-beta must be stripped for non-Anthropic upstreams"
+        );
+    }
 }

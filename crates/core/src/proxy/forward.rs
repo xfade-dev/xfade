@@ -172,9 +172,12 @@ fn build_upstream_request(
         _ => client.post(&url),
     };
 
+    let is_anthropic_target = endpoint == "messages" || endpoint == "/v1/messages";
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        if !STRIP_HEADERS.contains(&name_str.as_str()) {
+        if !STRIP_HEADERS.contains(&name_str.as_str())
+            || (is_anthropic_target && name_str == "anthropic-beta")
+        {
             if let Ok(v) = value.to_str() {
                 req = req.header(name.as_str(), v);
             }
@@ -346,6 +349,8 @@ fn log_request_full(
         status,
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         duration_ms,
         error: error.clone(),
         session_id: session_id.map(|s| s.to_string()),
@@ -1190,6 +1195,8 @@ fn build_unavailable_503_response(
         status: StatusCode::SERVICE_UNAVAILABLE.as_u16() as i64,
         prompt_tokens: 0,
         completion_tokens: 0,
+        cached_prompt_tokens: 0,
+        cache_write_tokens: 0,
         duration_ms,
         error: Some(reason.to_string()),
         session_id: session_id.map(|s| s.to_string()),
@@ -2363,6 +2370,8 @@ impl TailLogStream {
             status: self.status.as_u16() as i64,
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             duration_ms,
             error,
             session_id: self.session_id.clone(),

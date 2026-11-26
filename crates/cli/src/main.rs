@@ -181,6 +181,9 @@ enum Cmd {
         tool: Option<ToolKind>,
         #[arg(long)]
         base_url: Option<String>,
+        /// Wire protocol the upstream speaks (`chat`, `messages`, or `responses`)
+        #[arg(long)]
+        protocol: Option<ProviderProtocol>,
         #[arg(long)]
         key: Option<String>,
         #[arg(long = "set", value_parser = parse_kv)]
@@ -344,7 +347,8 @@ enum ProxyCmd {
         /// disjoint model catalogs.
         #[arg(long = "route-model", value_parser = parse_kv)]
         route_models: Vec<(String, String)>,
-        /// Target protocol: chat (OpenAI-compatible) or messages (Anthropic native passthrough)
+        /// [Deprecated] Legacy fallback protocol for chat-protocol routes: chat or messages.
+        /// Provider protocol should be configured per provider via `xfade edit --protocol`.
         #[arg(long, value_parser = ["chat", "messages"], default_value = "chat")]
         target: String,
     },
@@ -886,6 +890,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             name,
             tool,
             base_url,
+            protocol,
             key,
             sets,
             opus_model,
@@ -901,6 +906,9 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 .ok_or_else(|| CoreError::ProviderNotFound(format!("{tool}/{name}")))?;
             if let Some(url) = base_url {
                 p.base_url = Some(url);
+            }
+            if let Some(proto) = protocol {
+                p.protocol = proto;
             }
             let mut map = p.extra.as_object().cloned().unwrap_or_default();
             for (k, v) in sets {
@@ -1212,15 +1220,29 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                 return Ok(());
             }
             println!(
-                "{:<24} {:>10} {:>10} {:>12} {:>8} {:>8}",
-                "group", "requests", "tokens", "cost (est)", "errors", "avg_ms"
+                "{:<24} {:>10} {:>10} {:>10} {:>11} {:>12} {:>8} {:>8}",
+                "group",
+                "requests",
+                "tokens",
+                "cache_read",
+                "cache_write",
+                "cost (est)",
+                "errors",
+                "avg_ms"
             );
             for r in &rows {
                 let tokens = r.prompt_tokens + r.completion_tokens;
                 let cost_str = xfade_core::proxy::pricing::format_cost(r.cost_usd_micros);
                 println!(
-                    "{:<24} {:>10} {:>10} {:>12} {:>8} {:>8}",
-                    r.group, r.requests, tokens, cost_str, r.errors, r.avg_duration_ms
+                    "{:<24} {:>10} {:>10} {:>10} {:>11} {:>12} {:>8} {:>8}",
+                    r.group,
+                    r.requests,
+                    tokens,
+                    r.cached_prompt_tokens,
+                    r.cache_write_tokens,
+                    cost_str,
+                    r.errors,
+                    r.avg_duration_ms
                 );
             }
             println!("* cost estimates based on official token pricing (estimated)");
@@ -2241,7 +2263,20 @@ fn cmd_status(core: &Core) -> Result<(), CoreError> {
                 Some(m) => println!("model: {m}"),
                 None => println!("model: (passthrough)"),
             }
-            println!("target: {target_protocol}");
+            let providers = core.list(None).unwrap_or_default();
+            let proto_list: Vec<String> = routes
+                .iter()
+                .map(|id| {
+                    let proto = providers
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.protocol.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{id}={proto}")
+                })
+                .collect();
+            println!("protocols: {}", proto_list.join(", "));
+            println!("target: {target_protocol} (legacy fallback for chat routes; prefer 'edit --protocol')");
         }
     }
     let smart = if core.db().smart_enabled()? {

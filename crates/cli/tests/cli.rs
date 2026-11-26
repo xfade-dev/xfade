@@ -190,11 +190,19 @@ fn edit_updates_base_url_and_extra() {
             "claude",
             "--base-url",
             "https://new",
+            "--protocol",
+            "messages",
             "--set",
             "model=k2",
         ])
         .assert()
         .success();
+    xfade(home.path())
+        .args(["ls", "--tool", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kimi"))
+        .stdout(predicate::str::contains("messages"));
     xfade(home.path())
         .args(["use", "kimi", "--tool", "claude", "--direct"])
         .assert()
@@ -202,6 +210,7 @@ fn edit_updates_base_url_and_extra() {
     let s = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
     assert!(s.contains("https://new"));
     assert!(s.contains("k2")); // ANTHROPIC_MODEL from extra.model
+    assert!(s.contains("sk-1")); // Original key preserved when --key is omitted
 }
 
 #[test]
@@ -944,6 +953,8 @@ fn stats_and_sessions_display_cost_estimation() {
         status: 200,
         prompt_tokens: 10_000,
         completion_tokens: 1_000,
+        cached_prompt_tokens: 0,
+        cache_write_tokens: 0,
         duration_ms: 120,
         error: None,
         session_id: Some("s-test-cost-1".into()),

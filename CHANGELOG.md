@@ -2,6 +2,14 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.2 — 2026-11-26
+
+### Protocol Management & Cache Observability
+- **feat(cli)**: Add `--protocol <chat|messages|responses>` to `xfade edit` so provider wire protocols can be updated in place without re-adding the provider or overwriting its API key.
+- **fix(cli,proxy)**: Clarify `xfade proxy status` by displaying per-route `protocols:` (`<id>=<protocol>`) and marking `xfade proxy use --target` as a deprecated legacy fallback for `chat`-protocol routes.
+- **feat(db,cli)**: Persist `cached_prompt_tokens` and `cache_write_tokens` in `request_logs` (with automatic `ALTER TABLE` migration) and display `cache_read` / `cache_write` columns in `xfade stats`.
+- **feat(proxy,forward)**: Forward client `anthropic-beta` headers when targeting Anthropic `/v1/messages` upstreams while continuing to strip them for non-Anthropic upstreams.
+
 ## v0.14.1 — 2026-11-26
 
 ### Configurable Proxy TTFT Timeout

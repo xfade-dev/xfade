@@ -1430,6 +1430,7 @@ mod tests {
             cost_usd_micros: 1000,
             errors: 0,
             avg_duration_ms: 10,
+            ..Default::default()
         }];
 
         let backend = TestBackend::new(100, 25);
@@ -1466,6 +1467,7 @@ mod tests {
             cost_usd_micros: 35_000, // $0.035
             errors: 0,
             avg_duration_ms: 220,
+            ..Default::default()
         }];
 
         let backend = TestBackend::new(100, 25);
@@ -1706,6 +1708,7 @@ mod tests {
             cost_usd_micros: 0,
             errors: 2,
             avg_duration_ms: 150,
+            ..Default::default()
         }];
 
         let backend = TestBackend::new(100, 20);

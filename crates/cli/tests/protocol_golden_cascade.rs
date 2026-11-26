@@ -331,4 +331,19 @@ fn test_cli_heterogeneous_protocol_management_and_status() {
         .stdout(predicate::str::contains(
             "routes: p-msg -> p-resp -> p-chat",
         ));
+
+    // 5. Switch p-chat protocol to messages via `xfade edit --protocol`
+    xfade(&[
+        "edit",
+        "p-chat",
+        "--tool",
+        "opencode",
+        "--protocol",
+        "messages",
+    ])
+    .success();
+    xfade(&["ls", "--tool", "opencode"])
+        .success()
+        .stdout(predicate::str::contains("p-chat"))
+        .stdout(predicate::str::contains("messages"));
 }

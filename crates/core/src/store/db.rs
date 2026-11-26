@@ -8,7 +8,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// A single request log row (all numeric fields are i64).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct RequestLog {
     pub ts: String,
     pub endpoint: String,
@@ -19,6 +19,8 @@ pub struct RequestLog {
     pub status: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_write_tokens: i64,
     pub duration_ms: i64,
     pub error: Option<String>,
     /// Session this request belongs to (see `crate::sessions`); NULL for
@@ -163,12 +165,14 @@ pub enum StatsGroupBy {
 }
 
 /// A single aggregated stats row.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct StatsRow {
     pub group: String,
     pub requests: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cached_prompt_tokens: i64,
+    pub cache_write_tokens: i64,
     pub cost_usd_micros: i64,
     pub errors: i64,
     pub avg_duration_ms: i64,
@@ -276,6 +280,8 @@ impl Database {
                 provider_id TEXT NOT NULL, status INTEGER NOT NULL,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL, error TEXT,
                 tool TEXT NOT NULL DEFAULT '',
                 session_id TEXT,
@@ -444,6 +450,18 @@ impl Database {
         if !log_cols.contains("cost_usd_micros") {
             conn.execute(
                 "ALTER TABLE request_logs ADD COLUMN cost_usd_micros INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !log_cols.contains("cached_prompt_tokens") {
+            conn.execute(
+                "ALTER TABLE request_logs ADD COLUMN cached_prompt_tokens INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !log_cols.contains("cache_write_tokens") {
+            conn.execute(
+                "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -1195,8 +1213,8 @@ impl Database {
     pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id, cost_usd_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO request_logs (ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, cached_prompt_tokens, cache_write_tokens, duration_ms, error, session_id, cost_usd_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 log.ts,
                 log.endpoint,
@@ -1206,6 +1224,8 @@ impl Database {
                 log.status,
                 log.prompt_tokens,
                 log.completion_tokens,
+                log.cached_prompt_tokens,
+                log.cache_write_tokens,
                 log.duration_ms,
                 log.error,
                 log.session_id,
@@ -1247,6 +1267,8 @@ impl Database {
             "SELECT {group_expr}, COUNT(*),
                     COALESCE(SUM(prompt_tokens), 0),
                     COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(cached_prompt_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
                     COALESCE(SUM(cost_usd_micros), 0),
                     SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
                     CAST(AVG(duration_ms) AS INTEGER)
@@ -1266,9 +1288,11 @@ impl Database {
                 requests: row.get(1)?,
                 prompt_tokens: row.get(2)?,
                 completion_tokens: row.get(3)?,
-                cost_usd_micros: row.get(4)?,
-                errors: row.get(5)?,
-                avg_duration_ms: row.get(6)?,
+                cached_prompt_tokens: row.get(4)?,
+                cache_write_tokens: row.get(5)?,
+                cost_usd_micros: row.get(6)?,
+                errors: row.get(7)?,
+                avg_duration_ms: row.get(8)?,
             });
         }
         Ok(out)
@@ -1278,7 +1302,7 @@ impl Database {
     pub fn recent_request_logs(&self, limit: usize) -> Result<Vec<RequestLog>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, duration_ms, error, session_id, cost_usd_micros
+            "SELECT ts, endpoint, model, provider_id, tool, status, prompt_tokens, completion_tokens, cached_prompt_tokens, cache_write_tokens, duration_ms, error, session_id, cost_usd_micros
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![limit as i64])?;
@@ -1293,10 +1317,12 @@ impl Database {
                 status: row.get(5)?,
                 prompt_tokens: row.get(6)?,
                 completion_tokens: row.get(7)?,
-                duration_ms: row.get(8)?,
-                error: row.get(9)?,
-                session_id: row.get(10)?,
-                cost_usd_micros: row.get(11)?,
+                cached_prompt_tokens: row.get(8)?,
+                cache_write_tokens: row.get(9)?,
+                duration_ms: row.get(10)?,
+                error: row.get(11)?,
+                session_id: row.get(12)?,
+                cost_usd_micros: row.get(13)?,
             });
         }
         Ok(out)
@@ -2636,6 +2662,7 @@ mod tests {
             error: None,
             session_id: None,
             cost_usd_micros: 0,
+            ..Default::default()
         })
         .unwrap();
         let rows = db
@@ -2665,6 +2692,7 @@ mod tests {
             error: None,
             session_id: None,
             cost_usd_micros: 0,
+            ..Default::default()
         })
         .unwrap();
         db.insert_request_log(&RequestLog {
@@ -2680,6 +2708,7 @@ mod tests {
             error: Some("rate limited".into()),
             session_id: None,
             cost_usd_micros: 0,
+            ..Default::default()
         })
         .unwrap();
         // F5: status=0 (upstream connection failure) should count as errors
@@ -2696,6 +2725,7 @@ mod tests {
             error: Some("connection refused".into()),
             session_id: None,
             cost_usd_micros: 0,
+            ..Default::default()
         })
         .unwrap();
         let rows = db
@@ -2727,6 +2757,7 @@ mod tests {
             error: None,
             session_id: Some("s1".into()),
             cost_usd_micros: 60_000, // 60,000 micros = $0.06
+            ..Default::default()
         })
         .unwrap();
 
@@ -2743,6 +2774,7 @@ mod tests {
             error: None,
             session_id: Some("s1".into()),
             cost_usd_micros: 30_000, // 30,000 micros = $0.03
+            ..Default::default()
         })
         .unwrap();
 
@@ -2777,6 +2809,7 @@ mod tests {
                 error: None,
                 session_id: None,
                 cost_usd_micros: 0,
+                ..Default::default()
             })
             .unwrap();
         };
@@ -2834,6 +2867,7 @@ mod tests {
             error: None,
             session_id: None,
             cost_usd_micros: 15,
+            ..Default::default()
         };
         let v: serde_json::Value = serde_json::to_value(&log).unwrap();
         assert_eq!(v["endpoint"], "chat");
@@ -3058,6 +3092,7 @@ mod tests {
             error: None,
             session_id: Some("s1".into()),
             cost_usd_micros: 0,
+            ..Default::default()
         })
         .unwrap();
         let logs = db.recent_request_logs(5).unwrap();
@@ -3086,6 +3121,7 @@ mod tests {
                 error: None,
                 session_id,
                 cost_usd_micros: 0,
+                ..Default::default()
             })
             .unwrap();
         }
@@ -3378,5 +3414,37 @@ mod tests {
         // Both rows should coexist in table
         let list = db.list_model_pricing().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_request_logs_cache_tokens_roundtrip_and_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("xfade.db")).unwrap();
+
+        db.insert_request_log(&RequestLog {
+            ts: "2026-11-26T10:00:00Z".into(),
+            endpoint: "messages".into(),
+            model: Some("claude-sonnet-5-5".into()),
+            provider_id: "devops".into(),
+            tool: "claude".into(),
+            status: 200,
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            cached_prompt_tokens: 7719,
+            cache_write_tokens: 500,
+            duration_ms: 1200,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let logs = db.recent_request_logs(1).unwrap();
+        assert_eq!(logs[0].cached_prompt_tokens, 7719);
+        assert_eq!(logs[0].cache_write_tokens, 500);
+
+        let stats = db
+            .stats_since("2026-11-26T00:00:00Z", StatsGroupBy::Provider, None)
+            .unwrap();
+        assert_eq!(stats[0].cached_prompt_tokens, 7719);
+        assert_eq!(stats[0].cache_write_tokens, 500);
     }
 }
