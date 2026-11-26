@@ -49,6 +49,10 @@ GUI: `bash crates/gui/build-sidecar.sh` first, then `cd crates/gui && npx tauri 
 - **Headless shells** fail the keyring backend (`User interaction is not allowed`);
   test with `xfade config set secrets file` (or `XFADE_SECRETS=file`).
 - `cargo fmt` and clippy must be clean before a change is done.
+- **Git / Commit hygiene**:
+  - Use `xfade team <core@xfade.dev>` as commit author and committer (`user.name` / `user.email`); do not commit with personal identities.
+  - Do **not** add `Co-authored-by:` trailers (e.g. Cursor, Aider, Claude, or other bot/agent trailers) to commit messages.
+  - Merge branches/PRs locally (`git merge --no-ff` + `git push`) rather than via the GitHub Web UI so merge commits keep `xfade team <core@xfade.dev>`.
 
 ## Docs
 
