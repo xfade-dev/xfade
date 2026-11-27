@@ -491,10 +491,12 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
         assert_eq!(parsed["modelProvider"], "gemini");
         assert_eq!(parsed["model"], "gemini-2.5-pro");
-        assert_eq!(
-            parsed["customModelsConfig"]["customModels"]["gemini-2.5-pro"]["modelName"],
-            "gemini-api://https://gw.example/models/gemini-2.5-pro"
-        );
+        let model_name = parsed["customModelsConfig"]["customModels"]["gemini-2.5-pro"]
+            ["modelName"]
+            .as_str()
+            .unwrap();
+        assert_eq!(model_name, "gemini-2.5-pro");
+        assert!(!model_name.contains("://"));
         assert_eq!(args[2], "--model");
         assert_eq!(args[3], "gemini-2.5-pro");
 

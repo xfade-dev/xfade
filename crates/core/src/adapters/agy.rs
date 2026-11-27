@@ -21,12 +21,12 @@ pub(crate) fn agy_env_pairs(base_url: &str, api_key: Option<&str>) -> Vec<(&'sta
 /// Build the `customModelsConfig` entry for `agy`'s `settings.json` when a
 /// model is configured alongside a `base_url`.
 /// `customModels` is a map keyed by model ID (`jetbox_state_pb.CustomModelsConfig`).
-pub(crate) fn agy_custom_models_config(base_url: &str, model: &str) -> Value {
-    let base = base_url.trim_end_matches('/');
+/// `modelName` must be the bare model ID (the endpoint comes from `GOOGLE_GEMINI_BASE_URL`).
+pub(crate) fn agy_custom_models_config(_base_url: &str, model: &str) -> Value {
     json!({
         "customModels": {
             model: {
-                "modelName": format!("gemini-api://{base}/models/{model}"),
+                "modelName": model,
                 "label": model,
             }
         }
@@ -135,6 +135,11 @@ impl ToolAdapter for AgyAdapter {
                             model = Some(m.to_string());
                         }
                     }
+                } else {
+                    let m = name.strip_prefix("models/").unwrap_or(name);
+                    if model.is_none() && !m.is_empty() {
+                        model = Some(m.to_string());
+                    }
                 }
             }
         }
@@ -185,17 +190,18 @@ mod tests {
         assert_eq!(doc["modelProvider"], "gemini");
         assert_eq!(doc["model"], "gemini-2.5-pro");
         assert_eq!(doc["notifications"], true);
-        assert_eq!(
-            doc["customModelsConfig"]["customModels"]["gemini-2.5-pro"]["modelName"],
-            "gemini-api://https://gw.example/models/gemini-2.5-pro"
-        );
+        let model_name = doc["customModelsConfig"]["customModels"]["gemini-2.5-pro"]["modelName"]
+            .as_str()
+            .unwrap();
+        assert_eq!(model_name, "gemini-2.5-pro");
+        assert!(!model_name.contains("://"));
         // Secret must never be written to settings.json
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
             .contains("sk-secret"));
 
         let (imported, key) = ad.read_current().unwrap().unwrap();
-        assert_eq!(imported.base_url.as_deref(), Some("https://gw.example"));
+        assert!(imported.base_url.is_none());
         assert_eq!(imported.extra["model"], "gemini-2.5-pro");
         assert!(key.is_none());
 
@@ -208,5 +214,70 @@ mod tests {
         assert!(reverted.get("customModelsConfig").is_none());
         assert_eq!(reverted["model"], "Gemini 4 Hydrogen (Medium)");
         assert!(ad.read_current().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_current_supports_bare_models_prefix_and_legacy_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".gemini/antigravity-cli/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let ad = AgyAdapter::new(dir.path());
+
+        // 1. Bare model name
+        std::fs::write(
+            &path,
+            json!({
+                "modelProvider": "gemini",
+                "customModelsConfig": {
+                    "customModels": {
+                        "gemini-4-argon": { "modelName": "gemini-4-argon", "label": "gemini-4-argon" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (p, _) = ad.read_current().unwrap().unwrap();
+        assert!(p.base_url.is_none());
+        assert_eq!(p.extra["model"], "gemini-4-argon");
+
+        // 2. models/<id> prefix
+        std::fs::write(
+            &path,
+            json!({
+                "modelProvider": "gemini",
+                "customModelsConfig": {
+                    "customModels": {
+                        "gemini-4-argon": { "modelName": "models/gemini-4-argon", "label": "gemini-4-argon" }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (p, _) = ad.read_current().unwrap().unwrap();
+        assert!(p.base_url.is_none());
+        assert_eq!(p.extra["model"], "gemini-4-argon");
+
+        // 3. Legacy gemini-api://<base>/models/<model>
+        std::fs::write(
+            &path,
+            json!({
+                "modelProvider": "gemini",
+                "customModelsConfig": {
+                    "customModels": {
+                        "gemini-4-argon": {
+                            "modelName": "gemini-api://https://gw.example/models/gemini-4-argon",
+                            "label": "gemini-4-argon"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (p, _) = ad.read_current().unwrap().unwrap();
+        assert_eq!(p.base_url.as_deref(), Some("https://gw.example"));
+        assert_eq!(p.extra["model"], "gemini-4-argon");
     }
 }

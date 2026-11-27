@@ -749,6 +749,15 @@ fn run(cli: Cli) -> Result<(), CoreError> {
             }
             core.use_provider(tool, &name, direct)?;
             println!("switched {tool} -> {name}");
+            if tool == ToolKind::Agy {
+                if let Ok(Some(cur)) = core.current(ToolKind::Agy) {
+                    if !cur.is_official() {
+                        println!(
+                            "note: agy reads GOOGLE_GEMINI_BASE_URL and GEMINI_API_KEY from env; launch with `xfade agy {name}` (or `xfade run {name} --tool agy`) instead of bare `agy`"
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Cmd::Current => {
