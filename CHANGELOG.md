@@ -2,6 +2,15 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.15.0 — 2026-11-27
+
+### Model Map Templates, Probe Auto-Mapping & Profile Switching
+- **feat(core,model-map)**: Add `crates/core/src/model_map_templates.rs` with 4 built-in templates (`claude-code-standard`, `codex-standard`, `agy-gemini`, `cost-saver`), custom user template loading (`~/.config/xfade/model_map_templates.json`), and `resolve_template_for_provider` three-tier auto-mapping (`ProbeExact` → `ProbeTier` → `Fallback`).
+- **feat(core,db)**: Add `model_map_profiles` table and transactional `apply_model_mappings_batch`, `list_model_map_profiles`, `get_model_map_profile`, `save_model_map_profile`, `switch_model_map_profile`, and `delete_model_map_profile` methods while keeping `model_mappings` as the single runtime source of truth.
+- **feat(cli,model-map)**: Add `xfade model-map template ls|apply [--probe] [--replace|--merge] [--dry-run] [--save-profile]` and `xfade model-map profile ls|save|use|rm`.
+- **feat(tui,model-map)**: Add `[t]` template auto-configure overlay (with `[p]` live `/v1/models` probe refresh) and `[p]` profile switcher overlay (`Enter` switch, `s` save snapshot, `d` delete) inside `ModelMapState`.
+- **feat(gui,model-map)**: Register 7 Tauri template/profile commands and upgrade `ModelMapEditor.tsx` with a Profile quick-switch bar and an interactive Template Auto-Configure wizard with probe source badges and `<datalist>` autocomplete.
+
 ## v0.14.9 — 2026-11-27
 
 ### Antigravity CLI (`agy`) Bare `modelName` & Gateway Title-Model Fallback
