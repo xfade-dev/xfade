@@ -2,6 +2,14 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.6 — 2026-11-27
+
+### Streaming Idle Timeout, Keepalive & Diagnostics
+- **fix(proxy,forward)**: Log the underlying cause (`upstream stream read error` vs `upstream stream idle timeout after <ms>ms`) in `make_robust_stream` so mid-stream interruptions can be diagnosed in `serve.log` while preserving client-visible error payloads.
+- **fix(proxy,robustness)**: Raise default `TimeoutConfig.idle_timeout` from `15s` to `60s` (`DEFAULT_IDLE_TIMEOUT_SECS`) so extended thinking or tool-call pauses on upstreams without periodic keepalives (e.g. Bedrock relays) do not prematurely trip `xfade_stream_interrupted`.
+- **feat(config,cli,tui)**: Add `idle_timeout_secs` to global `Config` (`config.json`), `Core::set_idle_timeout_secs`, `TimeoutConfig::from_config`, `xfade config set idle_timeout_secs <secs|default>`, and the TUI `Config` form (`Idle (s)`).
+- **feat(proxy,forward)**: Inject protocol-native SSE keepalives every `10s` (`event: ping` for Anthropic `/v1/messages`, `: keepalive` for Chat/Responses) outside `make_robust_stream` so downstream clients stay connected during long upstream pauses without resetting the upstream `idle_timeout` detector.
+
 ## v0.14.5 — 2026-11-26
 
 ### macOS GUI Ad-Hoc Signing & UX Fixes

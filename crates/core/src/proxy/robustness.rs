@@ -11,6 +11,11 @@ use crate::models::ProviderProtocol;
 /// do not falsely trip `ttft_timeout` during upstream latency spikes.
 pub const DEFAULT_TTFT_TIMEOUT_SECS: u64 = 90;
 
+/// Default chunk-to-chunk idle timeout in seconds during an active response stream.
+/// Raised from 15s to 60s so extended thinking or tool-call pauses on upstreams
+/// without periodic SSE keepalives (e.g. Bedrock relays) do not prematurely trip.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60;
+
 /// Tiered timeout configuration for the proxy forwarding pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutConfig {
@@ -29,7 +34,7 @@ impl Default for TimeoutConfig {
         Self {
             connect_timeout: Duration::from_secs(10),
             ttft_timeout: Duration::from_secs(DEFAULT_TTFT_TIMEOUT_SECS),
-            idle_timeout: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             total_non_stream_timeout: Duration::from_secs(120),
         }
     }
@@ -42,6 +47,9 @@ impl TimeoutConfig {
         let mut out = Self::default();
         if let Some(secs) = cfg.ttft_timeout_secs {
             out.ttft_timeout = Duration::from_secs(secs.max(1));
+        }
+        if let Some(secs) = cfg.idle_timeout_secs {
+            out.idle_timeout = Duration::from_secs(secs.max(1));
         }
         out
     }
@@ -336,7 +344,11 @@ mod tests {
             Duration::from_secs(DEFAULT_TTFT_TIMEOUT_SECS)
         );
         assert_eq!(cfg.ttft_timeout, Duration::from_secs(90));
-        assert_eq!(cfg.idle_timeout, Duration::from_secs(15));
+        assert_eq!(
+            cfg.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
 
     #[test]
@@ -346,19 +358,23 @@ mod tests {
             TimeoutConfig::from_config(&c).ttft_timeout,
             Duration::from_secs(90)
         );
+        assert_eq!(
+            TimeoutConfig::from_config(&c).idle_timeout,
+            Duration::from_secs(60)
+        );
 
         c.ttft_timeout_secs = Some(150);
-        assert_eq!(
-            TimeoutConfig::from_config(&c).ttft_timeout,
-            Duration::from_secs(150)
-        );
+        c.idle_timeout_secs = Some(120);
+        let parsed = TimeoutConfig::from_config(&c);
+        assert_eq!(parsed.ttft_timeout, Duration::from_secs(150));
+        assert_eq!(parsed.idle_timeout, Duration::from_secs(120));
 
         // Zero is clamped to at least 1s
         c.ttft_timeout_secs = Some(0);
-        assert_eq!(
-            TimeoutConfig::from_config(&c).ttft_timeout,
-            Duration::from_secs(1)
-        );
+        c.idle_timeout_secs = Some(0);
+        let clamped = TimeoutConfig::from_config(&c);
+        assert_eq!(clamped.ttft_timeout, Duration::from_secs(1));
+        assert_eq!(clamped.idle_timeout, Duration::from_secs(1));
     }
 
     #[test]

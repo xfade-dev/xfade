@@ -22,6 +22,7 @@ enum MockAction {
     Sse(StatusCode, Vec<String>),
     SseDelayed(StatusCode, Duration, Vec<String>),
     SseErrorMidStream(StatusCode, Vec<String>),
+    SseStallMidStream(StatusCode, Vec<String>, Duration),
     Sequence(Vec<MockAction>),
 }
 
@@ -137,6 +138,38 @@ impl MockServer {
                                             "upstream connection dropped mid-stream",
                                         )),
                                         (lines, idx, true),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from_stream(s))
+                            .unwrap()
+                    }
+                    MockAction::SseStallMidStream(status, lines, stall) => {
+                        let s = futures::stream::unfold(
+                            (lines, 0usize, stall),
+                            |(lines, idx, stall)| async move {
+                                if idx < lines.len() {
+                                    let mut payload = lines[idx].as_bytes().to_vec();
+                                    payload.extend_from_slice(b"\n\n");
+                                    Some((
+                                        Ok::<axum::body::Bytes, std::io::Error>(
+                                            axum::body::Bytes::from(payload),
+                                        ),
+                                        (lines, idx + 1, stall),
+                                    ))
+                                } else if idx == lines.len() {
+                                    tokio::time::sleep(stall).await;
+                                    Some((
+                                        Ok::<axum::body::Bytes, std::io::Error>(
+                                            axum::body::Bytes::from_static(b"data: [DONE]\n\n"),
+                                        ),
+                                        (lines, idx + 1, stall),
                                     ))
                                 } else {
                                     None
@@ -671,5 +704,73 @@ async fn test_scenario_6_heterogeneous_protocol_post_commit_interruption_synthes
         cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
         1,
         "interrupted upstream must record circuit breaker failure"
+    );
+}
+
+// ── Scenario 7: Post-Commit Mid-Stream Idle Timeout ──────────────────────────
+
+#[tokio::test]
+async fn test_scenario_7_post_commit_idle_timeout_synthesizes_error() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Upstream emits Anthropic message_start + content_block_delta, then stalls for 500ms.
+    let up1 = MockServer::spawn(MockAction::SseStallMidStream(
+        StatusCode::OK,
+        vec![
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514"}}"#
+                .to_string(),
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Thinking..."}}"#
+                .to_string(),
+        ],
+        Duration::from_millis(500),
+    ))
+    .await;
+
+    let core = setup_test_core(&dir, &[("p1", &up1.url, ProviderProtocol::Messages)]);
+    let timeouts = TimeoutConfig {
+        connect_timeout: Duration::from_secs(5),
+        ttft_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_millis(120),
+        total_non_stream_timeout: Duration::from_secs(5),
+    };
+    let (url, cb) = spawn_proxy_with_svc(ProxyService::new(core).with_timeouts(timeouts)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/messages"))
+        .header("x-api-key", "test-key")
+        .header("x-xfade-tool", "aider")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains("Thinking..."),
+        "expected committed text before stall, got: {body}"
+    );
+    assert!(
+        body.contains(r#""type":"xfade_stream_interrupted""#),
+        "expected xfade_stream_interrupted on idle timeout, got: {body}"
+    );
+    assert!(
+        body.contains(r#""message":"upstream connection lost mid-stream""#),
+        "expected preserved client error message, got: {body}"
+    );
+    assert_eq!(
+        cb.failure_count(&xfade_core::proxy::circuit_key(ToolKind::Aider, "p1")),
+        1,
+        "idle timeout must record circuit breaker failure"
     );
 }

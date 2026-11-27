@@ -696,32 +696,81 @@ where
                 {
                     st.has_tool_call = true;
                 }
-                Some((Ok(chunk), st))
+                return Some((Ok(chunk), st));
             }
-            Ok(Some(Err(_err))) => {
-                st.emitted_interrupted = true;
-                st.interrupted_flag
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                ProxyService::record_failure_static(&st.circuit_breaker, &st.db, &st.provider_id);
-                let interrupted = robustness::synthesize_stream_interrupted(
-                    st.inbound_proto,
-                    &st.req_id,
-                    st.has_tool_call,
+            Ok(Some(Err(err))) => {
+                eprintln!(
+                    "[xfade::proxy] req_id={} provider={} upstream stream read error: {}",
+                    st.req_id, st.provider_id, err
                 );
-                Some((Ok(interrupted), st))
             }
-            Ok(None) => None,
+            Ok(None) => return None,
             Err(_timeout_elapsed) => {
-                st.emitted_interrupted = true;
-                st.interrupted_flag
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                ProxyService::record_failure_static(&st.circuit_breaker, &st.db, &st.provider_id);
-                let interrupted = robustness::synthesize_stream_interrupted(
-                    st.inbound_proto,
-                    &st.req_id,
-                    st.has_tool_call,
+                eprintln!(
+                    "[xfade::proxy] req_id={} provider={} upstream stream idle timeout after {}ms",
+                    st.req_id,
+                    st.provider_id,
+                    st.idle_timeout.as_millis()
                 );
-                Some((Ok(interrupted), st))
+            }
+        }
+
+        st.emitted_interrupted = true;
+        st.interrupted_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ProxyService::record_failure_static(&st.circuit_breaker, &st.db, &st.provider_id);
+        let interrupted = robustness::synthesize_stream_interrupted(
+            st.inbound_proto,
+            &st.req_id,
+            st.has_tool_call,
+        );
+        Some((Ok(interrupted), st))
+    })
+}
+
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn sse_keepalive_frame(proto: ProviderProtocol) -> Bytes {
+    match proto {
+        ProviderProtocol::Messages => {
+            Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+        }
+        ProviderProtocol::Chat | ProviderProtocol::Responses => {
+            Bytes::from_static(b": keepalive\n\n")
+        }
+    }
+}
+
+/// Emit protocol-compatible SSE keepalive frames when the upstream stream is silent
+/// for `interval`, preventing downstream clients from timing out while waiting on
+/// long thinking pauses. Wrapped outside `make_robust_stream` so it does not reset
+/// the upstream `idle_timeout` detector.
+fn make_keepalive_stream<S>(
+    stream: S,
+    inbound_proto: ProviderProtocol,
+    interval: Duration,
+) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static
+where
+    S: futures::Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    struct State {
+        stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+        inbound_proto: ProviderProtocol,
+        interval: Duration,
+    }
+
+    let init = State {
+        stream: Box::pin(stream),
+        inbound_proto,
+        interval,
+    };
+
+    futures::stream::unfold(init, |mut st| async move {
+        tokio::select! {
+            biased;
+            item = st.stream.next() => item.map(|res| (res, st)),
+            _ = tokio::time::sleep(st.interval) => {
+                Some((Ok(sse_keepalive_frame(st.inbound_proto)), st))
             }
         }
     })
@@ -849,9 +898,10 @@ where
         db.clone(),
         interrupted_flag.clone(),
     );
+    let keepalive = make_keepalive_stream(robust, inbound_proto, SSE_KEEPALIVE_INTERVAL);
 
     let body = make_tapped_streaming_body_with_flag(
-        robust,
+        keepalive,
         head,
         tail,
         db,
@@ -3225,5 +3275,140 @@ data: [DONE]\n\n";
             .with_protocol(crate::models::ProviderProtocol::Messages);
         let (ep, _) = prepare_body_for_provider("models", &p, b"", None).unwrap();
         assert_eq!(ep, "models");
+    }
+
+    #[tokio::test]
+    async fn test_make_robust_stream_idle_timeout_and_read_error() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::store::db::Database::open(&dir.path().join("db.sqlite")).unwrap();
+        let cb = Arc::new(super::super::CircuitBreaker::new(Default::default()));
+
+        // 1. Idle timeout after first chunk
+        let stalled_stream = futures::stream::unfold(0u8, |step| async move {
+            match step {
+                0 => Some((
+                    Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some((Ok(Bytes::from_static(b"data: late\n\n")), 2))
+                }
+                _ => None,
+            }
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let robust = make_robust_stream(
+            stalled_stream,
+            Duration::from_millis(40),
+            ProviderProtocol::Messages,
+            "req-idle".into(),
+            false,
+            "claude_code/p1".into(),
+            cb.clone(),
+            db.clone(),
+            flag.clone(),
+        );
+        let chunks: Vec<Bytes> = robust.map(|r| r.unwrap()).collect().await;
+        assert_eq!(chunks.len(), 2);
+        let err_body = String::from_utf8_lossy(&chunks[1]);
+        assert!(err_body.contains("xfade_stream_interrupted"));
+        assert!(err_body.contains("upstream connection lost mid-stream"));
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(cb.failure_count("claude_code/p1"), 1);
+
+        // 2. Upstream read error
+        let err_stream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: ok\n\n")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ]);
+        let flag2 = Arc::new(AtomicBool::new(false));
+        let robust2 = make_robust_stream(
+            err_stream,
+            Duration::from_secs(5),
+            ProviderProtocol::Chat,
+            "req-err".into(),
+            false,
+            "aider/p2".into(),
+            cb.clone(),
+            db,
+            flag2.clone(),
+        );
+        let chunks2: Vec<Bytes> = robust2.map(|r| r.unwrap()).collect().await;
+        assert_eq!(chunks2.len(), 2);
+        let err_body2 = String::from_utf8_lossy(&chunks2[1]);
+        assert!(err_body2.contains("xfade_stream_interrupted"));
+        assert!(flag2.load(Ordering::SeqCst));
+        assert_eq!(cb.failure_count("aider/p2"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_make_keepalive_stream_emits_ping_without_resetting_idle_timeout() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::store::db::Database::open(&dir.path().join("db.sqlite")).unwrap();
+        let cb = Arc::new(super::super::CircuitBreaker::new(Default::default()));
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // Upstream emits one chunk then stalls for 300ms.
+        // Robust stream has 110ms idle_timeout; keepalive has 30ms interval.
+        // Keepalive must emit `event: ping` frames while waiting, AND robust stream
+        // must still time out at ~110ms (keepalive does NOT reset idle_timeout).
+        let stalled_stream = futures::stream::unfold(0u8, |step| async move {
+            match step {
+                0 => Some((
+                    Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n")),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Some((Ok(Bytes::from_static(b"data: late\n\n")), 2))
+                }
+                _ => None,
+            }
+        });
+
+        let robust = make_robust_stream(
+            stalled_stream,
+            Duration::from_millis(110),
+            ProviderProtocol::Messages,
+            "req-ka".into(),
+            false,
+            "claude_code/p1".into(),
+            cb,
+            db,
+            flag.clone(),
+        );
+        let keepalive = make_keepalive_stream(
+            robust,
+            ProviderProtocol::Messages,
+            Duration::from_millis(30),
+        );
+
+        let chunks: Vec<String> = keepalive
+            .map(|r| String::from_utf8_lossy(&r.unwrap()).into_owned())
+            .collect()
+            .await;
+
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(
+            chunks.iter().any(|c| c.contains("event: ping")),
+            "expected at least one keepalive ping frame, got: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .last()
+                .map(|c| c.contains("xfade_stream_interrupted"))
+                .unwrap_or(false),
+            "expected stream to still terminate with xfade_stream_interrupted, got: {chunks:?}"
+        );
     }
 }

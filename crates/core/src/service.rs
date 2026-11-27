@@ -444,6 +444,21 @@ impl Core {
         Ok(cfg)
     }
 
+    /// Set or reset the proxy stream chunk-to-chunk idle timeout in seconds.
+    /// `None` resets to the built-in default (60s). `Some(0)` is rejected.
+    pub fn set_idle_timeout_secs(&self, secs: Option<u64>) -> Result<Config> {
+        if secs == Some(0) {
+            return Err(CoreError::ConfigParse {
+                path: "idle_timeout_secs".into(),
+                msg: "must be >= 1 second (or 'default' / empty to reset)".into(),
+            });
+        }
+        let mut cfg = self.config();
+        cfg.idle_timeout_secs = secs;
+        cfg.save(&self.data_dir)?;
+        Ok(cfg)
+    }
+
     /// Edit a provider (when `key` is `Some`, also rotate the keyring secret).
     pub fn update_provider(&self, provider: &Provider, api_key: Option<&str>) -> Result<()> {
         if self.db.get(provider.tool, &provider.id)?.is_none() {

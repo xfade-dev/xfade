@@ -136,6 +136,7 @@ pub enum ConfigField {
     Model,
     Api,
     TtftTimeout,
+    IdleTimeout,
     ApiKey,
 }
 
@@ -150,6 +151,7 @@ pub struct ConfigState {
     pub model: String,
     pub api: String,
     pub ttft_timeout_secs: String,
+    pub idle_timeout_secs: String,
     pub api_key: String,
     pub api_key_is_set: bool,
 }
@@ -539,6 +541,10 @@ impl App {
                 .ttft_timeout_secs
                 .map(|s| s.to_string())
                 .unwrap_or_default(),
+            idle_timeout_secs: config
+                .idle_timeout_secs
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
             api_key: String::new(),
             api_key_is_set,
         });
@@ -836,6 +842,8 @@ impl App {
                 ConfigField::Model => config.model.push(c),
                 ConfigField::TtftTimeout if c.is_ascii_digit() => config.ttft_timeout_secs.push(c),
                 ConfigField::TtftTimeout => {}
+                ConfigField::IdleTimeout if c.is_ascii_digit() => config.idle_timeout_secs.push(c),
+                ConfigField::IdleTimeout => {}
                 ConfigField::ApiKey => config.api_key.push(c),
             }
         } else if let Some(mm) = self.model_map.as_mut() {
@@ -977,6 +985,9 @@ impl App {
                 ConfigField::TtftTimeout => {
                     config.ttft_timeout_secs.pop();
                 }
+                ConfigField::IdleTimeout => {
+                    config.idle_timeout_secs.pop();
+                }
                 ConfigField::ApiKey => {
                     config.api_key.pop();
                 }
@@ -1026,7 +1037,8 @@ impl App {
                 ConfigField::BaseUrl => ConfigField::Model,
                 ConfigField::Model => ConfigField::Api,
                 ConfigField::Api => ConfigField::TtftTimeout,
-                ConfigField::TtftTimeout => ConfigField::ApiKey,
+                ConfigField::TtftTimeout => ConfigField::IdleTimeout,
+                ConfigField::IdleTimeout => ConfigField::ApiKey,
                 ConfigField::ApiKey => ConfigField::Secrets,
             };
         } else if let Some(mm) = self.model_map.as_mut() {
@@ -1064,7 +1076,8 @@ impl App {
                 ConfigField::Model => ConfigField::BaseUrl,
                 ConfigField::Api => ConfigField::Model,
                 ConfigField::TtftTimeout => ConfigField::Api,
-                ConfigField::ApiKey => ConfigField::TtftTimeout,
+                ConfigField::IdleTimeout => ConfigField::TtftTimeout,
+                ConfigField::ApiKey => ConfigField::IdleTimeout,
             };
         } else if let Some(mm) = self.model_map.as_mut() {
             if let Some(ed) = mm.editing.as_mut() {
@@ -1283,6 +1296,18 @@ impl App {
                 }
             },
         };
+        let idle_secs = match config.idle_timeout_secs.trim() {
+            "" => None,
+            s => match s.parse::<u64>() {
+                Ok(v) if v >= 1 => Some(v),
+                _ => {
+                    self.message =
+                        Some("Error: Idle timeout must be >= 1 second (or blank for 60s)".into());
+                    self.config_edit = Some(config);
+                    return;
+                }
+            },
+        };
         let result = core.update_config(
             Some(config.secrets.trim()),
             Some(config.base_url.trim()),
@@ -1295,6 +1320,11 @@ impl App {
             return;
         }
         if let Err(error) = core.set_ttft_timeout_secs(ttft_secs) {
+            self.message = Some(format!("Error: {error}"));
+            self.config_edit = Some(config);
+            return;
+        }
+        if let Err(error) = core.set_idle_timeout_secs(idle_secs) {
             self.message = Some(format!("Error: {error}"));
             self.config_edit = Some(config);
             return;

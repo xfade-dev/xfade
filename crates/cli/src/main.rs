@@ -824,6 +824,13 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                         xfade_core::proxy::robustness::DEFAULT_TTFT_TIMEOUT_SECS
                     ),
                 }
+                match cfg.idle_timeout_secs {
+                    Some(s) => println!("idle_timeout_secs: {s}"),
+                    None => println!(
+                        "idle_timeout_secs: {} (default)",
+                        xfade_core::proxy::robustness::DEFAULT_IDLE_TIMEOUT_SECS
+                    ),
+                }
                 println!("base_url: {}", cfg.base_url.as_deref().unwrap_or("(unset)"));
                 println!("model: {}", cfg.model.as_deref().unwrap_or("(unset)"));
                 println!("api: {}", cfg.api.as_deref().unwrap_or("(unset)"));
@@ -860,25 +867,31 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                             })?;
                         core.set_keychain_allow_all(allow_all)?;
                     }
-                    "ttft_timeout_secs" => {
+                    "ttft_timeout_secs" | "idle_timeout_secs" => {
                         let trimmed = value.trim();
-                        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                            core.set_ttft_timeout_secs(None)?;
+                        let parsed = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default")
+                        {
+                            None
                         } else {
                             let secs =
                                 trimmed.parse::<u64>().map_err(|_| CoreError::ConfigParse {
-                                    path: "ttft_timeout_secs".into(),
+                                    path: key.clone(),
                                     msg: format!(
                                         "invalid seconds '{value}' (expected integer >= 1 or 'default')"
                                     ),
                                 })?;
-                            core.set_ttft_timeout_secs(Some(secs))?;
+                            Some(secs)
+                        };
+                        if key == "ttft_timeout_secs" {
+                            core.set_ttft_timeout_secs(parsed)?;
+                        } else {
+                            core.set_idle_timeout_secs(parsed)?;
                         }
                     }
                     other => {
                         return Err(CoreError::ConfigParse {
                             path: other.to_string(),
-                            msg: "unknown config key (expected: secrets|keychain_allow_all|ttft_timeout_secs|base_url|model|api|api_key)".into(),
+                            msg: "unknown config key (expected: secrets|keychain_allow_all|ttft_timeout_secs|idle_timeout_secs|base_url|model|api|api_key)".into(),
                         });
                     }
                 }

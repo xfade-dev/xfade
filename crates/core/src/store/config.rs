@@ -73,6 +73,10 @@ pub struct Config {
     /// Defaults to `90` when unset (`None`).
     #[serde(default)]
     pub ttft_timeout_secs: Option<u64>,
+    /// Chunk-to-chunk idle timeout in seconds during an active response stream.
+    /// Defaults to `60` when unset (`None`).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             api: None,
             keychain_allow_all: true,
             ttft_timeout_secs: None,
+            idle_timeout_secs: None,
         }
     }
 }
@@ -118,6 +123,7 @@ mod tests {
         assert_eq!(c.secrets, SecretsBackend::Keyring);
         assert!(c.keychain_allow_all);
         assert_eq!(c.ttft_timeout_secs, None);
+        assert_eq!(c.idle_timeout_secs, None);
     }
 
     #[test]
@@ -130,6 +136,7 @@ mod tests {
             api: Some("anthropic-messages".into()),
             keychain_allow_all: false,
             ttft_timeout_secs: Some(120),
+            idle_timeout_secs: Some(90),
         };
         c.save(dir.path()).unwrap();
         let loaded = Config::load(dir.path());
@@ -139,6 +146,7 @@ mod tests {
         assert_eq!(loaded.api.as_deref(), Some("anthropic-messages"));
         assert!(!loaded.keychain_allow_all);
         assert_eq!(loaded.ttft_timeout_secs, Some(120));
+        assert_eq!(loaded.idle_timeout_secs, Some(90));
     }
 
     #[test]

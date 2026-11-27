@@ -3312,10 +3312,35 @@ mod tests {
 
         // Resetting to None restores default
         core.set_ttft_timeout_secs(None).unwrap();
-        let svc_reset = ProxyService::new(core);
+        let svc_reset = ProxyService::new(core.clone());
         assert_eq!(
             svc_reset.timeouts.ttft_timeout,
             std::time::Duration::from_secs(90)
+        );
+
+        // Default idle_timeout is 60s when unset in config.json
+        assert_eq!(
+            svc_reset.timeouts.idle_timeout,
+            std::time::Duration::from_secs(60)
+        );
+
+        // Persisting idle_timeout_secs updates newly created ProxyService instances
+        core.set_idle_timeout_secs(Some(120)).unwrap();
+        let svc_idle_custom = ProxyService::new(core.clone());
+        assert_eq!(
+            svc_idle_custom.timeouts.idle_timeout,
+            std::time::Duration::from_secs(120)
+        );
+
+        // Zero is rejected
+        assert!(core.set_idle_timeout_secs(Some(0)).is_err());
+
+        // Resetting to None restores default
+        core.set_idle_timeout_secs(None).unwrap();
+        let svc_idle_reset = ProxyService::new(core);
+        assert_eq!(
+            svc_idle_reset.timeouts.idle_timeout,
+            std::time::Duration::from_secs(60)
         );
     }
 

@@ -1121,6 +1121,17 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             config.ttft_timeout_secs.is_empty(),
         ),
         input_line(
+            "Idle (s):",
+            if config.idle_timeout_secs.is_empty() {
+                "60 (default)".to_string()
+            } else {
+                config.idle_timeout_secs.clone()
+            },
+            config.field == ConfigField::IdleTimeout,
+            false,
+            config.idle_timeout_secs.is_empty(),
+        ),
+        input_line(
             "API Key:",
             key_text,
             config.field == ConfigField::ApiKey,
@@ -1151,8 +1162,12 @@ fn draw_config(f: &mut Frame, app: &App, area: Rect) {
             4,
             "Proxy Time-To-First-Token timeout in seconds (blank = 90s default; restart daemon to apply).",
         ),
-        ConfigField::ApiKey => (
+        ConfigField::IdleTimeout => (
             5,
+            "Proxy stream chunk idle timeout in seconds (blank = 60s default; restart daemon to apply).",
+        ),
+        ConfigField::ApiKey => (
+            6,
             "Copied into new providers that leave API Key blank. Not shown after saving.",
         ),
     };
@@ -2030,7 +2045,7 @@ mod tests {
         let core = test_core(&dir);
         let mut app = App::new(ToolKind::ClaudeCode, &core);
         app.start_config(&core);
-        for _ in 0..5 {
+        for _ in 0..6 {
             app.edit_next_field(); // -> API Key, the last field
         }
         // Narrow + short: the Secrets/API option rows wrap here.
