@@ -583,3 +583,77 @@ async fn test_messages_400_extra_fields_retries_once_and_succeeds() {
         .get("custom_extra")
         .is_none());
 }
+
+#[tokio::test]
+async fn test_agy_title_model_default_fallback_and_user_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let core = Core::with_paths(
+        &home,
+        &data,
+        Arc::new(xfade_core::store::secrets::MockStore::default()),
+    )
+    .unwrap();
+
+    let up = MockServer::spawn(MockAction::StatusJson(
+        StatusCode::OK,
+        r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Title"}]}}]}"#.to_string(),
+    ))
+    .await;
+
+    let p = Provider::new("gem", ToolKind::Agy, Some(up.url.clone()))
+        .with_protocol(ProviderProtocol::Gemini);
+    core.add_provider(p, Some("sk-gem")).unwrap();
+    core.db()
+        .set_routes(&["gem".to_string()], None, "gemini")
+        .unwrap();
+
+    let local_token = xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
+        .get_or_create(ToolKind::Agy)
+        .unwrap();
+    let proxy_url = spawn_proxy(core.clone()).await;
+
+    let client = reqwest::Client::new();
+    // 1. Default gateway fallback: gemini-3.1-flash-lite-preview -> gemini-3.8-flash
+    let resp = client
+        .post(format!(
+            "{proxy_url}/v1beta/models/gemini-3.1-flash-lite-preview:generateContent"
+        ))
+        .header("x-goog-api-key", &local_token)
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "summarize"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Explicit user model-map overrides the built-in fallback
+    core.db()
+        .set_model_mapping("gemini-3.1-flash-lite-preview", "*", "gemini-2.5-flash")
+        .unwrap();
+    let resp2 = client
+        .post(format!(
+            "{proxy_url}/v1beta/models/gemini-3.1-flash-lite-preview:generateContent"
+        ))
+        .header("x-goog-api-key", &local_token)
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "summarize"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let reqs = up.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(
+        reqs[0].path,
+        "/v1beta/models/gemini-3.8-flash:generateContent"
+    );
+    assert_eq!(
+        reqs[1].path,
+        "/v1beta/models/gemini-2.5-flash:generateContent"
+    );
+}

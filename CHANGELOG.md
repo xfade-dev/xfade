@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.9 — 2026-11-27
+
+### Antigravity CLI (`agy`) Bare `modelName` & Gateway Title-Model Fallback
+- **fix(adapter,agy)**: Emit bare model IDs in `customModelsConfig.customModels.<model>.modelName` instead of `gemini-api://<base>/models/<model>` (which caused `agy` fallback parsing to send `https` as the model name and trigger `403 key_model_access_denied`). `AgyAdapter::read_current` now supports bare names, `models/<id>`, and legacy `gemini-api://` URIs.
+- **fix(cli,agy)**: Print a reminder after `xfade use <name> --tool agy` for third-party providers to launch via `xfade agy <name>` / `xfade run <name> --tool agy` so `GOOGLE_GEMINI_BASE_URL` and `GEMINI_API_KEY` are injected.
+- **feat(proxy,forward)**: Add a default gateway fallback mapping (`gemini-3.1-flash-lite-preview` → `gemini-3.8-flash`) for `agy` / Gemini `/v1beta` requests when no explicit `model_mappings`, `route_models`, or `model_override` is configured (overridable anytime via `xfade model-map set gemini-3.1-flash-lite-preview "*" <model>`).
+
 ## v0.14.8 — 2026-11-27
 
 ### Antigravity CLI (`agy`) Instant Launch & Anthropic `tool_use` Sanitizer

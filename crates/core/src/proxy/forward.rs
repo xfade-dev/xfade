@@ -520,6 +520,26 @@ fn resolve_routes<'a>(
     })
 }
 
+/// Built-in gateway fallback mappings for auxiliary client models (e.g. `agy`
+/// interactive title generation) when no explicit `model_mappings`,
+/// `route_models`, or `model_override` is configured. Users can override this
+/// anytime via `xfade model-map set <client_model> "*" <upstream_model>`.
+fn default_gateway_model_fallback(
+    client_model: Option<&str>,
+    client_tool: Option<ToolKind>,
+    endpoint: &str,
+) -> Option<String> {
+    let is_agy_or_gemini =
+        client_tool == Some(ToolKind::Agy) || matches!(endpoint, "gemini" | "gemini_stream");
+    if !is_agy_or_gemini {
+        return None;
+    }
+    match client_model {
+        Some("gemini-3.1-flash-lite-preview") => Some("gemini-3.8-flash".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 /// Prepare the request body for conversion or passthrough paths.
 /// Returns a `PreparedBodies` on success, or an error response.
@@ -2276,7 +2296,8 @@ async fn forward_with_failover(
             client_mappings.as_ref(),
             &route_models,
             model_override.as_deref(),
-        );
+        )
+        .or_else(|| default_gateway_model_fallback(model.as_deref(), client_tool, endpoint));
     }
 
     // Stage 2c: model→route pinning (aggregated `/v1/models`). Off by default.
