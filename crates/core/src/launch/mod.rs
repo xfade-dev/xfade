@@ -13,6 +13,7 @@
 //! - pi / omp / cline / hermes / openclaw: no verified injection contract;
 //!   rejected with a `xfade use` hint.
 
+use crate::adapters::agy::agy_custom_models_config;
 use crate::adapters::client_base_url;
 use crate::adapters::opencode::{models_for_extra, OPENAI_COMPAT};
 use crate::error::{CoreError, Result};
@@ -60,6 +61,7 @@ pub fn launch_plan(provider: &Provider, api_key: Option<&str>) -> Result<LaunchP
         ToolKind::ClaudeCode | ToolKind::Aider => Ok(LaunchPlan::Env(run_env(provider, api_key)?)),
         ToolKind::Codex => codex_plan(provider, api_key),
         ToolKind::OpenCode => opencode_plan(provider, api_key),
+        ToolKind::Agy => agy_plan(provider, api_key),
         tool => Err(CoreError::RunUnsupported(tool.label().to_string())),
     }
 }
@@ -206,6 +208,40 @@ fn opencode_plan(provider: &Provider, api_key: Option<&str>) -> Result<LaunchPla
         "OPENCODE_CONFIG_CONTENT".into(),
         serde_json::to_string(&cfg)?,
     )]))
+}
+
+fn agy_plan(provider: &Provider, api_key: Option<&str>) -> Result<LaunchPlan> {
+    let model = provider.extra.get("model").and_then(|v| v.as_str());
+    if provider.is_official() {
+        return Ok(match model {
+            Some(m) => LaunchPlan::EnvWithArgs {
+                env: vec![],
+                args: vec!["--model".into(), m.to_string()],
+            },
+            None => LaunchPlan::Env(vec![]),
+        });
+    }
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| CoreError::ConfigParse {
+            path: "provider".into(),
+            msg: format!("third-party provider '{}' is missing base_url", provider.id),
+        })?;
+    let mut settings = json!({
+        "modelProvider": "gemini",
+    });
+    if let Some(m) = model {
+        settings["model"] = json!(m);
+        settings["customModelsConfig"] = agy_custom_models_config(base_url, m);
+    }
+    let mut args = vec!["--settings".into(), serde_json::to_string(&settings)?];
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.to_string());
+    }
+    let env = run_env(provider, api_key)?;
+    Ok(LaunchPlan::EnvWithArgs { env, args })
 }
 
 /// Pre-launch check for codex: newer versions validate the WHOLE
@@ -433,5 +469,34 @@ mod tests {
         // Missing config → no warning.
         let empty = tempfile::tempdir().unwrap();
         assert!(codex_legacy_wire_api_warning(empty.path()).is_none());
+    }
+
+    #[test]
+    fn agy_plan_uses_inline_settings_and_env_without_touching_disk() {
+        let mut p = Provider::new("relay", ToolKind::Agy, Some("https://gw.example/".into()));
+        p.extra = json!({"model": "gemini-2.5-pro"});
+        let plan = launch_plan(&p, Some("sk-agy")).unwrap();
+        assert_eq!(
+            plan.env(),
+            &[
+                (
+                    "GOOGLE_GEMINI_BASE_URL".to_string(),
+                    "https://gw.example".to_string()
+                ),
+                ("GEMINI_API_KEY".to_string(), "sk-agy".to_string()),
+            ]
+        );
+        let args = plan.args_prefix();
+        assert_eq!(args[0], "--settings");
+        let parsed: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        assert_eq!(parsed["modelProvider"], "gemini");
+        assert_eq!(parsed["model"], "gemini-2.5-pro");
+        assert_eq!(args[2], "--model");
+        assert_eq!(args[3], "gemini-2.5-pro");
+
+        let official = Provider::new("official", ToolKind::Agy, None);
+        let off_plan = launch_plan(&official, None).unwrap();
+        assert!(off_plan.env().is_empty());
+        assert!(off_plan.args_prefix().is_empty());
     }
 }

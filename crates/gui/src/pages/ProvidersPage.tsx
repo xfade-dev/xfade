@@ -25,6 +25,7 @@ const TOOLS: { key: ToolKind; label: string }[] = [
   { key: "cline", label: "Cline" },
   { key: "hermes", label: "Hermes Agent" },
   { key: "open-claw", label: "OpenClaw" },
+  { key: "agy", label: "Antigravity" },
 ];
 
 type LatencyState = { status: "probing" } | { status: "ok"; ms: number } | { status: "down" };

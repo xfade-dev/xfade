@@ -58,6 +58,7 @@ TOOL LAUNCHERS (Zero-config instant run):
   cline        Launch Cline
   hermes       Launch Hermes Agent
   openclaw     Launch OpenClaw
+  agy          Launch Antigravity CLI with inline `--settings` + env
 
 GENERAL:
   self-update  Update xfade to the latest GitHub release
@@ -303,6 +304,9 @@ enum Cmd {
     /// Launch OpenClaw — config-file tool, instant launch unsupported (see `xfade use`)
     #[command(name = "openclaw")]
     OpenClaw(RunOpts),
+    /// Launch Antigravity CLI with inline `--settings` + Gemini env (instant `run`)
+    #[command(name = "agy", alias = "antigravity")]
+    Agy(RunOpts),
 }
 
 /// Instant-launch options for the per-tool subcommands:
@@ -670,6 +674,7 @@ fn run(cli: Cli) -> Result<(), CoreError> {
         Cmd::Cline(o) => cmd_run_instant(ToolKind::Cline, o),
         Cmd::Hermes(o) => cmd_run_instant(ToolKind::Hermes, o),
         Cmd::OpenClaw(o) => cmd_run_instant(ToolKind::OpenClaw, o),
+        Cmd::Agy(o) => cmd_run_instant(ToolKind::Agy, o),
         Cmd::Use { name, tool, direct } => {
             let core = build_core()?;
             let tool = resolve_tool(&core, &name, tool)?;

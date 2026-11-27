@@ -257,6 +257,32 @@ impl SemanticDetector {
                                 }
                             }
                         }
+                        ProviderProtocol::Gemini => {
+                            if let Some(candidates) =
+                                val.get("candidates").and_then(|c| c.as_array())
+                            {
+                                for cand in candidates {
+                                    if let Some(parts) = cand
+                                        .pointer("/content/parts")
+                                        .and_then(|p| p.as_array())
+                                    {
+                                        for part in parts {
+                                            if let Some(t) =
+                                                part.get("text").and_then(|t| t.as_str())
+                                            {
+                                                if !t.is_empty() {
+                                                    has_semantic = true;
+                                                }
+                                            }
+                                            if part.get("functionCall").is_some() {
+                                                has_semantic = true;
+                                                has_tool_call = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -325,6 +351,19 @@ pub fn synthesize_stream_interrupted(
                 }
             });
             Bytes::from(format!("event: response.failed\ndata: {json}\n\n"))
+        }
+        ProviderProtocol::Gemini => {
+            let json = serde_json::json!({
+                "error": {
+                    "code": 500,
+                    "message": "upstream connection lost mid-stream",
+                    "status": "INTERNAL",
+                    "xfade_type": "xfade_stream_interrupted",
+                    "request_id": req_id,
+                    "retryable": retryable
+                }
+            });
+            Bytes::from(format!("data: {json}\n\n"))
         }
     }
 }

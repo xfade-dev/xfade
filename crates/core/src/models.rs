@@ -14,10 +14,11 @@ pub enum ToolKind {
     Cline,
     Hermes,
     OpenClaw,
+    Agy,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 9] = [
+    pub const ALL: [ToolKind; 10] = [
         ToolKind::ClaudeCode,
         ToolKind::Codex,
         ToolKind::OpenCode,
@@ -27,6 +28,7 @@ impl ToolKind {
         ToolKind::Cline,
         ToolKind::Hermes,
         ToolKind::OpenClaw,
+        ToolKind::Agy,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -40,6 +42,7 @@ impl ToolKind {
             ToolKind::Cline => "cline",
             ToolKind::Hermes => "hermes",
             ToolKind::OpenClaw => "openclaw",
+            ToolKind::Agy => "agy",
         }
     }
 
@@ -55,6 +58,7 @@ impl ToolKind {
             ToolKind::Cline => "Cline",
             ToolKind::Hermes => "Hermes Agent",
             ToolKind::OpenClaw => "OpenClaw",
+            ToolKind::Agy => "Antigravity",
         }
     }
 }
@@ -78,8 +82,9 @@ impl FromStr for ToolKind {
             "cline" => Ok(ToolKind::Cline),
             "hermes" => Ok(ToolKind::Hermes),
             "openclaw" => Ok(ToolKind::OpenClaw),
+            "agy" | "antigravity" => Ok(ToolKind::Agy),
             _ => Err(format!(
-                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider|cline|hermes|openclaw)"
+                "unknown tool: {s} (expected claude|codex|opencode|pi|omp|aider|cline|hermes|openclaw|agy)"
             )),
         }
     }
@@ -92,6 +97,7 @@ pub enum ProviderProtocol {
     Chat,
     Messages,
     Responses,
+    Gemini,
 }
 
 /// Mapping from provider ID (or "*") to upstream model name.
@@ -106,6 +112,7 @@ impl ProviderProtocol {
             Self::Chat => "chat",
             Self::Messages => "messages",
             Self::Responses => "responses",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -115,6 +122,7 @@ impl ProviderProtocol {
             Self::Chat => "chat",
             Self::Messages => "messages",
             Self::Responses => "responses",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -132,8 +140,9 @@ impl std::str::FromStr for ProviderProtocol {
             "chat" | "openai" => Ok(Self::Chat),
             "messages" | "anthropic" => Ok(Self::Messages),
             "responses" | "codex" => Ok(Self::Responses),
+            "gemini" | "google" => Ok(Self::Gemini),
             _ => Err(format!(
-                "unknown protocol: '{s}' (expected chat|messages|responses)"
+                "unknown protocol: '{s}' (expected chat|messages|responses|gemini)"
             )),
         }
     }
@@ -162,6 +171,12 @@ impl Provider {
                 .is_some_and(|u| u.contains("anthropic.com"))
         {
             ProviderProtocol::Messages
+        } else if tool == ToolKind::Agy
+            || base_url
+                .as_deref()
+                .is_some_and(|u| u.contains("generativelanguage.googleapis.com"))
+        {
+            ProviderProtocol::Gemini
         } else {
             ProviderProtocol::Chat
         };

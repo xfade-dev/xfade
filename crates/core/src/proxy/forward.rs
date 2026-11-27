@@ -80,7 +80,11 @@ fn endpoint_from_path(path: &str) -> &'static str {
         "/v1/chat/completions" => "chat",
         "/v1/responses" => "responses",
         "/v1/messages" => "messages",
-        "/v1/models" => "models",
+        "/v1/models" | "/v1beta/models" => "models",
+        _ if path.starts_with("/v1beta/models/") && path.contains(":streamGenerateContent") => {
+            "gemini_stream"
+        }
+        _ if path.starts_with("/v1beta/models/") => "gemini",
         _ => "chat",
     }
 }
@@ -164,8 +168,15 @@ fn build_upstream_request(
     body: &[u8],
     auth_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let base = crate::adapters::with_v1_if_bare_host(base_url);
-    let url = format!("{}{}", base, endpoint_path(endpoint));
+    let is_gemini_target = endpoint.starts_with("/v1beta/");
+    let url = if is_gemini_target {
+        let base = base_url.trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        format!("{base}{endpoint}")
+    } else {
+        let base = crate::adapters::with_v1_if_bare_host(base_url);
+        format!("{}{}", base, endpoint_path(endpoint))
+    };
 
     let mut req = match method {
         "GET" => client.get(&url),
@@ -185,10 +196,14 @@ fn build_upstream_request(
     }
 
     if let Some(key) = auth_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-        if endpoint == "messages" || endpoint == "/v1/messages" {
-            req = req.header("x-api-key", key);
-            req = req.header("anthropic-version", "2023-06-01");
+        if is_gemini_target {
+            req = req.header("x-goog-api-key", key);
+        } else {
+            req = req.header("Authorization", format!("Bearer {key}"));
+            if endpoint == "messages" || endpoint == "/v1/messages" {
+                req = req.header("x-api-key", key);
+                req = req.header("anthropic-version", "2023-06-01");
+            }
         }
     }
 
@@ -564,6 +579,7 @@ pub fn endpoint_to_inbound_protocol(endpoint: &str) -> ProviderProtocol {
     match endpoint {
         "messages" | "/v1/messages" => ProviderProtocol::Messages,
         "responses" | "/v1/responses" => ProviderProtocol::Responses,
+        "gemini" | "gemini_stream" => ProviderProtocol::Gemini,
         _ => ProviderProtocol::Chat,
     }
 }
@@ -582,11 +598,17 @@ pub fn prepare_body_for_provider(
 
     let inbound_proto = endpoint_to_inbound_protocol(endpoint);
     let outbound_proto = provider.protocol;
+    let inbound_stream = endpoint == "gemini_stream"
+        || serde_json::from_slice::<serde_json::Value>(original_body)
+            .ok()
+            .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+            .unwrap_or(false);
 
     let target_endpoint = match outbound_proto {
         ProviderProtocol::Chat => "chat",
         ProviderProtocol::Messages => "messages",
         ProviderProtocol::Responses => "responses",
+        ProviderProtocol::Gemini => "gemini",
     };
 
     if inbound_proto == outbound_proto {
@@ -608,6 +630,13 @@ pub fn prepare_body_for_provider(
                 })
                 .map(|b| b.to_vec())
         }
+        (ProviderProtocol::Messages, ProviderProtocol::Gemini) => {
+            super::convert::request_anthropic_to_openai(original_body, None)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_gemini(&chat_bytes, model_override)
+                })
+                .map(|b| b.to_vec())
+        }
         (ProviderProtocol::Responses, ProviderProtocol::Chat) => {
             super::convert::request_responses_to_chat(original_body, model_override)
                 .map(|b| maybe_inject_stream_options("chat", &b).unwrap_or_else(|| b.to_vec()))
@@ -619,12 +648,41 @@ pub fn prepare_body_for_provider(
                 })
                 .map(|b| b.to_vec())
         }
+        (ProviderProtocol::Responses, ProviderProtocol::Gemini) => {
+            super::convert::request_responses_to_chat(original_body, None)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_gemini(&chat_bytes, model_override)
+                })
+                .map(|b| b.to_vec())
+        }
         (ProviderProtocol::Chat, ProviderProtocol::Messages) => {
             super::convert::request_chat_to_anthropic(original_body, model_override)
                 .map(|b| b.to_vec())
         }
         (ProviderProtocol::Chat, ProviderProtocol::Responses) => {
             super::convert::request_chat_to_responses(original_body, model_override)
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Chat, ProviderProtocol::Gemini) => {
+            super::convert::request_chat_to_gemini(original_body, model_override)
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Gemini, ProviderProtocol::Chat) => {
+            super::convert::request_gemini_to_chat(original_body, model_override, inbound_stream)
+                .map(|b| maybe_inject_stream_options("chat", &b).unwrap_or_else(|| b.to_vec()))
+        }
+        (ProviderProtocol::Gemini, ProviderProtocol::Messages) => {
+            super::convert::request_gemini_to_chat(original_body, None, inbound_stream)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_anthropic(&chat_bytes, model_override)
+                })
+                .map(|b| b.to_vec())
+        }
+        (ProviderProtocol::Gemini, ProviderProtocol::Responses) => {
+            super::convert::request_gemini_to_chat(original_body, None, inbound_stream)
+                .and_then(|chat_bytes| {
+                    super::convert::request_chat_to_responses(&chat_bytes, model_override)
+                })
                 .map(|b| b.to_vec())
         }
         _ => unreachable!(),
@@ -735,7 +793,7 @@ fn sse_keepalive_frame(proto: ProviderProtocol) -> Bytes {
         ProviderProtocol::Messages => {
             Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
         }
-        ProviderProtocol::Chat | ProviderProtocol::Responses => {
+        ProviderProtocol::Chat | ProviderProtocol::Responses | ProviderProtocol::Gemini => {
             Bytes::from_static(b": keepalive\n\n")
         }
     }
@@ -866,6 +924,10 @@ where
                 upstream,
                 req_model.clone(),
             )),
+            ProviderProtocol::Gemini => Box::pin(super::convert::stream_gemini_to_chat(
+                upstream,
+                req_model.clone(),
+            )),
         };
 
         // Step 2: Canonical Chat IR stream -> Inbound stream
@@ -876,6 +938,10 @@ where
                 req_model,
             )),
             ProviderProtocol::Responses => Box::pin(super::convert::stream_chat_to_responses(
+                chat_stream,
+                req_model,
+            )),
+            ProviderProtocol::Gemini => Box::pin(super::convert::stream_chat_to_gemini(
                 chat_stream,
                 req_model,
             )),
@@ -972,6 +1038,9 @@ async fn handle_success_non_streaming(
             ProviderProtocol::Responses => {
                 super::convert::response_responses_to_chat(&bytes, &req_model)
             }
+            ProviderProtocol::Gemini => {
+                super::convert::response_gemini_to_chat(&bytes, &req_model)
+            }
         };
 
         // Step 2: Canonical Chat IR -> Inbound
@@ -983,6 +1052,9 @@ async fn handle_success_non_streaming(
                 }
                 ProviderProtocol::Responses => {
                     super::convert::response_chat_to_responses(&chat_bytes, &req_model)
+                }
+                ProviderProtocol::Gemini => {
+                    super::convert::response_chat_to_gemini(&chat_bytes, &req_model)
                 }
             },
             Err(e) => Err(e),
@@ -1477,6 +1549,29 @@ async fn failover_loop(
         }
         let sending_body: &[u8] = injected_body_vec.as_deref().unwrap_or(sending_body_ref);
 
+        let is_stream = endpoint == "gemini_stream"
+            || serde_json::from_slice::<serde_json::Value>(original_body)
+                .ok()
+                .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                .unwrap_or(false);
+        let gemini_ep;
+        let forward_endpoint = if upstream_endpoint == "gemini" {
+            let target_model = entry
+                .model_override
+                .as_deref()
+                .or(model.as_deref())
+                .unwrap_or("gemini-2.5-pro");
+            let action = if is_stream {
+                "streamGenerateContent?alt=sse"
+            } else {
+                "generateContent"
+            };
+            gemini_ep = format!("/v1beta/models/{target_model}:{action}");
+            gemini_ep.as_str()
+        } else {
+            upstream_endpoint
+        };
+
         let single_route = entries.len() == 1;
         let mut retried_stream_end = false;
         let mut retried_transport = false;
@@ -1491,7 +1586,7 @@ async fn failover_loop(
                     &svc.client,
                     method,
                     &base_url,
-                    upstream_endpoint,
+                    forward_endpoint,
                     headers,
                     sending_body,
                     auth_key.as_deref(),
@@ -1575,7 +1670,7 @@ async fn failover_loop(
                                 &svc.client,
                                 method,
                                 &base_url,
-                                upstream_endpoint,
+                                forward_endpoint,
                                 headers,
                                 sending_body,
                                 auth_key.as_deref(),
@@ -1613,7 +1708,7 @@ async fn failover_loop(
                         &svc.client,
                         method,
                         &base_url,
-                        upstream_endpoint,
+                        forward_endpoint,
                         headers,
                         &new_body,
                         auth_key.as_deref(),
@@ -2532,7 +2627,18 @@ pub async fn handle(
     let model = parsed
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()))
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if endpoint == "gemini" || endpoint == "gemini_stream" {
+                uri.path()
+                    .strip_prefix("/v1beta/models/")
+                    .and_then(|rest| rest.split(':').next())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
     // Conversation identity: hash the opener (system + first user turn) and
     // reuse the session when the fingerprint matches one started recently.
     let session_id = parsed.as_ref().and_then(|v| {

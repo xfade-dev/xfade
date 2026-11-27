@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod aider;
 pub mod claude_code;
 pub mod cline;
@@ -59,6 +60,7 @@ pub fn adapter_for(tool: ToolKind, home: &Path) -> Box<dyn ToolAdapter> {
         ToolKind::Cline => Box::new(cline::ClineAdapter::new(home)),
         ToolKind::Hermes => Box::new(hermes::HermesAdapter::new(home)),
         ToolKind::OpenClaw => Box::new(openclaw::OpenClawAdapter::new(home)),
+        ToolKind::Agy => Box::new(agy::AgyAdapter::new(home)),
     }
 }
 

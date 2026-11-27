@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.7 — 2026-11-27
+
+### Antigravity CLI (`agy`) & Gemini `/v1beta` Protocol Support
+- **feat(tool,adapter,launch)**: Add `ToolKind::Agy` (`agy` / `antigravity`), `AgyAdapter` (managing `~/.gemini/antigravity-cli/settings.json` `modelProvider`, `model`, and `customModelsConfig`), built-in `agy` presets (`official`, `google-ai-studio`, `local-proxy`), and zero-disk-touch `xfade agy` / `xfade run agy` launch via `--settings` + `GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY`.
+- **feat(proxy,convert)**: Add `ProviderProtocol::Gemini`, `/v1beta/models/*` proxy routes, `x-goog-api-key` gateway authentication, bidirectional `Gemini ↔ Chat` request/response/streaming conversion (`convert_gemini.rs`), `usageMetadata` token accounting, and `SemanticDetector` / stream interruption support for Gemini streams.
+- **fix(tui,gui)**: Adjust TUI tool-tab spacing so all 10 tools fit cleanly in 80 columns, add `[gem]` protocol badge support, and sync `agy` / `gemini` types into `xfade-gui`.
+
 ## v0.14.6 — 2026-11-27
 
 ### Streaming Idle Timeout, Keepalive & Diagnostics

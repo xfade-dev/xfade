@@ -11,6 +11,7 @@
 //! openclaw) have no env-only contract; `run` refuses them with a hint to
 //! `xfade use` instead.
 
+use crate::adapters::agy::agy_env_pairs;
 use crate::adapters::claude_code::claude_env_pairs;
 use crate::error::{CoreError, Result};
 use crate::models::{Provider, ToolKind};
@@ -27,6 +28,7 @@ pub fn tool_command(tool: ToolKind) -> &'static str {
         ToolKind::Cline => "cline",
         ToolKind::Hermes => "hermes",
         ToolKind::OpenClaw => "openclaw",
+        ToolKind::Agy => "agy",
     }
 }
 
@@ -123,6 +125,10 @@ pub fn run_env(provider: &Provider, api_key: Option<&str>) -> Result<Vec<(String
             }
             Ok(env)
         }
+        ToolKind::Agy => Ok(agy_env_pairs(base_url, api_key)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()),
         tool => Err(CoreError::RunUnsupported(tool.label().to_string())),
     }
 }

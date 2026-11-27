@@ -53,7 +53,8 @@ fn token_matches(expected: &str, presented: &str) -> bool {
 }
 
 /// The credential a client presented: `Authorization: Bearer <t>` (OpenAI-style
-/// clients) or `x-api-key: <t>` (Anthropic-native clients).
+/// clients), `x-api-key: <t>` (Anthropic-native clients), or `x-goog-api-key: <t>`
+/// (Google Gemini / Antigravity CLI clients).
 fn presented_token(headers: &HeaderMap) -> Option<&str> {
     if let Some(t) = headers
         .get(header::AUTHORIZATION)
@@ -62,7 +63,10 @@ fn presented_token(headers: &HeaderMap) -> Option<&str> {
     {
         return Some(t);
     }
-    headers.get("x-api-key").and_then(|v| v.to_str().ok())
+    headers
+        .get("x-api-key")
+        .or_else(|| headers.get("x-goog-api-key"))
+        .and_then(|v| v.to_str().ok())
 }
 
 /// Browser-origin defence for loopback-bound listeners.
@@ -116,6 +120,7 @@ pub async fn auth_guard(
             req.extensions_mut().insert(ClientIdentity(tool));
             req.headers_mut().remove(header::AUTHORIZATION);
             req.headers_mut().remove("x-api-key");
+            req.headers_mut().remove("x-goog-api-key");
             return next.run(req).await;
         }
         if tok.starts_with("xfade-local-") {

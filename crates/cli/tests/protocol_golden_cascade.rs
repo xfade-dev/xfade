@@ -347,3 +347,70 @@ fn test_cli_heterogeneous_protocol_management_and_status() {
         .stdout(predicate::str::contains("p-chat"))
         .stdout(predicate::str::contains("messages"));
 }
+
+#[tokio::test]
+async fn test_agy_gemini_inbound_transcodes_to_chat_upstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let core = Core::with_paths(
+        &home,
+        &data,
+        Arc::new(xfade_core::store::secrets::MockStore::default()),
+    )
+    .unwrap();
+
+    let up_chat = MockServer::spawn(MockAction::Sse(
+        StatusCode::OK,
+        vec![
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello from Chat"}}]}"#.to_string(),
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ],
+    ))
+    .await;
+
+    let p = Provider::new("oai", ToolKind::Agy, Some(up_chat.url.clone()))
+        .with_protocol(ProviderProtocol::Chat);
+    core.add_provider(p, Some("sk-upstream")).unwrap();
+    core.db()
+        .set_routes(&["oai".to_string()], Some("gpt-5"), "chat")
+        .unwrap();
+
+    let local_token =
+        xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
+            .get_or_create(ToolKind::Agy)
+            .unwrap();
+    let proxy_url = spawn_proxy(core).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{proxy_url}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        ))
+        .header("x-goog-api-key", &local_token)
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Hello from Chat"),
+        "expected converted Gemini SSE text, got: {body}"
+    );
+    assert!(
+        body.contains("\"finishReason\":\"STOP\""),
+        "expected Gemini finishReason, got: {body}"
+    );
+
+    let reqs = up_chat.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].path, "/v1/chat/completions");
+    let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(sent["model"], "gpt-5");
+    assert_eq!(sent["stream"], true);
+}

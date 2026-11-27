@@ -1,6 +1,7 @@
 pub mod cache_injector;
 pub mod circuit_breaker;
 pub mod convert;
+pub mod convert_gemini;
 pub mod forward;
 pub mod pricing;
 pub mod pricing_sync;
@@ -294,6 +295,11 @@ impl ProxyService {
             .route("/v1/responses", post(forward::handle))
             .route("/v1/messages", post(forward::handle))
             .route("/v1/models", get(forward::handle_get))
+            .route(
+                "/v1beta/models/{*rest}",
+                post(forward::handle).get(forward::handle_get),
+            )
+            .route("/v1beta/models", get(forward::handle_get))
             .route("/__xfade/status", get(status::handle))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),

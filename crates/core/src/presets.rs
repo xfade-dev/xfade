@@ -164,6 +164,14 @@ pub fn presets_for(tool: ToolKind) -> Vec<Preset> {
                 ),
             ]);
         }
+        ToolKind::Agy => {
+            v.extend([p(
+                "google-ai-studio",
+                "Google AI Studio (Gemini API)",
+                Some("https://generativelanguage.googleapis.com"),
+                serde_json::json!({"model": "gemini-2.5-pro"}),
+            )]);
+        }
     }
     // Load user custom presets
     if let Some(custom) = load_custom_presets() {
@@ -197,7 +205,7 @@ fn load_custom_presets() -> Option<Vec<Preset>> {
 /// Pi and OMP both use the OpenAI-compatible protocol, going through the /v1 path.
 fn local_proxy_base_url(tool: ToolKind) -> &'static str {
     match tool {
-        ToolKind::ClaudeCode => "http://127.0.0.1:24860",
+        ToolKind::ClaudeCode | ToolKind::Agy => "http://127.0.0.1:24860",
         ToolKind::Codex
         | ToolKind::OpenCode
         | ToolKind::Pi

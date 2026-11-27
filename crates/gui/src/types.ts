@@ -7,9 +7,10 @@ export type ToolKind =
   | "aider"
   | "cline"
   | "hermes"
-  | "open-claw";
+  | "open-claw"
+  | "agy";
 
-export type ProviderProtocol = "chat" | "messages" | "responses";
+export type ProviderProtocol = "chat" | "messages" | "responses" | "gemini";
 
 export interface Provider {
   id: string;

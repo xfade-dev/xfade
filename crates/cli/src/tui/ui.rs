@@ -101,7 +101,7 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
 fn tool_tabs(app: &App) -> Line<'static> {
     let spans = ToolKind::ALL
         .iter()
-        .flat_map(|t| {
+        .map(|t| {
             let style = if *t == app.tool {
                 Style::default()
                     .fg(Color::Black)
@@ -110,10 +110,7 @@ fn tool_tabs(app: &App) -> Line<'static> {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            [
-                Span::styled(format!(" {} ", t.as_str()), style),
-                Span::raw(" "),
-            ]
+            Span::styled(format!(" {} ", t.as_str()), style)
         })
         .collect::<Vec<_>>();
     Line::from(spans)
@@ -460,6 +457,7 @@ fn draw_list(f: &mut Frame, app: &App, stats: &[StatsRow], area: Rect) {
                     xfade_core::ProviderProtocol::Messages => ("[msg] ", Color::Magenta),
                     xfade_core::ProviderProtocol::Responses => ("[resp]", Color::Blue),
                     xfade_core::ProviderProtocol::Chat => ("[chat]", Color::DarkGray),
+                    xfade_core::ProviderProtocol::Gemini => ("[gem] ", Color::Green),
                 };
                 spans.push(Span::styled(
                     format!("{proto_tag} "),
@@ -526,6 +524,7 @@ fn draw_provider_details(f: &mut Frame, app: &App, area: Rect) {
         xfade_core::ProviderProtocol::Chat => "Chat (OpenAI-compatible)",
         xfade_core::ProviderProtocol::Messages => "Messages (Anthropic)",
         xfade_core::ProviderProtocol::Responses => "Responses (OpenAI v1/responses)",
+        xfade_core::ProviderProtocol::Gemini => "Gemini (Google v1beta)",
     };
     let model = p
         .extra

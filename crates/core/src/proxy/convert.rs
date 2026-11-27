@@ -11,6 +11,10 @@
 //!   `response_chat_to_responses` and `stream_chat_to_responses`.
 
 use crate::error::{CoreError, Result};
+pub use super::convert_gemini::{
+    request_chat_to_gemini, request_gemini_to_chat, response_chat_to_gemini,
+    response_gemini_to_chat, stream_chat_to_gemini, stream_gemini_to_chat,
+};
 use crate::models::ProviderProtocol;
 use axum::body::Bytes;
 use futures::Stream;
@@ -2504,6 +2508,14 @@ pub fn transcode_error_body(
             "error": {
                 "message": message,
                 "type": err_type,
+            }
+        }))
+        .unwrap_or_else(|_| raw_bytes.to_vec()),
+        ProviderProtocol::Gemini => serde_json::to_vec(&json!({
+            "error": {
+                "code": 500,
+                "message": message,
+                "status": "INTERNAL",
             }
         }))
         .unwrap_or_else(|_| raw_bytes.to_vec()),

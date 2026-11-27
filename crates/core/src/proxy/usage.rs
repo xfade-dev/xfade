@@ -19,7 +19,11 @@ impl Usage {
             Ok(v) => v,
             Err(_) => return Self::default(),
         };
-        let usage = v.get("usage").cloned().unwrap_or(Value::Null);
+        let usage = v
+            .get("usage")
+            .or_else(|| v.get("usageMetadata"))
+            .cloned()
+            .unwrap_or(Value::Null);
         Self::from_usage_value(&usage)
     }
 
@@ -127,13 +131,18 @@ impl Usage {
             let usage = v
                 .get("usage")
                 .cloned()
+                .or_else(|| v.get("usageMetadata").cloned())
                 .or_else(|| v.get("message").and_then(|m| m.get("usage")).cloned())
                 .or_else(|| v.get("response").and_then(|m| m.get("usage")).cloned())
                 .unwrap_or(Value::Null);
             if usage.is_null() {
                 continue;
             }
-            if let Some(p) = usage.get("prompt_tokens").and_then(|t| t.as_i64()) {
+            if let Some(p) = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("promptTokenCount"))
+                .and_then(|t| t.as_i64())
+            {
                 raw_prompt = Some(p);
             }
             if let Some(inp) = usage.get("input_tokens").and_then(|t| t.as_i64()) {
@@ -142,6 +151,7 @@ impl Usage {
             if let Some(c) = usage
                 .get("completion_tokens")
                 .or_else(|| usage.get("output_tokens"))
+                .or_else(|| usage.get("candidatesTokenCount"))
                 .and_then(|t| t.as_i64())
             {
                 // message_delta's output_tokens is cumulative → take last.
