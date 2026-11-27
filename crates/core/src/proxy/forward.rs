@@ -1038,9 +1038,7 @@ async fn handle_success_non_streaming(
             ProviderProtocol::Responses => {
                 super::convert::response_responses_to_chat(&bytes, &req_model)
             }
-            ProviderProtocol::Gemini => {
-                super::convert::response_gemini_to_chat(&bytes, &req_model)
-            }
+            ProviderProtocol::Gemini => super::convert::response_gemini_to_chat(&bytes, &req_model),
         };
 
         // Step 2: Canonical Chat IR -> Inbound

@@ -10,11 +10,11 @@
 //!   chat-completions-only upstreams, see `request_responses_to_chat`,
 //!   `response_chat_to_responses` and `stream_chat_to_responses`.
 
-use crate::error::{CoreError, Result};
 pub use super::convert_gemini::{
     request_chat_to_gemini, request_gemini_to_chat, response_chat_to_gemini,
     response_gemini_to_chat, stream_chat_to_gemini, stream_gemini_to_chat,
 };
+use crate::error::{CoreError, Result};
 use crate::models::ProviderProtocol;
 use axum::body::Bytes;
 use futures::Stream;

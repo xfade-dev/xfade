@@ -60,7 +60,9 @@ impl ToolAdapter for AgyAdapter {
     fn apply(&self, provider: &Provider, _api_key: Option<&str>) -> Result<()> {
         let path = self.settings_path();
         let mut doc = load_json_or_empty(&path)?;
-        let root = doc.as_object_mut().expect("load_json_or_empty guarantees object");
+        let root = doc
+            .as_object_mut()
+            .expect("load_json_or_empty guarantees object");
 
         if provider.is_official() {
             root.remove("modelProvider");
@@ -178,7 +180,9 @@ mod tests {
             "gemini-api://https://gw.example/models/gemini-2.5-pro"
         );
         // Secret must never be written to settings.json
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("sk-secret"));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("sk-secret"));
 
         let (imported, key) = ad.read_current().unwrap().unwrap();
         assert_eq!(imported.base_url.as_deref(), Some("https://gw.example"));

@@ -144,10 +144,7 @@ pub fn request_gemini_to_chat(
         {
             out.insert("max_tokens".into(), v.clone());
         }
-        if let Some(v) = gc
-            .get("stopSequences")
-            .or_else(|| gc.get("stop_sequences"))
-        {
+        if let Some(v) = gc.get("stopSequences").or_else(|| gc.get("stop_sequences")) {
             out.insert("stop".into(), v.clone());
         }
     }
@@ -169,7 +166,9 @@ pub fn request_gemini_to_chat(
                     if let Some(desc) = d.get("description") {
                         func.insert("description".into(), desc.clone());
                     }
-                    if let Some(params) = d.get("parameters").or_else(|| d.get("parametersJsonSchema"))
+                    if let Some(params) = d
+                        .get("parameters")
+                        .or_else(|| d.get("parametersJsonSchema"))
                     {
                         func.insert("parameters".into(), params.clone());
                     }
@@ -591,8 +590,7 @@ where
                                     st.saw_tool_call = true;
                                     let name =
                                         fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                                    let args =
-                                        fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                                    let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                                     delta.insert(
                                         "tool_calls".into(),
                                         json!([{
@@ -731,10 +729,11 @@ where
                                 for tc in tcs {
                                     let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0)
                                         as usize;
-                                    let entry = st.tool_bufs.entry(idx).or_insert_with(|| ToolBuf {
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    });
+                                    let entry =
+                                        st.tool_bufs.entry(idx).or_insert_with(|| ToolBuf {
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        });
                                     if let Some(n) = tc
                                         .pointer("/function/name")
                                         .and_then(|n| n.as_str())
@@ -881,7 +880,10 @@ mod tests {
 
         let gem_bytes = response_chat_to_gemini(&chat_bytes, "gemini-2.5-pro").unwrap();
         let gem: Value = serde_json::from_slice(&gem_bytes).unwrap();
-        assert_eq!(gem["candidates"][0]["content"]["parts"][0]["text"], "Hello!");
+        assert_eq!(
+            gem["candidates"][0]["content"]["parts"][0]["text"],
+            "Hello!"
+        );
         assert_eq!(gem["candidates"][0]["finishReason"], "STOP");
         assert_eq!(gem["usageMetadata"]["promptTokenCount"], 10);
     }

@@ -874,7 +874,8 @@ fn run(cli: Cli) -> Result<(), CoreError> {
                     }
                     "ttft_timeout_secs" | "idle_timeout_secs" => {
                         let trimmed = value.trim();
-                        let parsed = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default")
+                        let parsed = if trimmed.is_empty()
+                            || trimmed.eq_ignore_ascii_case("default")
                         {
                             None
                         } else {

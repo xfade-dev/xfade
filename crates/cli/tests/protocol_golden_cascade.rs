@@ -377,10 +377,9 @@ async fn test_agy_gemini_inbound_transcodes_to_chat_upstream() {
         .set_routes(&["oai".to_string()], Some("gpt-5"), "chat")
         .unwrap();
 
-    let local_token =
-        xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
-            .get_or_create(ToolKind::Agy)
-            .unwrap();
+    let local_token = xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
+        .get_or_create(ToolKind::Agy)
+        .unwrap();
     let proxy_url = spawn_proxy(core).await;
 
     let client = reqwest::Client::new();

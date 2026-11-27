@@ -262,9 +262,8 @@ impl SemanticDetector {
                                 val.get("candidates").and_then(|c| c.as_array())
                             {
                                 for cand in candidates {
-                                    if let Some(parts) = cand
-                                        .pointer("/content/parts")
-                                        .and_then(|p| p.as_array())
+                                    if let Some(parts) =
+                                        cand.pointer("/content/parts").and_then(|p| p.as_array())
                                     {
                                         for part in parts {
                                             if let Some(t) =
