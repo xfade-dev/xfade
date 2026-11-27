@@ -19,6 +19,13 @@ import {
   setModelMapping,
   removeModelMapping,
   setModelsMerge,
+  listModelMapTemplates,
+  previewModelMapTemplate,
+  applyModelMapTemplate,
+  listModelMapProfiles,
+  saveModelMapProfile,
+  switchModelMapProfile,
+  deleteModelMapProfile,
   securityDoctor,
   securityDoctorFix,
   stats,
@@ -70,6 +77,20 @@ describe("api", () => {
     expect(await setModelMapping("sonnet", "ds", "deepseek-chat")).toBe("set_model_mapping");
     expect(await removeModelMapping("sonnet", "ds")).toBe("remove_model_mapping");
     expect(await setModelsMerge(true)).toBe("set_models_merge");
+    expect(await listModelMapTemplates()).toBe("list_model_map_templates");
+    expect(await previewModelMapTemplate("claude-code-standard", "ds", true)).toBe(
+      "preview_model_map_template"
+    );
+    expect(
+      await applyModelMapTemplate(
+        [{ alias: "sonnet", provider_id: "ds", upstream_model: "deepseek-chat" }],
+        true
+      )
+    ).toBe("apply_model_map_template");
+    expect(await listModelMapProfiles()).toBe("list_model_map_profiles");
+    expect(await saveModelMapProfile("daily", "desc")).toBe("save_model_map_profile");
+    expect(await switchModelMapProfile("daily", true)).toBe("switch_model_map_profile");
+    expect(await deleteModelMapProfile("daily")).toBe("delete_model_map_profile");
   });
 
   it("security doctor wrappers call expected commands", async () => {

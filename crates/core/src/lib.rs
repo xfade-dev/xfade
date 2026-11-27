@@ -6,6 +6,7 @@ pub mod daemon_spawner;
 pub mod error;
 pub mod fsutil;
 pub mod launch;
+pub mod model_map_templates;
 pub mod models;
 pub mod presets;
 pub mod proxy;

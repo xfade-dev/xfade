@@ -173,12 +173,31 @@ pub struct ModelMapEdit {
 }
 
 #[derive(Debug, Clone)]
+pub struct TemplatePickerState {
+    pub templates: Vec<xfade_core::model_map_templates::ModelMapTemplate>,
+    pub template_idx: usize,
+    pub provider_idx: usize,
+    pub merge: bool,
+    pub preview: Vec<xfade_core::model_map_templates::ResolvedTemplateRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfilePickerState {
+    pub profiles: Vec<xfade_core::models::ModelMapProfile>,
+    pub selected: usize,
+    pub merge: bool,
+    pub saving_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelMapState {
     pub models_merge: bool,
     pub selected_row: usize,
     pub rows: Vec<(String, String, String)>,
     pub editing: Option<ModelMapEdit>,
     pub provider_choices: Vec<String>,
+    pub template_picker: Option<TemplatePickerState>,
+    pub profile_picker: Option<ProfilePickerState>,
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +620,8 @@ impl App {
             rows,
             editing: None,
             provider_choices,
+            template_picker: None,
+            profile_picker: None,
         });
         self.message = None;
     }
@@ -701,6 +722,382 @@ impl App {
                 } else {
                     "models-merge: OFF (first-success passthrough)".into()
                 });
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    fn compute_template_preview(
+        providers: &[Provider],
+        model_probes: &HashMap<String, ModelProbeResult>,
+        provider_choices: &[String],
+        tpl: &xfade_core::model_map_templates::ModelMapTemplate,
+        provider_idx: usize,
+    ) -> Vec<xfade_core::model_map_templates::ResolvedTemplateRule> {
+        let pid = provider_choices
+            .get(provider_idx)
+            .map(String::as_str)
+            .unwrap_or("*");
+        let target_provider = if pid == "*" {
+            None
+        } else {
+            providers.iter().find(|p| p.id == pid)
+        };
+        let discovered = Self::models_for_provider_choice(model_probes, pid);
+        xfade_core::model_map_templates::resolve_template_with_provider(
+            tpl,
+            target_provider,
+            pid,
+            &discovered,
+        )
+    }
+
+    pub fn model_map_open_template(&mut self) {
+        let templates = xfade_core::model_map_templates::all_templates();
+        if templates.is_empty() {
+            self.message = Some("No model map templates available".into());
+            return;
+        }
+        let default_pid = self
+            .selected_provider()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "*".to_string());
+        let Some(mm) = self.model_map.as_mut() else {
+            return;
+        };
+        let provider_idx = mm
+            .provider_choices
+            .iter()
+            .position(|p| p == &default_pid)
+            .unwrap_or(0);
+        let preview = Self::compute_template_preview(
+            &self.providers,
+            &self.model_probes,
+            &mm.provider_choices,
+            &templates[0],
+            provider_idx,
+        );
+        mm.profile_picker = None;
+        mm.template_picker = Some(TemplatePickerState {
+            templates,
+            template_idx: 0,
+            provider_idx,
+            merge: false,
+            preview,
+        });
+    }
+
+    pub fn model_map_close_template(&mut self) {
+        if let Some(mm) = self.model_map.as_mut() {
+            mm.template_picker = None;
+        }
+    }
+
+    pub fn model_map_template_refresh_preview(&mut self) {
+        let Some(mm) = self.model_map.as_mut() else {
+            return;
+        };
+        let Some(tp) = mm.template_picker.as_mut() else {
+            return;
+        };
+        if let Some(tpl) = tp.templates.get(tp.template_idx) {
+            tp.preview = Self::compute_template_preview(
+                &self.providers,
+                &self.model_probes,
+                &mm.provider_choices,
+                tpl,
+                tp.provider_idx,
+            );
+        }
+    }
+
+    pub fn model_map_template_step_tpl(&mut self, forward: bool) {
+        let Some(mm) = self.model_map.as_mut() else {
+            return;
+        };
+        let Some(tp) = mm.template_picker.as_mut() else {
+            return;
+        };
+        if tp.templates.is_empty() {
+            return;
+        }
+        let n = tp.templates.len();
+        tp.template_idx = if forward {
+            (tp.template_idx + 1) % n
+        } else {
+            (tp.template_idx + n - 1) % n
+        };
+        self.model_map_template_refresh_preview();
+    }
+
+    pub fn model_map_template_cycle_provider(&mut self, forward: bool) {
+        let Some(mm) = self.model_map.as_mut() else {
+            return;
+        };
+        let Some(tp) = mm.template_picker.as_mut() else {
+            return;
+        };
+        if mm.provider_choices.is_empty() {
+            return;
+        }
+        let n = mm.provider_choices.len();
+        tp.provider_idx = if forward {
+            (tp.provider_idx + 1) % n
+        } else {
+            (tp.provider_idx + n - 1) % n
+        };
+        self.model_map_template_refresh_preview();
+    }
+
+    pub fn model_map_template_toggle_mode(&mut self) {
+        if let Some(tp) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.template_picker.as_mut())
+        {
+            tp.merge = !tp.merge;
+        }
+    }
+
+    pub fn model_map_template_apply(&mut self, core: &Core) {
+        let Some(tp) = self
+            .model_map
+            .as_ref()
+            .and_then(|mm| mm.template_picker.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let entries: Vec<(String, String, String)> = tp
+            .preview
+            .iter()
+            .filter(|r| !r.upstream_model.trim().is_empty())
+            .map(|r| {
+                (
+                    r.client_alias.clone(),
+                    r.provider_id.clone(),
+                    r.upstream_model.clone(),
+                )
+            })
+            .collect();
+        match core.db().apply_model_mappings_batch(&entries, !tp.merge) {
+            Ok(count) => {
+                let (rows, models_merge) = Self::load_model_map_rows(core);
+                if let Some(mm) = self.model_map.as_mut() {
+                    mm.rows = rows;
+                    mm.models_merge = models_merge;
+                    mm.selected_row = 0;
+                    mm.template_picker = None;
+                }
+                let tpl_id = tp
+                    .templates
+                    .get(tp.template_idx)
+                    .map(|t| t.id.as_str())
+                    .unwrap_or("template");
+                self.message = Some(format!(
+                    "Applied {count} rule(s) from '{tpl_id}' ({})",
+                    if tp.merge { "merge" } else { "replace" }
+                ));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    pub fn model_map_open_profile(&mut self, core: &Core) {
+        let profiles = match core.db().list_model_map_profiles() {
+            Ok(p) => p,
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+                return;
+            }
+        };
+        let selected = profiles.iter().position(|p| p.is_active).unwrap_or(0);
+        if let Some(mm) = self.model_map.as_mut() {
+            mm.template_picker = None;
+            mm.profile_picker = Some(ProfilePickerState {
+                profiles,
+                selected,
+                merge: false,
+                saving_name: None,
+            });
+        }
+    }
+
+    pub fn model_map_close_profile(&mut self) {
+        if let Some(mm) = self.model_map.as_mut() {
+            mm.profile_picker = None;
+        }
+    }
+
+    pub fn model_map_profile_step(&mut self, forward: bool) {
+        if let Some(pp) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+        {
+            if pp.profiles.is_empty() {
+                return;
+            }
+            let n = pp.profiles.len();
+            pp.selected = if forward {
+                (pp.selected + 1) % n
+            } else {
+                (pp.selected + n - 1) % n
+            };
+        }
+    }
+
+    pub fn model_map_profile_toggle_mode(&mut self) {
+        if let Some(pp) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+        {
+            pp.merge = !pp.merge;
+        }
+    }
+
+    pub fn model_map_profile_switch(&mut self, core: &Core) {
+        let Some((name, merge)) = self
+            .model_map
+            .as_ref()
+            .and_then(|mm| mm.profile_picker.as_ref())
+            .and_then(|pp| {
+                pp.profiles
+                    .get(pp.selected)
+                    .map(|p| (p.name.clone(), pp.merge))
+            })
+        else {
+            return;
+        };
+        match core.db().switch_model_map_profile(&name, !merge) {
+            Ok(count) => {
+                let (rows, models_merge) = Self::load_model_map_rows(core);
+                if let Some(mm) = self.model_map.as_mut() {
+                    mm.rows = rows;
+                    mm.models_merge = models_merge;
+                    mm.selected_row = 0;
+                    mm.profile_picker = None;
+                }
+                self.message = Some(format!(
+                    "Switched to profile '{name}' ({count} rule(s), {})",
+                    if merge { "merge" } else { "replace" }
+                ));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    pub fn model_map_profile_start_save(&mut self) {
+        if let Some(pp) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+        {
+            pp.saving_name = Some(String::new());
+        }
+    }
+
+    pub fn model_map_profile_cancel_save(&mut self) {
+        if let Some(pp) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+        {
+            pp.saving_name = None;
+        }
+    }
+
+    pub fn model_map_profile_save_char(&mut self, c: char) {
+        if let Some(s) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+            .and_then(|pp| pp.saving_name.as_mut())
+        {
+            s.push(c);
+        }
+    }
+
+    pub fn model_map_profile_save_backspace(&mut self) {
+        if let Some(s) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+            .and_then(|pp| pp.saving_name.as_mut())
+        {
+            s.pop();
+        }
+    }
+
+    pub fn model_map_profile_commit_save(&mut self, core: &Core) {
+        let Some(name) = self
+            .model_map
+            .as_mut()
+            .and_then(|mm| mm.profile_picker.as_mut())
+            .and_then(|pp| pp.saving_name.take())
+        else {
+            return;
+        };
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            self.message = Some("Profile name cannot be empty".into());
+            return;
+        }
+        match core.db().save_model_map_profile(&trimmed, "", None) {
+            Ok(()) => {
+                if let Ok(profiles) = core.db().list_model_map_profiles() {
+                    let sel = profiles.iter().position(|p| p.name == trimmed).unwrap_or(0);
+                    if let Some(pp) = self
+                        .model_map
+                        .as_mut()
+                        .and_then(|mm| mm.profile_picker.as_mut())
+                    {
+                        pp.profiles = profiles;
+                        pp.selected = sel;
+                    }
+                }
+                self.message = Some(format!("Saved profile '{trimmed}'"));
+            }
+            Err(e) => {
+                self.message = Some(format!("Error: {e}"));
+            }
+        }
+    }
+
+    pub fn model_map_profile_delete(&mut self, core: &Core) {
+        let Some(name) = self
+            .model_map
+            .as_ref()
+            .and_then(|mm| mm.profile_picker.as_ref())
+            .and_then(|pp| pp.profiles.get(pp.selected).map(|p| p.name.clone()))
+        else {
+            return;
+        };
+        match core.db().delete_model_map_profile(&name) {
+            Ok(true) => {
+                if let Ok(profiles) = core.db().list_model_map_profiles() {
+                    if let Some(pp) = self
+                        .model_map
+                        .as_mut()
+                        .and_then(|mm| mm.profile_picker.as_mut())
+                    {
+                        pp.profiles = profiles;
+                        if pp.selected >= pp.profiles.len() {
+                            pp.selected = pp.profiles.len().saturating_sub(1);
+                        }
+                    }
+                }
+                self.message = Some(format!("Deleted profile '{name}'"));
+            }
+            Ok(false) => {
+                self.message = Some("Profile not found".into());
             }
             Err(e) => {
                 self.message = Some(format!("Error: {e}"));
@@ -2558,5 +2955,69 @@ mod tests {
                 .provider_id,
             initial
         );
+    }
+
+    #[test]
+    fn model_map_template_and_profile_overlays_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(&dir);
+        core.add_provider(
+            Provider::new(
+                "ds",
+                ToolKind::ClaudeCode,
+                Some("https://api.deepseek.com".into()),
+            ),
+            Some("sk-ds"),
+        )
+        .unwrap();
+
+        let mut app = App::new(ToolKind::ClaudeCode, &core);
+        app.model_probes.insert(
+            "ds".into(),
+            ModelProbeResult::Models(vec!["deepseek-chat".into(), "deepseek-reasoner".into()]),
+        );
+        app.start_model_map(&core);
+
+        // Open template picker (defaults to selected provider "ds"), apply
+        app.model_map_open_template();
+        assert!(app.model_map.as_ref().unwrap().template_picker.is_some());
+        app.model_map_template_apply(&core);
+        assert!(app.model_map.as_ref().unwrap().template_picker.is_none());
+        assert_eq!(app.model_map.as_ref().unwrap().rows.len(), 6);
+
+        // Open profile picker, save, clear, switch back, delete
+        app.model_map_open_profile(&core);
+        app.model_map_profile_start_save();
+        for c in "ds-fast".chars() {
+            app.model_map_profile_save_char(c);
+        }
+        app.model_map_profile_commit_save(&core);
+        assert_eq!(
+            app.model_map
+                .as_ref()
+                .unwrap()
+                .profile_picker
+                .as_ref()
+                .unwrap()
+                .profiles
+                .len(),
+            1
+        );
+
+        core.db().clear_model_mappings().unwrap();
+        app.model_map_profile_switch(&core);
+        assert_eq!(app.model_map.as_ref().unwrap().rows.len(), 6);
+
+        app.model_map_open_profile(&core);
+        app.model_map_profile_delete(&core);
+        assert!(app
+            .model_map
+            .as_ref()
+            .unwrap()
+            .profile_picker
+            .as_ref()
+            .unwrap()
+            .profiles
+            .is_empty());
     }
 }

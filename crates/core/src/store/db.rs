@@ -1,5 +1,5 @@
 use crate::error::{CoreError, Result};
-use crate::models::{Provider, ToolKind};
+use crate::models::{ModelMapProfile, Provider, ToolKind};
 use rusqlite::{params, Connection};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -363,6 +363,13 @@ impl Database {
                 provider_id TEXT NOT NULL,
                 upstream_model TEXT NOT NULL,
                 PRIMARY KEY (client_model, provider_id)
+            );
+            CREATE TABLE IF NOT EXISTS model_map_profiles (
+                name TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                mappings_json TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS model_pricing (
                 model_pattern TEXT NOT NULL,
@@ -1165,6 +1172,177 @@ impl Database {
     pub fn clear_model_mappings(&self) -> Result<()> {
         self.conn().execute("DELETE FROM model_mappings", [])?;
         Ok(())
+    }
+
+    /// Apply a batch of `(client_model, provider_id, upstream_model)` rules in a single transaction.
+    /// When `replace` is true, existing rules are cleared first.
+    pub fn apply_model_mappings_batch(
+        &self,
+        entries: &[(String, String, String)],
+        replace: bool,
+    ) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if replace {
+            tx.execute("DELETE FROM model_mappings", [])?;
+        }
+        let mut count = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO model_mappings (client_model, provider_id, upstream_model)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(client_model, provider_id) DO UPDATE SET upstream_model = excluded.upstream_model",
+            )?;
+            for (alias, provider_id, upstream_model) in entries {
+                let a = alias.trim();
+                let p = provider_id.trim();
+                let u = upstream_model.trim();
+                if a.is_empty() || p.is_empty() || u.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![a, p, u])?;
+                count += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// List all saved model map profiles ordered by name.
+    pub fn list_model_map_profiles(&self) -> Result<Vec<ModelMapProfile>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, description, mappings_json, is_active, updated_at
+             FROM model_map_profiles ORDER BY name",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mappings_json: String = row.get(2)?;
+            let mappings: ModelMappings = serde_json::from_str(&mappings_json)?;
+            out.push(ModelMapProfile {
+                name: row.get(0)?,
+                description: row.get(1)?,
+                mappings,
+                is_active: row.get::<_, i64>(3)? != 0,
+                updated_at: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single model map profile by name.
+    pub fn get_model_map_profile(&self, name: &str) -> Result<Option<ModelMapProfile>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, description, mappings_json, is_active, updated_at
+             FROM model_map_profiles WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query(params![name.trim()])?;
+        match rows.next()? {
+            Some(row) => {
+                let mappings_json: String = row.get(2)?;
+                let mappings: ModelMappings = serde_json::from_str(&mappings_json)?;
+                Ok(Some(ModelMapProfile {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    mappings,
+                    is_active: row.get::<_, i64>(3)? != 0,
+                    updated_at: row.get(4)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Save (or overwrite) a named model map profile.
+    /// When `mappings` is `None`, snapshots the current `model_mappings` table.
+    pub fn save_model_map_profile(
+        &self,
+        name: &str,
+        description: &str,
+        mappings: Option<&ModelMappings>,
+    ) -> Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(CoreError::ConfigParse {
+                path: "model_map_profile".into(),
+                msg: "profile name cannot be empty".into(),
+            });
+        }
+        let snapshot = match mappings {
+            Some(m) => m.clone(),
+            None => self.get_model_mappings()?,
+        };
+        let json = serde_json::to_string(&snapshot)?;
+        let now =
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|e| CoreError::ConfigParse {
+                    path: "time".into(),
+                    msg: e.to_string(),
+                })?;
+        self.conn().execute(
+            "INSERT INTO model_map_profiles (name, description, mappings_json, is_active, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+                description = excluded.description,
+                mappings_json = excluded.mappings_json,
+                updated_at = excluded.updated_at",
+            params![trimmed, description.trim(), json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Switch to a saved model map profile, applying its rules to `model_mappings`
+    /// and marking it active.
+    pub fn switch_model_map_profile(&self, name: &str, replace: bool) -> Result<usize> {
+        let trimmed = name.trim();
+        let profile =
+            self.get_model_map_profile(trimmed)?
+                .ok_or_else(|| CoreError::ConfigParse {
+                    path: "model_map_profile".into(),
+                    msg: format!("profile '{trimmed}' not found"),
+                })?;
+        let mut entries = Vec::new();
+        for (alias, prov_map) in &profile.mappings {
+            for (prov, upstream) in prov_map {
+                entries.push((alias.clone(), prov.clone(), upstream.clone()));
+            }
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if replace {
+            tx.execute("DELETE FROM model_mappings", [])?;
+        }
+        let mut count = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO model_mappings (client_model, provider_id, upstream_model)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(client_model, provider_id) DO UPDATE SET upstream_model = excluded.upstream_model",
+            )?;
+            for (a, p, u) in &entries {
+                stmt.execute(params![a, p, u])?;
+                count += 1;
+            }
+        }
+        tx.execute("UPDATE model_map_profiles SET is_active = 0", [])?;
+        tx.execute(
+            "UPDATE model_map_profiles SET is_active = 1 WHERE name = ?1",
+            params![trimmed],
+        )?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Delete a saved model map profile by name.
+    pub fn delete_model_map_profile(&self, name: &str) -> Result<bool> {
+        let affected = self.conn().execute(
+            "DELETE FROM model_map_profiles WHERE name = ?1",
+            params![name.trim()],
+        )?;
+        Ok(affected > 0)
     }
 
     /// Cache a repo map (analyzer fingerprint + payload) keyed by root path.
@@ -2507,6 +2685,62 @@ mod tests {
             .unwrap();
         db.clear_model_mappings().unwrap();
         assert!(db.get_model_mappings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_model_map_profiles_and_batch_apply() {
+        let db = Database::open_memory().unwrap();
+        let applied = db
+            .apply_model_mappings_batch(
+                &[
+                    ("sonnet".into(), "ds".into(), "deepseek-chat".into()),
+                    ("opus".into(), "ds".into(), "deepseek-reasoner".into()),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(applied, 2);
+        db.save_model_map_profile("daily-ds", "DeepSeek daily", None)
+            .unwrap();
+
+        // Replace with another mapping set and save second profile
+        db.apply_model_mappings_batch(&[("sonnet".into(), "glm".into(), "glm-4.5".into())], true)
+            .unwrap();
+        db.save_model_map_profile("glm-only", "GLM fallback", None)
+            .unwrap();
+
+        // Switch back to daily-ds with replace=true
+        let switched = db.switch_model_map_profile("daily-ds", true).unwrap();
+        assert_eq!(switched, 2);
+        let active_maps = db.get_model_mappings().unwrap();
+        assert_eq!(active_maps.len(), 2);
+        assert_eq!(active_maps["sonnet"]["ds"], "deepseek-chat");
+
+        let profiles = db.list_model_map_profiles().unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .find(|p| p.name == "daily-ds")
+                .unwrap()
+                .is_active
+        );
+        assert!(
+            !profiles
+                .iter()
+                .find(|p| p.name == "glm-only")
+                .unwrap()
+                .is_active
+        );
+
+        // Merge second profile on top of daily-ds
+        db.switch_model_map_profile("glm-only", false).unwrap();
+        let merged = db.get_model_mappings().unwrap();
+        assert_eq!(merged["sonnet"]["ds"], "deepseek-chat");
+        assert_eq!(merged["sonnet"]["glm"], "glm-4.5");
+
+        assert!(db.delete_model_map_profile("glm-only").unwrap());
+        assert!(!db.delete_model_map_profile("glm-only").unwrap());
     }
 
     #[test]

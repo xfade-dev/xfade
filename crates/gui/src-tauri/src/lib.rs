@@ -52,6 +52,13 @@ pub fn run() {
             commands::set_model_mapping,
             commands::remove_model_mapping,
             commands::set_models_merge,
+            commands::list_model_map_templates,
+            commands::preview_model_map_template,
+            commands::apply_model_map_template,
+            commands::list_model_map_profiles,
+            commands::save_model_map_profile,
+            commands::switch_model_map_profile,
+            commands::delete_model_map_profile,
             commands::security_doctor,
             commands::security_doctor_fix,
         ])

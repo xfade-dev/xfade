@@ -472,6 +472,67 @@ enum ModelMapCmd {
     },
     /// Clear all model mappings across all aliases
     Clear,
+    /// Manage built-in and custom model map templates
+    Template {
+        #[command(subcommand)]
+        cmd: ModelMapTemplateCmd,
+    },
+    /// Manage saved model map profiles for quick switching
+    Profile {
+        #[command(subcommand)]
+        cmd: ModelMapProfileCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelMapTemplateCmd {
+    /// List all built-in and custom model map templates
+    #[command(alias = "list")]
+    Ls,
+    /// Preview or apply a model map template to a provider (or '*')
+    Apply {
+        template_id: String,
+        /// Target provider ID or '*'
+        #[arg(long, default_value = "*")]
+        provider: String,
+        /// Probe the provider's /v1/models endpoint for automatic matching
+        #[arg(long)]
+        probe: bool,
+        /// Replace all existing model mappings (default when --merge is not set)
+        #[arg(long, conflicts_with = "merge")]
+        replace: bool,
+        /// Merge generated rules into existing model mappings
+        #[arg(long, conflicts_with = "replace")]
+        merge: bool,
+        /// Preview matched rules without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+        /// Also save the resulting mappings as a named profile
+        #[arg(long)]
+        save_profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelMapProfileCmd {
+    /// List all saved model map profiles
+    #[command(alias = "list")]
+    Ls,
+    /// Snapshot current model mappings into a named profile
+    Save {
+        name: String,
+        #[arg(long, default_value = "")]
+        desc: String,
+    },
+    /// Switch to a saved profile (replaces active mappings by default)
+    Use {
+        name: String,
+        /// Merge profile rules into existing mappings instead of replacing
+        #[arg(long)]
+        merge: bool,
+    },
+    /// Delete a saved profile
+    Rm { name: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -2062,6 +2123,188 @@ fn cmd_model_map(core: &Core, cmd: ModelMapCmd) -> Result<(), CoreError> {
             println!("Cleared all model mappings.");
             Ok(())
         }
+        ModelMapCmd::Template { cmd } => cmd_model_map_template(core, cmd),
+        ModelMapCmd::Profile { cmd } => cmd_model_map_profile(core, cmd),
+    }
+}
+
+fn cmd_model_map_template(core: &Core, cmd: ModelMapTemplateCmd) -> Result<(), CoreError> {
+    use xfade_core::model_map_templates::{
+        all_templates, find_template, resolve_template_with_provider, MatchSource,
+    };
+    match cmd {
+        ModelMapTemplateCmd::Ls => {
+            let templates = all_templates();
+            println!("{:<22} {:<12} {:<6} DESCRIPTION", "ID", "CLIENT", "RULES");
+            println!("{}", "─".repeat(78));
+            for t in templates {
+                let tool = t
+                    .client_tool
+                    .map(|k| k.as_str().to_string())
+                    .unwrap_or_else(|| "any".to_string());
+                println!(
+                    "{:<22} {:<12} {:<6} {}",
+                    t.id,
+                    tool,
+                    t.rules.len(),
+                    t.description
+                );
+            }
+            Ok(())
+        }
+        ModelMapTemplateCmd::Apply {
+            template_id,
+            provider,
+            probe,
+            replace: _,
+            merge,
+            dry_run,
+            save_profile,
+        } => {
+            let tpl = find_template(&template_id).ok_or_else(|| CoreError::ConfigParse {
+                path: "model-map template".into(),
+                msg: format!(
+                    "unknown template '{}'; run `xfade model-map template ls`",
+                    template_id
+                ),
+            })?;
+            let provider = provider.trim().to_string();
+            let target_provider = if provider == "*" {
+                None
+            } else {
+                core.list(None)?.into_iter().find(|p| p.id == provider)
+            };
+
+            let discovered = if probe {
+                let Some(p) = target_provider.as_ref() else {
+                    return Err(CoreError::ProviderNotFound(format!(
+                        "'{provider}' cannot be probed (must be a registered provider)"
+                    )));
+                };
+                let (base_url, proto, key) = core
+                    .resolve_probe_params(p)
+                    .map_err(|e| CoreError::Proxy(format!("probe params failed: {e}")))?;
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| CoreError::Proxy(format!("failed to start tokio runtime: {e}")))?;
+                rt.block_on(xfade_core::service::probe_models_http(
+                    &base_url,
+                    proto,
+                    key.as_deref(),
+                    std::time::Duration::from_secs(5),
+                ))
+                .map_err(|e| CoreError::Proxy(format!("probe failed: {e}")))?
+            } else {
+                Vec::new()
+            };
+
+            let resolved = resolve_template_with_provider(
+                &tpl,
+                target_provider.as_ref(),
+                &provider,
+                &discovered,
+            );
+
+            println!(
+                "{:<30} {:<14} {:<30} {:<10} SOURCE",
+                "ALIAS", "PROVIDER", "UPSTREAM MODEL", "TIER"
+            );
+            println!("{}", "─".repeat(98));
+            for r in &resolved {
+                let src = match r.match_source {
+                    MatchSource::ProbeExact => "probe_exact",
+                    MatchSource::ProbeTier => "probe_tier",
+                    MatchSource::Fallback => "fallback",
+                    MatchSource::Unmatched => "unmatched",
+                };
+                let model_disp = if r.upstream_model.is_empty() {
+                    "(unmatched)"
+                } else {
+                    r.upstream_model.as_str()
+                };
+                println!(
+                    "{:<30} {:<14} {:<30} {:<10} {}",
+                    r.client_alias,
+                    r.provider_id,
+                    model_disp,
+                    r.tier.label(),
+                    src
+                );
+            }
+
+            if dry_run {
+                println!("\n(dry-run: no changes written)");
+                return Ok(());
+            }
+
+            let entries: Vec<(String, String, String)> = resolved
+                .into_iter()
+                .filter(|r| !r.upstream_model.trim().is_empty())
+                .map(|r| (r.client_alias, r.provider_id, r.upstream_model))
+                .collect();
+            let count = core.db().apply_model_mappings_batch(&entries, !merge)?;
+            println!(
+                "\nApplied {count} rule(s) from template '{}' ({}).",
+                tpl.id,
+                if merge { "merge" } else { "replace" }
+            );
+            if let Some(prof_name) = save_profile {
+                core.db().save_model_map_profile(
+                    &prof_name,
+                    &format!("From template {}", tpl.id),
+                    None,
+                )?;
+                println!("Saved snapshot as profile '{}'.", prof_name.trim());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_model_map_profile(core: &Core, cmd: ModelMapProfileCmd) -> Result<(), CoreError> {
+    match cmd {
+        ModelMapProfileCmd::Ls => {
+            let profiles = core.db().list_model_map_profiles()?;
+            if profiles.is_empty() {
+                println!("(no saved profiles; use `xfade model-map profile save <name>`)");
+                return Ok(());
+            }
+            println!(
+                "{:<2} {:<20} {:<6} {:<22} DESCRIPTION",
+                "", "NAME", "RULES", "UPDATED"
+            );
+            println!("{}", "─".repeat(76));
+            for p in profiles {
+                let mark = if p.is_active { "*" } else { " " };
+                let rule_count: usize = p.mappings.values().map(|m| m.len()).sum();
+                println!(
+                    "{:<2} {:<20} {:<6} {:<22} {}",
+                    mark, p.name, rule_count, p.updated_at, p.description
+                );
+            }
+            Ok(())
+        }
+        ModelMapProfileCmd::Save { name, desc } => {
+            core.db().save_model_map_profile(&name, &desc, None)?;
+            println!("Saved current model mappings as profile '{}'.", name.trim());
+            Ok(())
+        }
+        ModelMapProfileCmd::Use { name, merge } => {
+            let count = core.db().switch_model_map_profile(&name, !merge)?;
+            println!(
+                "Switched to profile '{}' ({count} rule(s), {}).",
+                name.trim(),
+                if merge { "merge" } else { "replace" }
+            );
+            Ok(())
+        }
+        ModelMapProfileCmd::Rm { name } => {
+            if core.db().delete_model_map_profile(&name)? {
+                println!("Deleted profile '{}'.", name.trim());
+            } else {
+                println!("Profile '{}' not found.", name.trim());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3269,5 +3512,59 @@ mod tests {
         // 6. Clearing all
         cmd_model_map(&core, ModelMapCmd::Clear).unwrap();
         assert!(core.db().get_model_mappings().unwrap().is_empty());
+
+        // 7. Template ls & apply (with --dry-run and --save-profile)
+        cmd_model_map_template(&core, ModelMapTemplateCmd::Ls).unwrap();
+        cmd_model_map_template(
+            &core,
+            ModelMapTemplateCmd::Apply {
+                template_id: "claude-code-standard".into(),
+                provider: "deepseek".into(),
+                probe: false,
+                replace: true,
+                merge: false,
+                dry_run: true,
+                save_profile: None,
+            },
+        )
+        .unwrap();
+        assert!(core.db().get_model_mappings().unwrap().is_empty());
+
+        cmd_model_map_template(
+            &core,
+            ModelMapTemplateCmd::Apply {
+                template_id: "claude-code-standard".into(),
+                provider: "deepseek".into(),
+                probe: false,
+                replace: true,
+                merge: false,
+                dry_run: false,
+                save_profile: Some("ds-std".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(core.db().get_model_mappings().unwrap().len(), 6);
+        assert_eq!(core.db().list_model_map_profiles().unwrap().len(), 1);
+
+        // 8. Profile ls / save / use / rm
+        cmd_model_map_profile(&core, ModelMapProfileCmd::Ls).unwrap();
+        cmd_model_map(&core, ModelMapCmd::Clear).unwrap();
+        cmd_model_map_profile(
+            &core,
+            ModelMapProfileCmd::Use {
+                name: "ds-std".into(),
+                merge: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(core.db().get_model_mappings().unwrap().len(), 6);
+        cmd_model_map_profile(
+            &core,
+            ModelMapProfileCmd::Rm {
+                name: "ds-std".into(),
+            },
+        )
+        .unwrap();
+        assert!(core.db().list_model_map_profiles().unwrap().is_empty());
     }
 }

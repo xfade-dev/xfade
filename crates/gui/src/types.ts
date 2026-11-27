@@ -63,6 +63,39 @@ export interface ModelMapDto {
   models_merge: boolean;
 }
 
+export type ModelTier = "flagship" | "balanced" | "fast" | "aux";
+export type MatchSource = "probe_exact" | "probe_tier" | "fallback" | "unmatched";
+
+export interface ModelMapTemplateDto {
+  id: string;
+  name: string;
+  description: string;
+  client_tool: ToolKind | null;
+  rule_count: number;
+}
+
+export interface ResolvedTemplateRule {
+  client_alias: string;
+  provider_id: string;
+  upstream_model: string;
+  tier: ModelTier;
+  match_source: MatchSource;
+}
+
+export interface TemplatePreviewDto {
+  rules: ResolvedTemplateRule[];
+  discovered_models: string[];
+  probe_error: string | null;
+}
+
+export interface ModelMapProfileDto {
+  name: string;
+  description: string;
+  rule_count: number;
+  is_active: boolean;
+  updated_at: string;
+}
+
 export type TrustState = "Guarded" | "Direct" | "Exposed";
 export type CheckStatus = "Pass" | "Warn" | "Fail";
 

@@ -1,6 +1,6 @@
 use crate::dto::{
-    AddProviderInput, ConfigDto, ConfigInput, ModelMapDto, ModelMappingDto, PresetDto, ProxyStatus,
-    RoutesDto, UpdateProviderInput,
+    AddProviderInput, ConfigDto, ConfigInput, ModelMapDto, ModelMapProfileDto, ModelMapTemplateDto,
+    ModelMappingDto, PresetDto, ProxyStatus, RoutesDto, TemplatePreviewDto, UpdateProviderInput,
 };
 use crate::state::AppState;
 use std::collections::BTreeMap;
@@ -540,6 +540,161 @@ pub async fn remove_model_mapping(
 pub async fn set_models_merge(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
     let core = state.core.clone();
     tauri::async_runtime::spawn_blocking(move || core.db().set_models_merge_enabled(enabled))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn list_model_map_templates() -> CmdResult<Vec<ModelMapTemplateDto>> {
+    Ok(xfade_core::model_map_templates::all_templates()
+        .into_iter()
+        .map(|t| ModelMapTemplateDto {
+            id: t.id,
+            name: t.name,
+            description: t.description,
+            client_tool: t.client_tool,
+            rule_count: t.rules.len(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn preview_model_map_template(
+    state: State<'_, AppState>,
+    template_id: String,
+    provider_id: String,
+    probe: Option<bool>,
+) -> CmdResult<TemplatePreviewDto> {
+    let tpl = xfade_core::model_map_templates::find_template(&template_id)
+        .ok_or_else(|| format!("unknown template: {template_id}"))?;
+    let provider_id = provider_id.trim().to_string();
+    let should_probe = probe.unwrap_or(true) && provider_id != "*";
+
+    let core = state.core.clone();
+    let pid_lookup = provider_id.clone();
+    let (target_provider, probe_params) = tauri::async_runtime::spawn_blocking(move || {
+        let target = if pid_lookup == "*" {
+            None
+        } else {
+            core.list(None)
+                .map_err(err)?
+                .into_iter()
+                .find(|p| p.id == pid_lookup)
+        };
+        let params = match (should_probe, target.as_ref()) {
+            (true, Some(p)) => Some(core.resolve_probe_params(p).map_err(|e| e.to_string())),
+            _ => None,
+        };
+        Ok::<_, String>((target, params))
+    })
+    .await
+    .map_err(err)??;
+
+    let mut discovered_models = Vec::new();
+    let mut probe_error = None;
+    if let Some(params_res) = probe_params {
+        match params_res {
+            Ok((base_url, proto, key)) => {
+                match probe_models_http(&base_url, proto, key.as_deref(), Duration::from_secs(5))
+                    .await
+                {
+                    Ok(models) => discovered_models = models,
+                    Err(e) => probe_error = Some(e),
+                }
+            }
+            Err(e) => probe_error = Some(e),
+        }
+    }
+
+    let rules = xfade_core::model_map_templates::resolve_template_with_provider(
+        &tpl,
+        target_provider.as_ref(),
+        &provider_id,
+        &discovered_models,
+    );
+
+    Ok(TemplatePreviewDto {
+        rules,
+        discovered_models,
+        probe_error,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_model_map_template(
+    state: State<'_, AppState>,
+    entries: Vec<ModelMappingDto>,
+    replace: bool,
+) -> CmdResult<usize> {
+    let core = state.core.clone();
+    let pairs: Vec<(String, String, String)> = entries
+        .into_iter()
+        .map(|e| (e.alias, e.provider_id, e.upstream_model))
+        .collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        core.db().apply_model_mappings_batch(&pairs, replace)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn list_model_map_profiles(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<ModelMapProfileDto>> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profiles = core.db().list_model_map_profiles().map_err(err)?;
+        Ok(profiles
+            .into_iter()
+            .map(|p| ModelMapProfileDto {
+                rule_count: p.mappings.values().map(|m| m.len()).sum(),
+                name: p.name,
+                description: p.description,
+                is_active: p.is_active,
+                updated_at: p.updated_at,
+            })
+            .collect())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn save_model_map_profile(
+    state: State<'_, AppState>,
+    name: String,
+    description: Option<String>,
+) -> CmdResult<()> {
+    let core = state.core.clone();
+    let desc = description.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        core.db().save_model_map_profile(&name, &desc, None)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn switch_model_map_profile(
+    state: State<'_, AppState>,
+    name: String,
+    replace: bool,
+) -> CmdResult<usize> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core.db().switch_model_map_profile(&name, replace))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn delete_model_map_profile(state: State<'_, AppState>, name: String) -> CmdResult<bool> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core.db().delete_model_map_profile(&name))
         .await
         .map_err(err)?
         .map_err(err)

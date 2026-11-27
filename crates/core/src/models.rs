@@ -106,6 +106,16 @@ pub type ProviderModelMap = std::collections::BTreeMap<String, String>;
 /// Global client model alias mapping dictionary: client_model -> (provider_id -> upstream_model).
 pub type ModelMappings = std::collections::BTreeMap<String, ProviderModelMap>;
 
+/// Named snapshot of [`ModelMappings`] for quick profile switching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelMapProfile {
+    pub name: String,
+    pub description: String,
+    pub mappings: ModelMappings,
+    pub is_active: bool,
+    pub updated_at: String,
+}
+
 impl ProviderProtocol {
     pub fn as_str(&self) -> &'static str {
         match self {

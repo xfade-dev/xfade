@@ -175,6 +175,7 @@ fn event_loop(
             model_drained = true;
         }
         if model_drained {
+            app.model_map_template_refresh_preview();
             dirty = true;
             if app.model_probing.is_empty() {
                 let n = mprobe_ok + mprobe_fail;
@@ -275,6 +276,14 @@ fn event_loop(
                 .model_map
                 .as_ref()
                 .is_some_and(|mm| mm.editing.is_some());
+            let in_template = app
+                .model_map
+                .as_ref()
+                .is_some_and(|mm| mm.template_picker.is_some());
+            let in_profile = app
+                .model_map
+                .as_ref()
+                .is_some_and(|mm| mm.profile_picker.is_some());
             if is_editing {
                 match key.code {
                     KeyCode::Esc => app.cancel_edit(),
@@ -287,6 +296,44 @@ fn event_loop(
                     KeyCode::Char(c) => app.edit_char(c),
                     _ => {}
                 }
+            } else if in_template {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.model_map_close_template(),
+                    KeyCode::Char('j') | KeyCode::Down => app.model_map_template_step_tpl(true),
+                    KeyCode::Char('k') | KeyCode::Up => app.model_map_template_step_tpl(false),
+                    KeyCode::Left => app.model_map_template_cycle_provider(false),
+                    KeyCode::Right => app.model_map_template_cycle_provider(true),
+                    KeyCode::Char(' ') => app.model_map_template_toggle_mode(),
+                    KeyCode::Char('p') => start_model_probes(core, &mut app, &model_probe_tx),
+                    KeyCode::Enter => app.model_map_template_apply(core),
+                    _ => {}
+                }
+            } else if in_profile {
+                let saving = app
+                    .model_map
+                    .as_ref()
+                    .and_then(|mm| mm.profile_picker.as_ref())
+                    .is_some_and(|pp| pp.saving_name.is_some());
+                if saving {
+                    match key.code {
+                        KeyCode::Esc => app.model_map_profile_cancel_save(),
+                        KeyCode::Enter => app.model_map_profile_commit_save(core),
+                        KeyCode::Backspace => app.model_map_profile_save_backspace(),
+                        KeyCode::Char(c) => app.model_map_profile_save_char(c),
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => app.model_map_close_profile(),
+                        KeyCode::Char('j') | KeyCode::Down => app.model_map_profile_step(true),
+                        KeyCode::Char('k') | KeyCode::Up => app.model_map_profile_step(false),
+                        KeyCode::Char(' ') => app.model_map_profile_toggle_mode(),
+                        KeyCode::Enter => app.model_map_profile_switch(core),
+                        KeyCode::Char('s') => app.model_map_profile_start_save(),
+                        KeyCode::Char('d') => app.model_map_profile_delete(core),
+                        _ => {}
+                    }
+                }
             } else {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => app.cancel_edit(),
@@ -296,6 +343,8 @@ fn event_loop(
                     KeyCode::Char('e') | KeyCode::Enter => app.model_map_start_edit(),
                     KeyCode::Char('d') => app.model_map_delete(core),
                     KeyCode::Char(' ') => app.model_map_toggle_merge(core),
+                    KeyCode::Char('t') => app.model_map_open_template(),
+                    KeyCode::Char('p') => app.model_map_open_profile(core),
                     _ => {}
                 }
             }

@@ -1185,6 +1185,119 @@ fn draw_model_map(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
+    if let Some(tp) = mm.template_picker.as_ref() {
+        let tpl = tp.templates.get(tp.template_idx);
+        let tpl_name = tpl.map(|t| t.name.as_str()).unwrap_or("-");
+        let tpl_desc = tpl.map(|t| t.description.as_str()).unwrap_or("");
+        let prov = mm
+            .provider_choices
+            .get(tp.provider_idx)
+            .map(String::as_str)
+            .unwrap_or("*");
+        let mode_str = if tp.merge {
+            "Merge (keep existing)"
+        } else {
+            "Replace (overwrite all)"
+        };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  Template: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    tpl_name,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({}/{})", tp.template_idx + 1, tp.templates.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Provider: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(prov, Style::default().fg(Color::Cyan)),
+                Span::styled("   Mode: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(mode_str, Style::default().fg(Color::Green)),
+            ]),
+            Line::from(Span::styled(
+                format!("  {tpl_desc}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+        ];
+        for r in &tp.preview {
+            let (src_label, src_color) = match r.match_source {
+                xfade_core::model_map_templates::MatchSource::ProbeExact => ("probe", Color::Green),
+                xfade_core::model_map_templates::MatchSource::ProbeTier => ("tier", Color::Cyan),
+                xfade_core::model_map_templates::MatchSource::Fallback => {
+                    ("fallback", Color::DarkGray)
+                }
+                xfade_core::model_map_templates::MatchSource::Unmatched => {
+                    ("unmatched", Color::Red)
+                }
+            };
+            let upstream = if r.upstream_model.is_empty() {
+                "(unmatched)"
+            } else {
+                r.upstream_model.as_str()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<26} ->  {:<26} ", r.client_alias, upstream)),
+                Span::styled(format!("[{src_label}]"), Style::default().fg(src_color)),
+            ]));
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Model Map · Apply Template ");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    if let Some(pp) = mm.profile_picker.as_ref() {
+        let mode_str = if pp.merge { "Merge" } else { "Replace" };
+        let mut lines = vec![Line::from(vec![
+            Span::styled("  Switch mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(mode_str, Style::default().fg(Color::Green)),
+        ])];
+        if let Some(name) = pp.saving_name.as_ref() {
+            lines.push(Line::from(""));
+            lines.push(input_line("Save as:", name.clone(), true, false, false));
+        }
+        lines.push(Line::from(""));
+        if pp.profiles.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no saved profiles; press [s] to save current rules)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (idx, p) in pp.profiles.iter().enumerate() {
+                let selected = idx == pp.selected;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let mark = if p.is_active { "*" } else { " " };
+                let prefix = if selected { "▸" } else { " " };
+                let count: usize = p.mappings.values().map(|m| m.len()).sum();
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{prefix}{mark} {:<20} ({count} rules)  {}",
+                        p.name, p.description
+                    ),
+                    style,
+                )));
+            }
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Model Map · Profiles ");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
     if let Some(ed) = mm.editing.as_ref() {
         let mut lines = vec![
             input_line(
@@ -1420,12 +1533,36 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("Enter", "save"),
                 ("Esc", "back"),
             ])
+        } else if mm.template_picker.is_some() {
+            keycap_line(&[
+                ("↑/↓", "template"),
+                ("←/→", "provider"),
+                ("p", "probe"),
+                ("Space", "mode"),
+                ("Enter", "apply"),
+                ("Esc", "back"),
+            ])
+        } else if let Some(pp) = mm.profile_picker.as_ref() {
+            if pp.saving_name.is_some() {
+                keycap_line(&[("type", "name"), ("Enter", "save"), ("Esc", "cancel")])
+            } else {
+                keycap_line(&[
+                    ("j/k", "move"),
+                    ("Enter", "switch"),
+                    ("s", "save"),
+                    ("d", "del"),
+                    ("Space", "mode"),
+                    ("Esc", "back"),
+                ])
+            }
         } else {
             keycap_line(&[
                 ("j/k", "move"),
                 ("a", "add"),
                 ("e", "edit"),
                 ("d", "del"),
+                ("t", "template"),
+                ("p", "profile"),
                 ("Space", "merge"),
                 ("Esc", "close"),
             ])
@@ -2274,6 +2411,12 @@ mod tests {
         assert!(text.contains("Model Map (1 rule)"));
         assert!(text.contains("ON (aggregated /v1/models)"));
         assert!(text.contains("sonnet  ->  glm=glm-4"));
+
+        app.model_map_open_template();
+        terminal.draw(|f| draw(f, &app, &[])).unwrap();
+        let tpl_text = buffer_text(&terminal);
+        assert!(tpl_text.contains("Model Map · Apply Template"));
+        assert!(tpl_text.contains("Claude Code Standard"));
     }
 
     #[test]

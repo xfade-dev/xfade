@@ -4,6 +4,9 @@ import type {
   ConfigDto,
   ConfigInput,
   ModelMapDto,
+  ModelMapProfileDto,
+  ModelMapTemplateDto,
+  ModelMappingDto,
   PresetDto,
   Provider,
   ProviderProtocol,
@@ -13,6 +16,7 @@ import type {
   SecurityDoctorReport,
   StatsGroupBy,
   StatsRow,
+  TemplatePreviewDto,
   ToolKind,
   UpdateProviderInput,
 } from "./types";
@@ -128,6 +132,35 @@ export const removeModelMapping = (alias: string, providerId?: string) =>
 
 export const setModelsMerge = (enabled: boolean) =>
   invoke<void>("set_models_merge", { enabled });
+
+export const listModelMapTemplates = () =>
+  invoke<ModelMapTemplateDto[]>("list_model_map_templates");
+
+export const previewModelMapTemplate = (
+  templateId: string,
+  providerId: string,
+  probe = true
+) =>
+  invoke<TemplatePreviewDto>("preview_model_map_template", {
+    templateId,
+    providerId,
+    probe,
+  });
+
+export const applyModelMapTemplate = (entries: ModelMappingDto[], replace: boolean) =>
+  invoke<number>("apply_model_map_template", { entries, replace });
+
+export const listModelMapProfiles = () =>
+  invoke<ModelMapProfileDto[]>("list_model_map_profiles");
+
+export const saveModelMapProfile = (name: string, description?: string) =>
+  invoke<void>("save_model_map_profile", { name, description: description ?? null });
+
+export const switchModelMapProfile = (name: string, replace: boolean) =>
+  invoke<number>("switch_model_map_profile", { name, replace });
+
+export const deleteModelMapProfile = (name: string) =>
+  invoke<boolean>("delete_model_map_profile", { name });
 
 export const securityDoctor = () => invoke<SecurityDoctorReport>("security_doctor");
 

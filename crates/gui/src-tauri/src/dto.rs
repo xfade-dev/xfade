@@ -87,6 +87,31 @@ pub struct ModelMapDto {
     pub models_merge: bool,
 }
 
+#[derive(Serialize)]
+pub struct ModelMapTemplateDto {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub client_tool: Option<ToolKind>,
+    pub rule_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct TemplatePreviewDto {
+    pub rules: Vec<xfade_core::model_map_templates::ResolvedTemplateRule>,
+    pub discovered_models: Vec<String>,
+    pub probe_error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ModelMapProfileDto {
+    pub name: String,
+    pub description: String,
+    pub rule_count: usize,
+    pub is_active: bool,
+    pub updated_at: String,
+}
+
 /// Global config, as exposed to the frontend (`api_key` is masked).
 #[derive(Serialize)]
 pub struct ConfigDto {
