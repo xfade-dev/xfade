@@ -2,6 +2,7 @@ pub mod cache_injector;
 pub mod circuit_breaker;
 pub mod convert;
 pub mod convert_gemini;
+pub mod extra_fields_rectifier;
 pub mod forward;
 pub mod pricing;
 pub mod pricing_sync;

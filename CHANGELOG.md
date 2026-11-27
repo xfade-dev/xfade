@@ -2,6 +2,13 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## v0.14.8 — 2026-11-27
+
+### Antigravity CLI (`agy`) Instant Launch & Anthropic `tool_use` Sanitizer
+- **fix(cli,agy)**: Add `ToolKind::Agy` to `cmd_run_instant` so `xfade agy <name>` works alongside `xfade run <name> --tool agy`.
+- **fix(adapter,agy)**: Format `customModelsConfig.customModels` as a model-ID-keyed map (`jetbox_state_pb.CustomModelsConfig`) instead of an array so `agy --settings` and `~/.gemini/antigravity-cli/settings.json` validate cleanly (while keeping `read_current` backward-compatible with array entries).
+- **fix(proxy,messages)**: Add `extra_fields_rectifier` (`strip_null_extras` + `rectify_extra_fields_error`) to proactively strip `null`-valued extra fields (e.g. `toolset_name: null`, `caller: null`) on `messages[*].content[*]` `tool_use` / `tool_result` blocks before forwarding Anthropic requests, and fall back to a single 400 retry on `"extra inputs are not permitted"` / `"extra fields not permitted"` / `"additional properties are not allowed"` errors.
+
 ## v0.14.7 — 2026-11-27
 
 ### Antigravity CLI (`agy`) & Gemini `/v1beta` Protocol Support

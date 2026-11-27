@@ -17,6 +17,10 @@ struct RecordedRequest {
 enum MockAction {
     StatusJson(StatusCode, String),
     Sse(StatusCode, Vec<String>),
+    Sequence(
+        Vec<(StatusCode, String)>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ),
 }
 
 struct MockServer {
@@ -57,6 +61,19 @@ impl MockServer {
                             .status(status)
                             .header("content-type", "text/event-stream")
                             .body(Body::from(payload))
+                            .unwrap()
+                    }
+                    MockAction::Sequence(steps, idx) => {
+                        let i = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (status, resp_body) = steps
+                            .get(i)
+                            .or_else(|| steps.last())
+                            .cloned()
+                            .unwrap_or((StatusCode::OK, "{}".to_string()));
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(resp_body))
                             .unwrap()
                     }
                 }
@@ -412,4 +429,157 @@ async fn test_agy_gemini_inbound_transcodes_to_chat_upstream() {
     let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
     assert_eq!(sent["model"], "gpt-5");
     assert_eq!(sent["stream"], true);
+}
+
+#[tokio::test]
+async fn test_messages_proactive_strips_null_tool_extras() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let core = Core::with_paths(
+        &home,
+        &data,
+        Arc::new(xfade_core::store::secrets::MockStore::default()),
+    )
+    .unwrap();
+
+    let up = MockServer::spawn(MockAction::StatusJson(
+        StatusCode::OK,
+        r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#.to_string(),
+    ))
+    .await;
+
+    let p = Provider::new("anth", ToolKind::ClaudeCode, Some(up.url.clone()))
+        .with_protocol(ProviderProtocol::Messages);
+    core.add_provider(p, Some("sk-anth")).unwrap();
+    core.db()
+        .set_routes(&["anth".to_string()], Some("claude-sonnet-4-6"), "messages")
+        .unwrap();
+
+    let local_token = xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
+        .get_or_create(ToolKind::ClaudeCode)
+        .unwrap();
+    let proxy_url = spawn_proxy(core).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("x-api-key", &local_token)
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 128,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "bash",
+                        "input": { "cmd": "pwd" },
+                        "toolset_name": null,
+                        "caller": null,
+                        "non_null_caller": "computer"
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "/tmp",
+                        "extra_null": null
+                    }]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = up.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    let tool_use = &sent["messages"][0]["content"][0];
+    assert!(tool_use.get("toolset_name").is_none());
+    assert!(tool_use.get("caller").is_none());
+    assert_eq!(tool_use["non_null_caller"], "computer");
+    assert!(sent["messages"][1]["content"][0]
+        .get("extra_null")
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_messages_400_extra_fields_retries_once_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let core = Core::with_paths(
+        &home,
+        &data,
+        Arc::new(xfade_core::store::secrets::MockStore::default()),
+    )
+    .unwrap();
+
+    let up = MockServer::spawn(MockAction::Sequence(
+        vec![
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"litellm.BadRequestError: #/messages/0/content/0/tool_use.custom_extra: Extra inputs are not permitted"}}"#.to_string(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"id":"msg_2","type":"message","role":"assistant","content":[{"type":"text","text":"retried ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#.to_string(),
+            ),
+        ],
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    ))
+    .await;
+
+    let p = Provider::new("anth", ToolKind::ClaudeCode, Some(up.url.clone()))
+        .with_protocol(ProviderProtocol::Messages);
+    core.add_provider(p, Some("sk-anth")).unwrap();
+    core.db()
+        .set_routes(&["anth".to_string()], Some("claude-sonnet-4-6"), "messages")
+        .unwrap();
+
+    let local_token = xfade_core::store::tokens::TokenManager::new(Arc::new(core.db().clone()))
+        .get_or_create(ToolKind::ClaudeCode)
+        .unwrap();
+    let proxy_url = spawn_proxy(core).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("x-api-key", &local_token)
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "bash",
+                    "input": { "cmd": "pwd" },
+                    "custom_extra": "v1"
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("retried ok"));
+
+    let reqs = up.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "expected strictly one retry on 400");
+    let first: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&reqs[1].body).unwrap();
+    assert_eq!(first["messages"][0]["content"][0]["custom_extra"], "v1");
+    assert!(second["messages"][0]["content"][0]
+        .get("custom_extra")
+        .is_none());
 }

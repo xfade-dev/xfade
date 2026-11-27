@@ -2626,15 +2626,19 @@ fn warn_legacy_wire_api(tool: ToolKind) {
 /// the tool name is the subcommand, provider/model/key are resolved on the
 /// spot (auto-created from a preset or `--base-url` when unregistered) and
 /// the tool's on-disk config is never touched. Injection covers claude /
-/// aider (env), codex (`-c` overrides + env key) and opencode (inline
-/// `OPENCODE_CONFIG_CONTENT`) — codex/opencode verified 2026-10-22 against
-/// codex-cli 0.155.0 / opencode 1.18.31; other tools get a `xfade use` hint.
+/// aider (env), codex (`-c` overrides + env key), opencode (inline
+/// `OPENCODE_CONFIG_CONTENT`), and agy (inline `--settings` + `GEMINI_*` env)
+/// — other tools get a `xfade use` hint.
 fn cmd_run_instant(tool: ToolKind, opts: RunOpts) -> Result<(), CoreError> {
     use std::process::Command;
 
     if !matches!(
         tool,
-        ToolKind::ClaudeCode | ToolKind::Aider | ToolKind::Codex | ToolKind::OpenCode
+        ToolKind::ClaudeCode
+            | ToolKind::Aider
+            | ToolKind::Codex
+            | ToolKind::OpenCode
+            | ToolKind::Agy
     ) {
         return Err(CoreError::ConfigParse {
             path: "run".into(),

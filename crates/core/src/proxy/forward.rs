@@ -1537,8 +1537,14 @@ async fn failover_loop(
         if is_anthropic_target {
             if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(sending_body_ref)
             {
+                let stripped = super::extra_fields_rectifier::strip_null_extras(&mut json_val);
+                if stripped > 0 {
+                    eprintln!(
+                        "[xfade-proxy] sanitized {stripped} null extra field(s) for tool_use"
+                    );
+                }
                 let report = super::cache_injector::inject_cache_control(&mut json_val, 4);
-                if report.injected_breakpoints > 0 {
+                if report.injected_breakpoints > 0 || stripped > 0 {
                     if let Ok(bytes) = serde_json::to_vec(&json_val) {
                         injected_body_vec = Some(bytes);
                     }
@@ -1690,6 +1696,10 @@ async fn failover_loop(
                 if let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(sending_body)
                 {
                     if super::thinking_rectifier::rectify_thinking_error(
+                        &mut body_json,
+                        400,
+                        &err_body,
+                    ) || super::extra_fields_rectifier::rectify_extra_fields_error(
                         &mut body_json,
                         400,
                         &err_body,

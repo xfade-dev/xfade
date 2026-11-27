@@ -746,12 +746,12 @@ fn instant_config_file_tool_points_to_use() {
 }
 
 #[test]
-fn instant_codex_opencode_pass_the_support_gate() {
-    // codex/opencode are no longer refused by the tool gate: an unknown name
+fn instant_codex_opencode_agy_pass_the_support_gate() {
+    // codex/opencode/agy are no longer refused by the tool gate: an unknown name
     // fails at provider resolution, not with the `use` hint. (Never reaches
     // exec, so no real binary is spawned.)
     let home = tempfile::tempdir().unwrap();
-    for tool in ["codex", "opencode"] {
+    for tool in ["codex", "opencode", "agy"] {
         xfade(home.path())
             .args([tool, "no-such-provider"])
             .assert()

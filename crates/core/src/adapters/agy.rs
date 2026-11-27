@@ -20,15 +20,16 @@ pub(crate) fn agy_env_pairs(base_url: &str, api_key: Option<&str>) -> Vec<(&'sta
 
 /// Build the `customModelsConfig` entry for `agy`'s `settings.json` when a
 /// model is configured alongside a `base_url`.
+/// `customModels` is a map keyed by model ID (`jetbox_state_pb.CustomModelsConfig`).
 pub(crate) fn agy_custom_models_config(base_url: &str, model: &str) -> Value {
     let base = base_url.trim_end_matches('/');
     json!({
-        "customModels": [
-            {
+        "customModels": {
+            model: {
                 "modelName": format!("gemini-api://{base}/models/{model}"),
                 "label": model,
             }
-        ]
+        }
     })
 }
 
@@ -109,12 +110,21 @@ impl ToolAdapter for AgyAdapter {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if let Some(first_model) = doc
+        let custom_entry = doc
             .get("customModelsConfig")
             .and_then(|c| c.get("customModels"))
-            .and_then(|m| m.as_array())
-            .and_then(|arr| arr.first())
-        {
+            .and_then(|m| {
+                m.as_object()
+                    .and_then(|map| {
+                        model
+                            .as_deref()
+                            .and_then(|id| map.get(id))
+                            .or_else(|| map.values().next())
+                    })
+                    .or_else(|| m.as_array().and_then(|arr| arr.first()))
+            });
+
+        if let Some(first_model) = custom_entry {
             if let Some(name) = first_model.get("modelName").and_then(|v| v.as_str()) {
                 if let Some(rest) = name.strip_prefix("gemini-api://") {
                     if let Some((b, m)) = rest.rsplit_once("/models/") {
@@ -176,7 +186,7 @@ mod tests {
         assert_eq!(doc["model"], "gemini-2.5-pro");
         assert_eq!(doc["notifications"], true);
         assert_eq!(
-            doc["customModelsConfig"]["customModels"][0]["modelName"],
+            doc["customModelsConfig"]["customModels"]["gemini-2.5-pro"]["modelName"],
             "gemini-api://https://gw.example/models/gemini-2.5-pro"
         );
         // Secret must never be written to settings.json
